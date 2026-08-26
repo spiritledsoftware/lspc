@@ -20,6 +20,10 @@ _Avoid_: Write, fix
 The filesystem tree presented to a language server as the context for queries and mutations.
 _Avoid_: Project, repository
 
+**Document**:
+A filesystem-backed text file whose current snapshot has been presented to a language server.
+_Avoid_: Buffer
+
 **Trust grant**:
 A user-local authorization for one Workspace's current named project server declaration to execute.
 _Avoid_: Approval, allowlist
