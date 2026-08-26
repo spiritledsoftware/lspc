@@ -1,0 +1,3 @@
+# Bind project trust to server declarations
+
+Project configuration can select or define executable language servers, so `lspc` requires a user-local Trust grant for each canonical Workspace and named project server before using project-controlled launch fields. The grant binds to the declaration digest and resolved executable path, never inherits across directories or worktrees, and revoke or Denial stops matching owners. Executable bytes are not hashed because package updates and launcher indirection make that check costly and incomplete; this trust boundary authorizes configuration rather than certifying everything a server may execute while analyzing a Workspace.

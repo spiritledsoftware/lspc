@@ -19,3 +19,11 @@ _Avoid_: Write, fix
 **Workspace**:
 The filesystem tree presented to a language server as the context for queries and mutations.
 _Avoid_: Project, repository
+
+**Trust grant**:
+A user-local authorization for one Workspace's current named project server declaration to execute.
+_Avoid_: Approval, allowlist
+
+**Denial**:
+A user-local decision that blocks one Workspace's named project server declaration until explicitly replaced by a Trust grant.
+_Avoid_: Revocation
