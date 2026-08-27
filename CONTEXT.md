@@ -16,6 +16,30 @@ _Avoid_: Command, operation
 A language-server-proposed change to one or more files.
 _Avoid_: Write, fix
 
+**Preview**:
+An identified, immutable representation of one Mutation that an Agent can inspect before authorizing it.
+_Avoid_: Diff, plan
+
+**Application**:
+An Agent-authorized attempt to commit one Mutation to the filesystem.
+_Avoid_: Execution, write
+
+**Preauthorization**:
+An Agent's advance authorization for Mutations requested while one language-server command runs.
+_Avoid_: Blanket approval, trust
+
+**Stale Preview**:
+A Preview whose bound Workspace, server identity, authorization, or filesystem preconditions no longer match.
+_Avoid_: Old preview, outdated edit
+
+**Recovery**:
+Resolution of a failed Application whose filesystem state could not be restored automatically.
+_Avoid_: Retry, repair
+
+**Receipt**:
+A durable record of the terminal outcome of one Application or Recovery.
+_Avoid_: Log, result
+
 **Workspace**:
 The filesystem tree presented to a language server as the context for queries and mutations.
 _Avoid_: Project, repository
