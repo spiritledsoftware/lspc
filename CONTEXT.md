@@ -12,6 +12,10 @@ _Avoid_: User, client
 An agent's request for semantic code intelligence from a language server.
 _Avoid_: Command, operation
 
+**Capability profile**:
+The fixed client capabilities offered and server capabilities negotiated for one language-server session.
+_Avoid_: Feature list, compatibility mode
+
 **Mutation**:
 A language-server-proposed change to one or more files.
 _Avoid_: Write, fix
