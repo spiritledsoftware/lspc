@@ -16,6 +16,18 @@ _Avoid_: Command, operation
 The fixed client capabilities offered and server capabilities negotiated for one language-server session.
 _Avoid_: Feature list, compatibility mode
 
+**Owner**:
+A long-lived process responsible for one initialized language-server session and its Queries.
+_Avoid_: Daemon, broker
+
+**Session identity**:
+A stable identifier for one Workspace, selected server, and set of immutable language-server session inputs.
+_Avoid_: Session ID, Owner ID
+
+**Owner generation**:
+One concrete lifetime of an Owner for a Session identity.
+_Avoid_: Session identity, process ID
+
 **Mutation**:
 A language-server-proposed change to one or more files.
 _Avoid_: Write, fix
