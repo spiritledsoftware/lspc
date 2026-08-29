@@ -1,3 +1,5 @@
+# `lspc` Project Instructions
+
 ## Agent skills
 
 ### Issue tracker
