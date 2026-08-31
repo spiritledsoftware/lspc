@@ -15,14 +15,48 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::contract::{
-    INPUT_ERROR_EXIT_CODE, INTERNAL_ERROR_EXIT_CODE, contract_catalog, internal_error_envelope,
-    invalid_arguments_envelope, schema_success_envelope, version_success_envelope,
+    INPUT_ERROR_EXIT_CODE, INTERNAL_ERROR_EXIT_CODE, contract_catalog, failure_envelope,
+    internal_error_envelope, invalid_arguments_envelope, schema_success_envelope,
+    version_success_envelope,
 };
 
-struct ParsedInvocation {
+pub(crate) struct ParsedInvocation {
     command: Vec<String>,
     options: BTreeMap<String, Vec<OsString>>,
     positionals: Vec<OsString>,
+}
+
+impl ParsedInvocation {
+    pub(crate) fn command_path(&self) -> &[String] {
+        &self.command
+    }
+
+    pub(crate) fn option_string(&self, name: &str) -> Option<String> {
+        self.options
+            .get(name)
+            .and_then(|values| values.first())
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn option_strings(&self, name: &str) -> Option<Vec<String>> {
+        self.options.get(name).map(|values| {
+            values
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect()
+        })
+    }
+
+    pub(crate) fn option_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.options
+            .get(name)
+            .and_then(|values| values.first())
+            .map(std::path::PathBuf::from)
+    }
+
+    pub(crate) fn has_option(&self, name: &str) -> bool {
+        self.options.contains_key(name)
+    }
 }
 
 /// Parses one CLI invocation and emits exactly one JSON envelope.
@@ -70,6 +104,18 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
                     &invalid_arguments_envelope(vec![command.clone()], "invalid_value", message),
                     ExitCode::from(INPUT_ERROR_EXIT_CODE),
                 ),
+            }
+        }
+        [group, ..] if group == "trust" => {
+            match crate::configuration::dispatch_trust_command(&invocation) {
+                Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
+                Err(failure) => {
+                    let exit_code = failure.exit_code;
+                    emit_envelope(
+                        &failure_envelope(invocation.command, &failure),
+                        ExitCode::from(exit_code),
+                    )
+                }
             }
         }
         _ => emit_envelope(

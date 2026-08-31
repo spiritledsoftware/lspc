@@ -6,6 +6,37 @@ use serde_json::{Map, Value, json};
 pub(crate) const INPUT_ERROR_EXIT_CODE: u8 = 2;
 pub(crate) const INTERNAL_ERROR_EXIT_CODE: u8 = 8;
 
+/// A fully classified failure ready for the stable JSON envelope.
+#[derive(Debug)]
+pub(crate) struct ContractFailure {
+    pub(crate) exit_code: u8,
+    pub(crate) category: &'static str,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) stage: &'static str,
+    pub(crate) delivery: &'static str,
+    pub(crate) retry: &'static str,
+    pub(crate) data: Value,
+}
+
+/// Wraps one classified failure in the stable machine envelope.
+pub(crate) fn failure_envelope(command: Vec<String>, failure: &ContractFailure) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "ok": false,
+        "command": command,
+        "error": {
+            "category": failure.category,
+            "code": failure.code,
+            "message": failure.message,
+            "stage": failure.stage,
+            "delivery": failure.delivery,
+            "retry": failure.retry,
+            "data": failure.data
+        }
+    })
+}
+
 /// Returns the checked v1 command and machine-contract catalog.
 pub(crate) fn contract_catalog() -> &'static Value {
     static CATALOG: OnceLock<Value> = OnceLock::new();

@@ -1,4 +1,6 @@
+mod canonical_value;
 mod cli;
+mod configuration;
 mod contract;
 mod session;
 
