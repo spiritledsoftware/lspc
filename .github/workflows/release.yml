@@ -1,0 +1,89 @@
+name: Release candidate
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: ["1.89", stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+          rustup component add rustfmt clippy --toolchain ${{ matrix.toolchain }}
+      - run: cargo +${{ matrix.toolchain }} fmt --all -- --check
+      - run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets -- -D warnings
+      - run: cargo +${{ matrix.toolchain }} test --locked --all-targets
+      - run: python scripts/release/check_schema.py
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      - run: python tests/release_scripts.py
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+      - uses: rustsec/audit-check@v2.0.0
+
+  package:
+    needs: [verify, dependencies]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package and install from locked source
+        run: python scripts/release/check_package.py
+
+  archive:
+    needs: package
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+      - name: Build and verify archive
+        run: python scripts/release/package.py --target ${{ matrix.target }} --output-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lspc-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  required-gates:
+    needs: archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Block incomplete release acceptance
+        run: python scripts/release/check_gates.py --require-complete
