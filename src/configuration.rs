@@ -362,6 +362,51 @@ pub(crate) fn select_server(
     Ok(server)
 }
 
+/// Derives one synchronized Document language ID for the selected server.
+pub(crate) fn document_language_id(
+    configuration: &LoadedConfiguration,
+    server: &str,
+    file: &Path,
+    explicit: Option<&str>,
+) -> Result<String, ContractFailure> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_owned());
+    }
+    let file = file.to_string_lossy().to_ascii_lowercase();
+    let matching = configuration
+        .routes
+        .iter()
+        .filter(|route| route.server == server)
+        .flat_map(|route| {
+            route
+                .extensions
+                .iter()
+                .map(move |extension| (route, extension))
+        })
+        .filter(|(_, extension)| file.ends_with(&extension.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let longest = matching
+        .iter()
+        .map(|(_, extension)| extension.len())
+        .max()
+        .ok_or_else(|| {
+            server_selection_failure(
+                "No language route for the selected server matches a synchronized Document.",
+            )
+        })?;
+    let languages = matching
+        .into_iter()
+        .filter(|(_, extension)| extension.len() == longest)
+        .map(|(route, _)| route.language_id.clone())
+        .collect::<BTreeSet<_>>();
+    if languages.len() != 1 {
+        return Err(server_selection_failure(
+            "Equally specific routes disagree on the synchronized Document language ID.",
+        ));
+    }
+    Ok(languages.into_iter().next().unwrap())
+}
+
 /// Resolves a server executable without invoking a shell.
 pub(crate) fn resolve_server_executable(
     server: &EffectiveServer,
