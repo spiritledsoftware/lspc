@@ -21,9 +21,9 @@ use crate::contract::{
 };
 
 pub(crate) struct ParsedInvocation {
-    command: Vec<String>,
-    options: BTreeMap<String, Vec<OsString>>,
-    positionals: Vec<OsString>,
+    pub(crate) command: Vec<String>,
+    pub(crate) options: BTreeMap<String, Vec<OsString>>,
+    pub(crate) positionals: Vec<OsString>,
 }
 
 impl ParsedInvocation {

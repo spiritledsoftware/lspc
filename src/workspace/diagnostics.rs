@@ -212,6 +212,25 @@ impl DiagnosticCache {
         }
     }
 
+    pub(crate) fn pull_result_id(&self, uri: &str) -> Option<&str> {
+        self.snapshots
+            .get(&pull_key(uri))
+            .and_then(|snapshot| snapshot.result_id.as_deref())
+    }
+
+    pub(crate) fn pull_result_ids(&self) -> Vec<Value> {
+        self.snapshots
+            .iter()
+            .filter(|(key, _)| key.starts_with("pull\0"))
+            .filter_map(|(_, snapshot)| {
+                snapshot
+                    .result_id
+                    .as_ref()
+                    .map(|value| json!({"uri": snapshot.uri, "value": value}))
+            })
+            .collect()
+    }
+
     pub(crate) fn all_known(&mut self) -> Vec<DiagnosticResult> {
         self.clock = self.clock.saturating_add(1);
         let clock = self.clock;
