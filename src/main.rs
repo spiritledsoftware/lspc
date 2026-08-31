@@ -1,5 +1,6 @@
 mod cli;
 mod contract;
+mod session;
 
 use std::{env, process::ExitCode};
 
