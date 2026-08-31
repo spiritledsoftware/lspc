@@ -52,6 +52,68 @@ fn invalid_cli_emits_a_structured_failure_without_stderr() {
     );
 }
 
+#[test]
+fn schema_help_and_group_help_are_machine_readable() {
+    let schema = run_lspc(&["schema"]);
+    assert!(schema.status.success());
+    assert!(schema.stderr.is_empty());
+    let schema: Value = serde_json::from_slice(&schema.stdout).unwrap();
+    assert_eq!(schema["command"], json!(["schema"]));
+    assert_eq!(
+        schema["result"]["catalog"]["commands"]
+            .as_array()
+            .unwrap()
+            .len(),
+        41
+    );
+
+    let root_help = run_lspc(&["--help"]);
+    let named_help = run_lspc(&["help"]);
+    assert_eq!(root_help.stdout, named_help.stdout);
+    let help: Value = serde_json::from_slice(&root_help.stdout).unwrap();
+    assert_eq!(help["command"], json!(["help"]));
+
+    let group_help = run_lspc(&["trust", "--help"]);
+    assert!(group_help.status.success());
+    let group_help: Value = serde_json::from_slice(&group_help.stdout).unwrap();
+    assert_eq!(group_help["command"], json!(["help", "trust"]));
+    assert_eq!(
+        group_help["result"]["catalog"]["commands"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+}
+
+#[test]
+fn full_and_focused_schema_results_use_the_frozen_registry() {
+    let full = run_lspc(&["schema", "--full"]);
+    assert!(full.status.success());
+    let full: Value = serde_json::from_slice(&full.stdout).unwrap();
+    assert_eq!(full["result"]["schemas"].as_object().unwrap().len(), 243);
+    assert_eq!(
+        full["result"]["catalog"]["commands"]
+            .as_array()
+            .unwrap()
+            .len(),
+        41
+    );
+
+    let focused = run_lspc(&["schema", "definition"]);
+    assert!(focused.status.success());
+    let focused: Value = serde_json::from_slice(&focused.stdout).unwrap();
+    assert_eq!(focused["command"], json!(["schema", "definition"]));
+    let schemas = focused["result"]["schemas"].as_object().unwrap();
+    assert!(schemas.contains_key("lspc://schema/v1/cli/definition"));
+    assert!(schemas.contains_key("lspc://schema/v1/command/definition"));
+
+    let invalid = run_lspc(&["schema", "no-such-subject"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let invalid: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(invalid["error"]["code"], "invalid_arguments");
+}
+
 fn run_lspc(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lspc"))
         .args(arguments)
