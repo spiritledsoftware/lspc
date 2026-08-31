@@ -118,6 +118,18 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
                 }
             }
         }
+        [group, command] if group == "skill" && command == "install" => {
+            match crate::skill_install::install(&invocation) {
+                Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
+                Err(failure) => {
+                    let exit_code = failure.exit_code;
+                    emit_envelope(
+                        &failure_envelope(invocation.command, &failure),
+                        ExitCode::from(exit_code),
+                    )
+                }
+            }
+        }
         _ => emit_envelope(
             &internal_error_envelope(invocation.command, "implementation_pending"),
             ExitCode::from(INTERNAL_ERROR_EXIT_CODE),
