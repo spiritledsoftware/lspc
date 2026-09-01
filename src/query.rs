@@ -732,16 +732,126 @@ fn document_filter_matches(filter: &Value, document: &DocumentSnapshot) -> bool 
     {
         return false;
     }
-    let Some(pattern) = filter.get("pattern").and_then(Value::as_str) else {
+    let Some(pattern) = filter.get("pattern") else {
         return true;
     };
-    let path = document.path.to_string_lossy().replace('\\', "/");
-    glob_matches(pattern.as_bytes(), path.as_bytes())
+    document_pattern_matches(pattern, document)
+}
+
+// One memoization cell per pattern/path byte pair and at most 256 brace
+// expansions bounds matching of server-controlled selector patterns.
+pub(crate) fn protocol_glob_matches(pattern: &str, path: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        glob_matches(
+            pattern.to_ascii_lowercase().as_bytes(),
+            path.to_ascii_lowercase().as_bytes(),
+        )
+    } else {
+        glob_matches(pattern.as_bytes(), path.as_bytes())
+    }
 }
 
 fn glob_matches(pattern: &[u8], path: &[u8]) -> bool {
-    let mut states = vec![vec![None; path.len() + 1]; pattern.len() + 1];
-    glob_matches_at(pattern, path, 0, 0, &mut states)
+    let mut expanded = Vec::new();
+    expand_braces(pattern, &mut expanded, 256);
+    expanded.into_iter().any(|pattern| {
+        let mut states = vec![vec![None; path.len() + 1]; pattern.len() + 1];
+        glob_matches_at(&pattern, path, 0, 0, &mut states)
+    })
+}
+
+fn document_pattern_matches(pattern: &Value, document: &DocumentSnapshot) -> bool {
+    let uri_path = Url::parse(&document.uri)
+        .ok()
+        .map(|uri| uri.path().to_owned())
+        .unwrap_or_else(|| document.path.to_string_lossy().replace('\\', "/"));
+    if let Some(pattern) = pattern.as_str() {
+        return glob_matches(pattern.as_bytes(), uri_path.as_bytes());
+    }
+    let Some(relative) = pattern.as_object() else {
+        return false;
+    };
+    let Some(pattern) = relative.get("pattern").and_then(Value::as_str) else {
+        return false;
+    };
+    let base_uri = relative.get("baseUri").and_then(|base| {
+        base.as_str()
+            .or_else(|| base.get("uri").and_then(Value::as_str))
+    });
+    let Some(base_path) = base_uri
+        .and_then(|uri| Url::parse(uri).ok())
+        .map(|uri| uri.path().trim_end_matches('/').to_owned())
+    else {
+        return false;
+    };
+    let Some(relative_path) = uri_path
+        .strip_prefix(&base_path)
+        .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    else {
+        return false;
+    };
+    glob_matches(
+        pattern.as_bytes(),
+        relative_path.trim_start_matches('/').as_bytes(),
+    )
+}
+
+fn expand_braces(pattern: &[u8], output: &mut Vec<Vec<u8>>, limit: usize) {
+    if output.len() >= limit {
+        return;
+    }
+    let mut open = None;
+    let mut depth = 0_u32;
+    for (index, byte) in pattern.iter().copied().enumerate() {
+        match byte {
+            b'{' if depth == 0 => {
+                open = Some(index);
+                depth = 1;
+            }
+            b'{' if depth > 0 => depth += 1,
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let open = open.unwrap();
+                    let alternatives = split_brace_alternatives(&pattern[open + 1..index]);
+                    if alternatives.len() <= 1 {
+                        break;
+                    }
+                    for alternative in alternatives {
+                        if output.len() >= limit {
+                            break;
+                        }
+                        let mut expanded = pattern[..open].to_vec();
+                        expanded.extend(alternative);
+                        expanded.extend(&pattern[index + 1..]);
+                        expand_braces(&expanded, output, limit);
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    output.push(pattern.to_vec());
+}
+
+fn split_brace_alternatives(value: &[u8]) -> Vec<&[u8]> {
+    let mut alternatives = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    for (index, byte) in value.iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                alternatives.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    alternatives.push(&value[start..]);
+    alternatives
 }
 
 fn glob_matches_at(
@@ -758,7 +868,11 @@ fn glob_matches_at(
         path_index == path.len()
     } else if pattern[pattern_index] == b'*' {
         let recursive = pattern.get(pattern_index + 1) == Some(&b'*');
-        let next_pattern = pattern_index + if recursive { 2 } else { 1 };
+        let mut next_pattern = pattern_index + if recursive { 2 } else { 1 };
+        let recursive_directory = recursive && pattern.get(next_pattern) == Some(&b'/');
+        if recursive_directory {
+            next_pattern += 1;
+        }
         glob_matches_at(pattern, path, next_pattern, path_index, states)
             || (path_index < path.len()
                 && (recursive || path[path_index] != b'/')
@@ -767,12 +881,39 @@ fn glob_matches_at(
         path_index < path.len()
             && path[path_index] != b'/'
             && glob_matches_at(pattern, path, pattern_index + 1, path_index + 1, states)
+    } else if pattern[pattern_index] == b'[' {
+        character_class(pattern, pattern_index, path.get(path_index).copied()).is_some_and(
+            |(matches, next_pattern)| {
+                matches && glob_matches_at(pattern, path, next_pattern, path_index + 1, states)
+            },
+        )
     } else {
         path.get(path_index) == pattern.get(pattern_index)
             && glob_matches_at(pattern, path, pattern_index + 1, path_index + 1, states)
     };
     states[pattern_index][path_index] = Some(result);
     result
+}
+
+fn character_class(pattern: &[u8], start: usize, character: Option<u8>) -> Option<(bool, usize)> {
+    let character = character.filter(|character| *character != b'/')?;
+    let end = pattern[start + 1..].iter().position(|byte| *byte == b']')? + start + 1;
+    let class = &pattern[start + 1..end];
+    let (negated, class) = class
+        .strip_prefix(b"!")
+        .map_or((false, class), |class| (true, class));
+    let mut matched = false;
+    let mut index = 0;
+    while index < class.len() {
+        if index + 2 < class.len() && class[index + 1] == b'-' {
+            matched |= (class[index]..=class[index + 2]).contains(&character);
+            index += 3;
+        } else {
+            matched |= class[index] == character;
+            index += 1;
+        }
+    }
+    Some((matched != negated, end + 1))
 }
 
 fn position_params(
@@ -1619,6 +1760,29 @@ mod tests {
         ) -> Result<DispatchResponse, ContractFailure> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn protocol_globs_support_recursive_braces_classes_and_relative_patterns() {
+        assert!(glob_matches(b"**/*.{rs,py}", b"main.rs"));
+        assert!(glob_matches(b"**/*.{rs,py}", b"src/lib.py"));
+        assert!(glob_matches(b"src/[!0-9][a-z].rs", b"src/ab.rs"));
+        assert!(!glob_matches(b"src/[!0-9][a-z].rs", b"src/1b.rs"));
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("src");
+        std::fs::create_dir(&source).unwrap();
+        let path = source.join("main.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let document = DocumentStore::new(2, 1024, 2048)
+            .refresh(&path, "rust", TextSynchronization::OpenClose)
+            .unwrap()
+            .snapshot;
+        let base_uri = Url::from_directory_path(root.path()).unwrap().to_string();
+        assert!(document_pattern_matches(
+            &json!({"baseUri": base_uri, "pattern": "src/*.{rs,py}"}),
+            &document
+        ));
     }
 
     #[test]

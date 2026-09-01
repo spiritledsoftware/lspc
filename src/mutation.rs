@@ -4,7 +4,11 @@ mod application;
 mod planner;
 mod state;
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -27,6 +31,13 @@ use application::{
 };
 use planner::{CanonicalOperation, PlannedWorkspaceEdit, WorkspaceEditPlanner};
 use state::{MutationStateStore, PreviewRecord, ReceiptRecord, StoredPreview, TransactionState};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PreauthorizedUsage {
+    pub(crate) entries: u64,
+    pub(crate) rollback_bytes: u64,
+    pub(crate) staged_text_bytes: u64,
+}
 
 pub(crate) fn dispatch_mutation_command(
     invocation: &ParsedInvocation,
@@ -167,9 +178,9 @@ pub(crate) fn apply_preauthorized_workspace_edit<F>(
     receipts: &ReceiptSettings,
     mutation: &MutationSettings,
     post_commit: &mut F,
-) -> Result<Value, ContractFailure>
+) -> Result<(Value, PreauthorizedUsage), ContractFailure>
 where
-    F: FnMut() -> bool,
+    F: FnMut(&[Value]) -> bool,
 {
     let planner = WorkspaceEditPlanner::open(
         workspace_path,
@@ -182,21 +193,25 @@ where
     let planned = planner
         .plan_workspace_edit(&edit)
         .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
+    let usage = preauthorized_usage(&planned);
     if planned.plan.operations.is_empty() {
-        return Ok(json!({
-            "schemaVersion": 1,
-            "ok": true,
-            "command": ["apply"],
-            "outcome": "applied",
-            "result": {
-                "state": "terminal",
+        return Ok((
+            json!({
+                "schemaVersion": 1,
+                "ok": true,
+                "command": ["apply"],
                 "outcome": "applied",
-                "filesystemState": "unchanged",
-                "sessionSynchronized": true,
-                "cleanupPending": false,
-                "manifest": []
-            }
-        }));
+                "result": {
+                    "state": "terminal",
+                    "outcome": "applied",
+                    "filesystemState": "unchanged",
+                    "sessionSynchronized": true,
+                    "cleanupPending": false,
+                    "manifest": []
+                }
+            }),
+            usage,
+        ));
     }
     let current = planner
         .inspect_manifest_paths(
@@ -248,7 +263,7 @@ where
         recovery_manifest_digest,
         previews,
     )?;
-    let mut synchronize = |_: &state::ReceiptRecord| post_commit();
+    let mut synchronize = |_: &state::ReceiptRecord, operations: &[Value]| post_commit(operations);
     let mut context = ApplicationContext {
         store: &store,
         preview_limits: previews,
@@ -257,8 +272,52 @@ where
         reauthorize: None,
         post_commit: Some(&mut synchronize),
         preauthorized: true,
+        caller_deadline: None,
     };
-    apply_preview(&mut context, &preview_id)
+    apply_preview(&mut context, &preview_id).map(|application| (application, usage))
+}
+
+fn preauthorized_usage(planned: &PlannedWorkspaceEdit) -> PreauthorizedUsage {
+    let entries = planned
+        .plan
+        .before_manifest
+        .iter()
+        .chain(planned.plan.intended_manifest.iter())
+        .map(|entry| &entry.path)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
+    let rollback_bytes = planned
+        .plan
+        .before_manifest
+        .iter()
+        .filter(|entry| entry.exists)
+        .map(|entry| {
+            fs::metadata(&entry.path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    let staged_text_bytes = planned
+        .plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            CanonicalOperation::Text { edits, .. } => Some(
+                edits
+                    .iter()
+                    .map(|edit| edit.new_text.len() as u64)
+                    .sum::<u64>(),
+            ),
+            _ => None,
+        })
+        .sum();
+    PreauthorizedUsage {
+        entries,
+        rollback_bytes,
+        staged_text_bytes,
+    }
 }
 
 /// Validates and persists a server-initiated edit that was not preauthorized.
@@ -502,6 +561,9 @@ fn preview_discard(invocation: &ParsedInvocation) -> Result<Value, ContractFailu
 
 fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let id = invocation.positional_string(0).unwrap();
+    let caller_deadline = invocation
+        .option_string("--deadline")
+        .map(|value| Instant::now() + parse_duration(&value));
     let store = MutationStateStore::open()?;
     let application = if let Some(receipt) = store.already_applied(&id)?
         && receipt.receipt.outcome == "applied"
@@ -515,6 +577,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             reauthorize: None,
             post_commit: None,
             preauthorized: false,
+            caller_deadline,
         };
         apply_preview(&mut context, &id)?
     } else {
@@ -524,10 +587,12 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             invocation.has_option("--ignore-project-config"),
         )?;
         let reauthorize = |stored: &StoredPreview| reauthorize_preview(invocation, &store, stored);
-        let mut synchronize = |receipt: &state::ReceiptRecord| {
+        let mut synchronize = |receipt: &state::ReceiptRecord, operations: &[Value]| {
             let (_, failures) = crate::session::refresh_workspace_owners(
                 &receipt.workspace_uri,
                 receipt.server.as_deref(),
+                receipt.session_identity.as_deref(),
+                operations,
             );
             failures.is_empty()
         };
@@ -539,6 +604,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             reauthorize: Some(&reauthorize),
             post_commit: Some(&mut synchronize),
             preauthorized: false,
+            caller_deadline,
         };
         apply_preview(&mut context, &id)?
     };
@@ -566,6 +632,8 @@ fn synchronize_application_receipt(
     let (_, failures) = crate::session::refresh_workspace_owners(
         &receipt.receipt.workspace_uri,
         receipt.receipt.server.as_deref(),
+        receipt.receipt.session_identity.as_deref(),
+        &[],
     );
     if failures.is_empty() {
         store.mark_receipt_session_synchronized(receipt_id)?;
@@ -1162,6 +1230,16 @@ fn default_mutation_settings() -> (PreviewSettings, ReceiptSettings, MutationSet
             max_preauthorized_callbacks: 64,
         },
     )
+}
+
+fn parse_duration(value: &str) -> Duration {
+    if let Some(value) = value.strip_suffix("ms") {
+        Duration::from_millis(value.parse().unwrap())
+    } else if let Some(value) = value.strip_suffix('s') {
+        Duration::from_secs(value.parse().unwrap())
+    } else {
+        Duration::from_secs(value.strip_suffix('m').unwrap().parse::<u64>().unwrap() * 60)
+    }
 }
 
 pub(crate) struct PreviewRecordContext<'a> {

@@ -1564,9 +1564,21 @@ fn hash_file(path: &Path, index: u64) -> Result<String, WorkspaceEditProblem> {
             Some(json!({"reason": error.to_string()})),
         )
     })?;
+    let accessed = file
+        .metadata()
+        .and_then(|metadata| metadata.accessed())
+        .map_err(|error| {
+            problem(
+                "metadata_unsupported",
+                "A regular file access time cannot be inspected.",
+                Some(index),
+                Some(path),
+                Some(json!({"reason": error.to_string()})),
+            )
+        })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
-    loop {
+    let read_result = loop {
         let read = file.read(&mut buffer).map_err(|error| {
             problem(
                 "filesystem_capability_unavailable",
@@ -1577,15 +1589,35 @@ fn hash_file(path: &Path, index: u64) -> Result<String, WorkspaceEditProblem> {
             )
         })?;
         if read == 0 {
-            break;
+            break Ok(());
         }
         hasher.update(&buffer[..read]);
-    }
+    };
+    let restore_result = file.set_times(std::fs::FileTimes::new().set_accessed(accessed));
+    read_result?;
+    restore_result.map_err(|error| {
+        problem(
+            "metadata_unsupported",
+            "A regular file access time cannot be restored after inspection.",
+            Some(index),
+            Some(path),
+            Some(json!({"reason": error.to_string()})),
+        )
+    })?;
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn read_text_file(path: &Path, limit: u64, index: u64) -> Result<Vec<u8>, WorkspaceEditProblem> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let mut file = File::open(path).map_err(|error| {
+        problem(
+            "filesystem_capability_unavailable",
+            "A text Document cannot be opened.",
+            Some(index),
+            Some(path),
+            Some(json!({"reason": error.to_string()})),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
         problem(
             "filesystem_capability_unavailable",
             "A text Document cannot be inspected.",
@@ -1605,7 +1637,19 @@ fn read_text_file(path: &Path, limit: u64, index: u64) -> Result<Vec<u8>, Worksp
             ),
         ));
     }
-    fs::read(path).map_err(|error| {
+    let accessed = metadata.accessed().map_err(|error| {
+        problem(
+            "metadata_unsupported",
+            "A text Document access time cannot be inspected.",
+            Some(index),
+            Some(path),
+            Some(json!({"reason": error.to_string()})),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read_result = file.read_to_end(&mut bytes);
+    let restore_result = file.set_times(std::fs::FileTimes::new().set_accessed(accessed));
+    read_result.map_err(|error| {
         problem(
             "filesystem_capability_unavailable",
             "A text Document cannot be read.",
@@ -1613,7 +1657,17 @@ fn read_text_file(path: &Path, limit: u64, index: u64) -> Result<Vec<u8>, Worksp
             Some(path),
             Some(json!({"reason": error.to_string()})),
         )
-    })
+    })?;
+    restore_result.map_err(|error| {
+        problem(
+            "metadata_unsupported",
+            "A text Document access time cannot be restored after inspection.",
+            Some(index),
+            Some(path),
+            Some(json!({"reason": error.to_string()})),
+        )
+    })?;
+    Ok(bytes)
 }
 
 fn identity_digest(
@@ -1733,14 +1787,166 @@ fn metadata_digest(
         }
         value["extendedAttributes"] = Value::Object(attributes);
     }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        value["bsdFlags"] = json!(metadata.st_flags());
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        let _ = (path, index);
         value["fileAttributes"] = json!(metadata.file_attributes());
         value["creationTime"] = json!(metadata.creation_time());
+        value["securityDescriptor"] = Value::String(hex::encode(
+            windows_security_descriptor(path).map_err(|error| {
+                problem(
+                    "metadata_unsupported",
+                    "The Windows security descriptor cannot be inspected.",
+                    Some(index),
+                    Some(path),
+                    Some(json!({"reason": error.to_string()})),
+                )
+            })?,
+        ));
+        if metadata.is_file() {
+            value["alternateStreams"] =
+                Value::Object(windows_alternate_streams(path).map_err(|error| {
+                    problem(
+                        "metadata_unsupported",
+                        "Windows alternate data streams cannot be inspected.",
+                        Some(index),
+                        Some(path),
+                        Some(json!({"reason": error.to_string()})),
+                    )
+                })?);
+        }
     }
     Ok(digest_canonical_value("lspc-resource-metadata-v1", &value))
+}
+
+#[cfg(windows)]
+fn windows_security_descriptor(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::{os::windows::ffi::OsStrExt, ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorLength,
+            OWNER_SECURITY_INFORMATION,
+        },
+    };
+
+    let mut wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let length = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+    if length == 0 {
+        unsafe {
+            LocalFree(descriptor);
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = unsafe { slice::from_raw_parts(descriptor.cast::<u8>(), length) }.to_vec();
+    unsafe {
+        LocalFree(descriptor);
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn windows_alternate_streams(path: &Path) -> std::io::Result<Map<String, Value>> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_HANDLE_EOF, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+            WIN32_FIND_STREAM_DATA,
+        },
+    };
+
+    let base_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut terminated = base_wide.clone();
+    terminated.push(0);
+    let mut data = WIN32_FIND_STREAM_DATA::default();
+    let handle = unsafe {
+        FindFirstStreamW(
+            terminated.as_ptr(),
+            FindStreamInfoStandard,
+            std::ptr::addr_of_mut!(data).cast(),
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut streams = Vec::new();
+    loop {
+        let end = data
+            .cStreamName
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(data.cStreamName.len());
+        let name_wide = &data.cStreamName[..end];
+        let name = OsString::from_wide(name_wide)
+            .to_string_lossy()
+            .into_owned();
+        if name != "::$DATA" {
+            streams.push((name, name_wide.to_vec(), data.StreamSize));
+        }
+        data = WIN32_FIND_STREAM_DATA::default();
+        if unsafe { FindNextStreamW(handle, std::ptr::addr_of_mut!(data).cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_HANDLE_EOF as i32) {
+                unsafe {
+                    FindClose(handle);
+                }
+                return Err(error);
+            }
+            break;
+        }
+    }
+    if unsafe { FindClose(handle) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let accessed = fs::metadata(path)?.accessed()?;
+    let mut result = Map::new();
+    for (name, name_wide, declared_size) in streams {
+        let mut stream_path = base_wide.clone();
+        stream_path.extend(name_wide);
+        let stream_path = PathBuf::from(OsString::from_wide(&stream_path));
+        let bytes = fs::read(&stream_path)?;
+        result.insert(
+            name,
+            json!({
+                "size": declared_size.max(0) as u64,
+                "digest": digest_raw_bytes(&bytes)
+            }),
+        );
+    }
+    File::open(path)?.set_times(std::fs::FileTimes::new().set_accessed(accessed))?;
+    Ok(result)
 }
 
 fn resource_rollback_bytes(_path: &Path, manifest: &ManifestEntry) -> u64 {

@@ -81,6 +81,7 @@ struct ActiveQuery {
     raw_request: bool,
     apply_edits: bool,
     apply_edit_ledger: Vec<Value>,
+    preauthorized_usage: crate::mutation::PreauthorizedUsage,
     synchronization: Value,
 }
 
@@ -218,7 +219,11 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         };
                         let _ = pending.response.send(response);
                     }
-                    OwnerRequest::RefreshDocuments => {
+                    OwnerRequest::RefreshDocuments { file_operations } => {
+                        let file_operations_delivered = lsp
+                            .send_file_operation_notifications(&file_operations)
+                            .await
+                            .is_ok();
                         let (outcomes, failures) = lsp.documents.refresh_open_documents(
                             lsp.negotiated.text_synchronization,
                         );
@@ -243,7 +248,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let result = json!({
                             "changedUris": changed,
                             "failures": failures.iter().map(contract_failure_ref_value).collect::<Vec<_>>(),
-                            "delivered": !delivery_failed && failures.is_empty()
+                            "delivered": file_operations_delivered && !delivery_failed && failures.is_empty()
                         });
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
                     }
@@ -619,6 +624,7 @@ impl LspRuntime {
                 raw_request,
                 apply_edits,
                 apply_edit_ledger: Vec::new(),
+                preauthorized_usage: crate::mutation::PreauthorizedUsage::default(),
                 synchronization,
             },
         );
@@ -905,11 +911,19 @@ impl LspRuntime {
         let position_encoding = self.negotiated.position_encoding;
         let previews = self.preview_settings.clone();
         let receipts = self.receipt_settings.clone();
-        let mutation = self.mutation_settings.clone();
-        let mut synchronize = || {
+        let mut mutation = self.mutation_settings.clone();
+        let used = active[&candidate].preauthorized_usage;
+        mutation.max_entries = mutation.max_entries.saturating_sub(used.entries);
+        mutation.max_rollback_bytes = mutation
+            .max_rollback_bytes
+            .saturating_sub(used.rollback_bytes);
+        mutation.max_staged_text_bytes = mutation
+            .max_staged_text_bytes
+            .saturating_sub(used.staged_text_bytes);
+        let mut synchronize = |operations: &[Value]| {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(self.synchronize_documents_after_commit())
+                    .block_on(self.synchronize_documents_after_commit(operations))
             })
         };
         match crate::mutation::apply_preauthorized_workspace_edit(
@@ -925,9 +939,24 @@ impl LspRuntime {
             &mutation,
             &mut synchronize,
         ) {
-            Ok(application) => {
+            Ok((application, usage)) => {
                 let result = &application["result"];
                 let synchronized = result["sessionSynchronized"].as_bool() == Some(true);
+                {
+                    let query = active.get_mut(&candidate).unwrap();
+                    query.preauthorized_usage.entries = query
+                        .preauthorized_usage
+                        .entries
+                        .saturating_add(usage.entries);
+                    query.preauthorized_usage.rollback_bytes = query
+                        .preauthorized_usage
+                        .rollback_bytes
+                        .saturating_add(usage.rollback_bytes);
+                    query.preauthorized_usage.staged_text_bytes = query
+                        .preauthorized_usage
+                        .staged_text_bytes
+                        .saturating_add(usage.staged_text_bytes);
+                }
                 if synchronized {
                     let documents = self.open_document_inputs();
                     active.get_mut(&candidate).unwrap().validated_documents = documents;
@@ -981,7 +1010,11 @@ impl LspRuntime {
         }
     }
 
-    async fn synchronize_documents_after_commit(&mut self) -> bool {
+    async fn synchronize_documents_after_commit(&mut self, file_operations: &[Value]) -> bool {
+        let file_operations_delivered = self
+            .send_file_operation_notifications(file_operations)
+            .await
+            .is_ok();
         let (outcomes, failures) = self
             .documents
             .refresh_open_documents(self.negotiated.text_synchronization);
@@ -993,7 +1026,8 @@ impl LspRuntime {
                 .is_ok();
         }
         let pending_events = self.documents.drain_pending_events();
-        synchronized
+        file_operations_delivered
+            && synchronized
             && self
                 .send_synchronization_events(pending_events)
                 .await
@@ -1261,6 +1295,63 @@ impl LspRuntime {
                     retry: "unsafe",
                     data: json!({"reason": error.to_string()}),
                 })?;
+        }
+        Ok(())
+    }
+
+    async fn send_file_operation_notifications(
+        &mut self,
+        operations: &[Value],
+    ) -> Result<(), ContractFailure> {
+        for operation in operations {
+            let Some(kind) = operation.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let (capability, method, files) = match kind {
+                "create" => (
+                    "didCreate",
+                    "workspace/didCreateFiles",
+                    json!([{"uri": operation["uri"]}]),
+                ),
+                "rename" => (
+                    "didRename",
+                    "workspace/didRenameFiles",
+                    json!([{
+                        "oldUri": operation["oldUri"],
+                        "newUri": operation["newUri"]
+                    }]),
+                ),
+                "delete" => (
+                    "didDelete",
+                    "workspace/didDeleteFiles",
+                    json!([{"uri": operation["uri"]}]),
+                ),
+                _ => continue,
+            };
+            if !file_operation_registered(&self.negotiated.initialize_result, capability, operation)
+            {
+                continue;
+            }
+            self.write_lsp_message(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {"files": files}
+                }),
+                false,
+            )
+            .await
+            .map_err(|error| ContractFailure {
+                exit_code: 4,
+                category: "unavailable",
+                code: "owner_unavailable",
+                message: "A post-commit file-operation notification could not be delivered."
+                    .to_owned(),
+                stage: "post_commit",
+                delivery: "uncertain",
+                retry: "unsafe",
+                data: json!({"reason": error.to_string(), "method": method}),
+            })?;
         }
         Ok(())
     }
@@ -1544,6 +1635,70 @@ impl LspRuntime {
     }
 }
 
+fn file_operation_registered(
+    initialize_result: &Value,
+    capability: &str,
+    operation: &Value,
+) -> bool {
+    let Some(filters) = initialize_result
+        .pointer(&format!(
+            "/capabilities/workspace/fileOperations/{capability}/filters"
+        ))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let uris = match operation.get("kind").and_then(Value::as_str) {
+        Some("rename") => vec![operation.get("oldUri"), operation.get("newUri")],
+        _ => vec![operation.get("uri")],
+    };
+    filters.iter().any(|filter| {
+        uris.iter().flatten().any(|uri| {
+            file_operation_filter_matches(
+                filter,
+                uri.as_str().unwrap_or_default(),
+                operation["isDirectory"].as_bool().unwrap_or(false),
+            )
+        })
+    })
+}
+
+fn file_operation_filter_matches(filter: &Value, uri: &str, is_directory: bool) -> bool {
+    let Some(filter) = filter.as_object() else {
+        return false;
+    };
+    let Some(uri) = Url::parse(uri).ok() else {
+        return false;
+    };
+    if filter
+        .get("scheme")
+        .and_then(Value::as_str)
+        .is_some_and(|scheme| scheme != uri.scheme())
+    {
+        return false;
+    }
+    let Some(pattern) = filter.get("pattern").and_then(Value::as_object) else {
+        return false;
+    };
+    if pattern
+        .get("matches")
+        .and_then(Value::as_str)
+        .is_some_and(|matches| matches != if is_directory { "folder" } else { "file" })
+    {
+        return false;
+    }
+    let Some(glob) = pattern.get("glob").and_then(Value::as_str) else {
+        return false;
+    };
+    let ignore_case = pattern
+        .get("options")
+        .and_then(Value::as_object)
+        .and_then(|options| options.get("ignoreCase"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::query::protocol_glob_matches(glob, uri.path(), ignore_case)
+}
+
 #[derive(Clone)]
 struct CallbackContext {
     settings: Value,
@@ -1588,13 +1743,17 @@ fn workspace_configuration_result(
         items
             .iter()
             .map(|item| {
+                let Some(item) = item.as_object() else {
+                    return Value::Null;
+                };
                 if !configuration_scope_allowed(context, item.get("scopeUri")) {
                     return Value::Null;
                 }
-                let section = item
-                    .get("section")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let section = match item.get("section") {
+                    None | Some(Value::Null) => "",
+                    Some(Value::String(section)) => section,
+                    Some(_) => return Value::Null,
+                };
                 if section.is_empty() {
                     return context.settings.clone();
                 }
@@ -1616,10 +1775,12 @@ fn workspace_configuration_result(
 }
 
 fn configuration_scope_allowed(context: &CallbackContext, scope_uri: Option<&Value>) -> bool {
-    let Some(scope_uri) = scope_uri.and_then(Value::as_str) else {
-        return true;
+    let scope_uri = match scope_uri {
+        None | Some(Value::Null) => return true,
+        Some(Value::String(scope_uri)) => scope_uri,
+        Some(_) => return false,
     };
-    if scope_uri == context.workspace_uri {
+    if scope_uri.as_str() == context.workspace_uri {
         return true;
     }
     Url::parse(scope_uri)
@@ -2044,4 +2205,61 @@ fn rfc3339_after(duration: Duration) -> String {
         + ::time::Duration::try_from(duration).unwrap_or(::time::Duration::ZERO))
     .format(&Rfc3339)
     .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_operation_filters_honor_kind_glob_and_case_options() {
+        let initialized = json!({
+            "capabilities": {"workspace": {"fileOperations": {"didRename": {
+                "filters": [{
+                    "scheme": "file",
+                    "pattern": {
+                        "glob": "**/*.{RS,py}",
+                        "matches": "file",
+                        "options": {"ignoreCase": true}
+                    }
+                }]
+            }}}}
+        });
+        assert!(file_operation_registered(
+            &initialized,
+            "didRename",
+            &json!({
+                "kind": "rename",
+                "oldUri": "file:///workspace/old.txt",
+                "newUri": "file:///workspace/src/main.rs",
+                "isDirectory": false
+            })
+        ));
+        assert!(!file_operation_registered(
+            &initialized,
+            "didRename",
+            &json!({
+                "kind": "rename",
+                "oldUri": "file:///workspace/old.txt",
+                "newUri": "file:///workspace/src/main.rs",
+                "isDirectory": true
+            })
+        ));
+    }
+
+    #[test]
+    fn workspace_configuration_returns_null_for_malformed_items() {
+        let context = CallbackContext {
+            settings: json!({"rust": {"check": true}}),
+            workspace_uri: "file:///workspace/".to_owned(),
+            workspace_path: PathBuf::from("/workspace"),
+            workspace_folder: json!({"uri": "file:///workspace/", "name": "workspace"}),
+        };
+        let result = workspace_configuration_result(
+            &context,
+            &json!({"items": [null, {"scopeUri": 7}, {"section": 7}, {"section": "rust.check"}]}),
+        )
+        .unwrap();
+        assert_eq!(result, json!([null, null, null, true]));
+    }
 }

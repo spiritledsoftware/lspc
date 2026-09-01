@@ -50,7 +50,10 @@ pub(crate) enum OwnerRequest {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         documents: Vec<OwnerDocumentInput>,
     },
-    RefreshDocuments,
+    RefreshDocuments {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        file_operations: Vec<Value>,
+    },
     Stop {
         force: bool,
     },

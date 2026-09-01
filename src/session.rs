@@ -791,6 +791,8 @@ pub(crate) fn signal_workspace_owners(
 pub(crate) fn refresh_workspace_owners(
     workspace_uri: &str,
     server: Option<&str>,
+    session_identity: Option<&str>,
+    file_operations: &[Value],
 ) -> (Vec<String>, Vec<String>) {
     run_async(async {
         let Ok(endpoints) = live_endpoints().await else {
@@ -801,9 +803,18 @@ pub(crate) fn refresh_workspace_owners(
         for endpoint in endpoints.into_iter().filter(|endpoint| {
             endpoint.workspace_uri == workspace_uri
                 && server.is_none_or(|server| server == endpoint.server)
+                && session_identity
+                    .is_none_or(|session_identity| session_identity == endpoint.session_identity)
         }) {
             let generation = endpoint.owner_generation.clone();
-            match send_owner_request(&endpoint, OwnerRequest::RefreshDocuments).await {
+            match send_owner_request(
+                &endpoint,
+                OwnerRequest::RefreshDocuments {
+                    file_operations: file_operations.to_vec(),
+                },
+            )
+            .await
+            {
                 Ok(result) if result["delivered"].as_bool() == Some(true) => {
                     refreshed.push(generation)
                 }

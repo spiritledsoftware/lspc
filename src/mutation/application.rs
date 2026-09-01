@@ -32,7 +32,7 @@ use super::{
 };
 
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
-type PostCommit<'a> = dyn FnMut(&ReceiptRecord) -> bool + 'a;
+type PostCommit<'a> = dyn FnMut(&ReceiptRecord, &[Value]) -> bool + 'a;
 
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
@@ -42,6 +42,7 @@ pub(crate) struct ApplicationContext<'a> {
     pub(crate) reauthorize: Option<&'a ReauthorizePreview<'a>>,
     pub(crate) post_commit: Option<&'a mut PostCommit<'a>>,
     pub(crate) preauthorized: bool,
+    pub(crate) caller_deadline: Option<Instant>,
 }
 
 /// Applies one exact Preview under the Workspace lock and records at-most-once completion.
@@ -69,10 +70,12 @@ pub(crate) fn apply_preview(
     let lock_file = context
         .store
         .open_application_lock(&preliminary.preview.workspace_uri)?;
-    lock_workspace(
+    lock_workspace_for_application(
         &lock_file,
         &preliminary.preview.workspace_uri,
         &context.mutation_limits.application_lock_timeout,
+        context.caller_deadline,
+        preview_id,
     )?;
     if let Some(receipt) = context.store.already_applied(preview_id)?
         && receipt.receipt.outcome == "applied"
@@ -80,6 +83,10 @@ pub(crate) fn apply_preview(
         return Ok(application_success(&receipt.receipt, "already_applied"));
     }
     let mut stored = context.store.reserve_preview(preview_id)?;
+    if deadline_expired(context.caller_deadline) {
+        let _ = context.store.release_preview(&mut stored);
+        return Err(application_cancelled(preview_id));
+    }
     if let Some(reauthorize) = context.reauthorize {
         let stale_reasons = match reauthorize(&stored) {
             Ok(reasons) => reasons,
@@ -189,6 +196,12 @@ pub(crate) fn apply_preview(
         let _ = context.store.release_preview(&mut stored);
         return Err(failure);
     }
+    if deadline_expired(context.caller_deadline) {
+        let _ = cleanup_transaction_artifacts(&transaction);
+        let _ = context.store.remove_transaction(&transaction_id);
+        let _ = context.store.release_preview(&mut stored);
+        return Err(application_cancelled(preview_id));
+    }
     transaction.state = TransactionState::Committing;
     context.store.write_transaction(&transaction)?;
     let started_at = transaction.started_at.clone();
@@ -244,10 +257,11 @@ pub(crate) fn apply_preview(
         } else {
             context.store.write_transaction(&transaction)?;
         }
+        let file_operations = post_commit_file_operations(&stored);
         if context
             .post_commit
             .as_deref_mut()
-            .is_some_and(|post_commit| post_commit(&receipt))
+            .is_some_and(|post_commit| post_commit(&receipt, &file_operations))
         {
             context
                 .store
@@ -353,6 +367,46 @@ pub(crate) fn apply_preview(
             Err(recovery_required_failure(&transaction))
         }
     }
+}
+
+fn post_commit_file_operations(stored: &StoredPreview) -> Vec<Value> {
+    stored
+        .preview
+        .plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            CanonicalOperation::Text { .. } => None,
+            CanonicalOperation::Create { uri, path, .. } => Some(json!({
+                "kind": "create",
+                "uri": uri,
+                "isDirectory": manifest_is_directory(&stored.preview.plan.intended_manifest, path)
+            })),
+            CanonicalOperation::Rename {
+                old_uri,
+                new_uri,
+                new_path,
+                ..
+            } => Some(json!({
+                "kind": "rename",
+                "oldUri": old_uri,
+                "newUri": new_uri,
+                "isDirectory": manifest_is_directory(&stored.preview.plan.intended_manifest, new_path)
+            })),
+            CanonicalOperation::Delete { uri, path, .. } => Some(json!({
+                "kind": "delete",
+                "uri": uri,
+                "isDirectory": manifest_is_directory(&stored.preview.plan.before_manifest, path)
+            })),
+        })
+        .collect()
+}
+
+fn manifest_is_directory(manifest: &[ManifestEntry], path: &Path) -> bool {
+    manifest
+        .iter()
+        .find(|entry| entry.path == path)
+        .is_some_and(|entry| entry.resource_kind == ResourceKind::Directory)
 }
 
 /// Rolls a recovery transaction back only while its observed manifest still matches.
@@ -654,6 +708,11 @@ fn apply_text_operation(
         .capability_root()
         .open_with(relative, &read_options)
         .map_err(|error| error.to_string())?;
+    let accessed = source
+        .metadata()
+        .and_then(|metadata| metadata.accessed())
+        .map_err(|error| format!("The text resource access time cannot be inspected: {error}"))?
+        .into_std();
     let mut bytes = Vec::new();
     source
         .read_to_end(&mut bytes)
@@ -677,6 +736,7 @@ fn apply_text_operation(
     if digest_raw_bytes(&result) != after_digest {
         return Err("Canonical text edit digest does not match.".to_owned());
     }
+    drop(source);
     let mut write_options = CapabilityOpenOptions::new();
     write_options.write(true).follow(FollowSymlinks::No);
     let mut file = planner
@@ -687,6 +747,10 @@ fn apply_text_operation(
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&result))
         .and_then(|_| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    let file = file.into_std();
+    file.set_times(std::fs::FileTimes::new().set_accessed(accessed))
+        .and_then(|()| file.sync_all())
         .map_err(|error| error.to_string())
 }
 
@@ -935,7 +999,6 @@ fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> s
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_dir() {
         fs::create_dir(destination)?;
-        fs::set_permissions(destination, metadata.permissions())?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             copy_resource(
@@ -944,29 +1007,180 @@ fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> s
                 copied_bytes,
             )?;
         }
+        copy_required_metadata(source, destination, &metadata, copied_bytes)?;
+        restore_source_access_time(source, &metadata)?;
         flush_directory(destination)?;
     } else {
         fs::copy(source, destination)?;
         *copied_bytes = copied_bytes.saturating_add(metadata.len());
-        copy_extended_attributes(source, destination)?;
+        copy_required_metadata(source, destination, &metadata, copied_bytes)?;
+        restore_source_access_time(source, &metadata)?;
         File::open(destination)?.sync_all()?;
     }
     Ok(())
 }
 
+fn copy_required_metadata(
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+    copied_bytes: &mut u64,
+) -> std::io::Result<()> {
+    copy_native_owner(source, destination, metadata)?;
+    *copied_bytes = copied_bytes.saturating_add(copy_extended_attributes(source, destination)?);
+    fs::set_permissions(destination, metadata.permissions())?;
+    copy_native_flags(source, destination, metadata)?;
+    copy_file_times(destination, metadata)
+}
+
 #[cfg(unix)]
-fn copy_extended_attributes(source: &Path, destination: &Path) -> std::io::Result<()> {
-    for name in xattr::list(source)? {
-        if let Some(value) = xattr::get(source, &name)? {
-            xattr::set(destination, &name, &value)?;
-        }
+fn copy_native_owner(
+    _source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
+
+    let path = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe { libc::chown(path.as_ptr(), metadata.uid(), metadata.gid()) } == -1 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn copy_extended_attributes(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+#[cfg(windows)]
+fn copy_native_owner(
+    source: &Path,
+    destination: &Path,
+    _metadata: &fs::Metadata,
+) -> std::io::Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            SetFileSecurityW,
+        },
+    };
+
+    let mut source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = ptr::null_mut();
+    let information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            source_wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let result =
+        if unsafe { SetFileSecurityW(destination_wide.as_mut_ptr(), information, descriptor) } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_native_owner(
+    _source: &Path,
+    _destination: &Path,
+    _metadata: &fs::Metadata,
+) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_native_flags(
+    _source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
+
+    let path = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe { libc::chflags(path.as_ptr(), metadata.st_flags()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_native_flags(
+    _source: &Path,
+    _destination: &Path,
+    _metadata: &fs::Metadata,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn copy_file_times(destination: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if metadata.is_dir() {
+        // Opening directories for timestamp updates requires
+        // FILE_FLAG_BACKUP_SEMANTICS; directory timestamps are not part of
+        // the v1 Mutation metadata digest on Windows.
+        return Ok(());
+    }
+    let times = std::fs::FileTimes::new()
+        .set_accessed(metadata.accessed()?)
+        .set_modified(metadata.modified()?);
+    File::open(destination)?.set_times(times)
+}
+
+#[cfg(unix)]
+fn restore_source_access_time(source: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    File::open(source)?.set_times(std::fs::FileTimes::new().set_accessed(metadata.accessed()?))
+}
+
+#[cfg(not(unix))]
+fn restore_source_access_time(_source: &Path, _metadata: &fs::Metadata) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_extended_attributes(source: &Path, destination: &Path) -> std::io::Result<u64> {
+    let mut copied_bytes = 0_u64;
+    for name in xattr::list(source)? {
+        if let Some(value) = xattr::get(source, &name)? {
+            xattr::set(destination, &name, &value)?;
+            copied_bytes = copied_bytes
+                .saturating_add(name.as_encoded_bytes().len() as u64)
+                .saturating_add(value.len() as u64);
+        }
+    }
+    Ok(copied_bytes)
+}
+
+#[cfg(not(unix))]
+fn copy_extended_attributes(_source: &Path, _destination: &Path) -> std::io::Result<u64> {
+    Ok(0)
 }
 
 fn remove_resource(path: &Path) -> std::io::Result<()> {
@@ -1150,6 +1364,71 @@ pub(crate) fn lock_workspace(
     }
 }
 
+fn lock_workspace_for_application(
+    file: &File,
+    workspace_uri: &str,
+    timeout_text: &str,
+    caller_deadline: Option<Instant>,
+    preview_id: &str,
+) -> Result<(), ContractFailure> {
+    let timeout = parse_duration(timeout_text).unwrap_or(Duration::from_secs(30));
+    let lock_deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock)
+                if caller_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                return Err(application_cancelled(preview_id));
+            }
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(ContractFailure {
+                    exit_code: 4,
+                    category: "unavailable",
+                    code: "workspace_lock_timeout",
+                    message: "The Workspace Application lock timed out.".to_owned(),
+                    stage: "lock_workspace",
+                    delivery: "not_applicable",
+                    retry: "safe",
+                    data: json!({"workspaceUri": workspace_uri, "timeout": timeout_text}),
+                });
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(ContractFailure {
+                    exit_code: 4,
+                    category: "unavailable",
+                    code: "state_unavailable",
+                    message: "The Workspace Application lock failed.".to_owned(),
+                    stage: "persist",
+                    delivery: "not_applicable",
+                    retry: "after_change",
+                    data: json!({"recordType": "transaction", "path": "", "osCode": error.raw_os_error()}),
+                });
+            }
+        }
+    }
+}
+
+fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn application_cancelled(preview_id: &str) -> ContractFailure {
+    ContractFailure {
+        exit_code: 6,
+        category: "mutation",
+        code: "application_cancelled",
+        message: "The caller deadline expired before Application commit began.".to_owned(),
+        stage: "lock_workspace",
+        delivery: "not_applicable",
+        retry: "safe",
+        data: json!({"previewId": preview_id}),
+    }
+}
+
 fn parse_duration(value: &str) -> Option<Duration> {
     if let Some(value) = value.strip_suffix("ms") {
         value.parse().ok().map(Duration::from_millis)
@@ -1257,6 +1536,8 @@ fn flush_directory(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -1268,6 +1549,12 @@ mod tests {
         let state = TempDir::new().unwrap();
         let file = workspace.path().join("main.rs");
         fs::write(&file, "old\n").unwrap();
+        let original_accessed =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(original_accessed))
+            .unwrap();
         let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
         let preview_limits = PreviewSettings {
             max_count: 64,
@@ -1329,11 +1616,51 @@ mod tests {
             reauthorize: None,
             post_commit: None,
             preauthorized: false,
+            caller_deadline: None,
         };
         let first = apply_preview(&mut context, &id).unwrap();
         let second = apply_preview(&mut context, &id).unwrap();
+        assert_eq!(
+            fs::metadata(workspace.path().join("main.rs"))
+                .unwrap()
+                .accessed()
+                .unwrap(),
+            original_accessed
+        );
         assert_eq!(fs::read_to_string(file).unwrap(), "new\n");
         assert_eq!(first["outcome"], "applied");
         assert_eq!(second["outcome"], "already_applied");
+    }
+
+    #[test]
+    fn caller_deadline_cancels_application_while_waiting_for_workspace_lock() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("application.lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let waiter = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let preview_id = format!("prv_{}", "1".repeat(32));
+        let failure = lock_workspace_for_application(
+            &waiter,
+            "file:///workspace/",
+            "1s",
+            Some(Instant::now() + Duration::from_millis(10)),
+            &preview_id,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "application_cancelled");
+        assert_eq!(failure.data["previewId"], preview_id);
     }
 }
