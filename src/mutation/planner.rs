@@ -164,6 +164,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
         preview_limits: &'a PreviewSettings,
         mutation_limits: &'a MutationSettings,
     ) -> Result<Self, WorkspaceEditProblem> {
+        if workspace.to_str().is_none() {
+            return Err(problem(
+                "filesystem_capability_unavailable",
+                "The Workspace path must be representable as a UTF-8 JSON string.",
+                None,
+                None,
+                None,
+            ));
+        }
         let workspace_dir =
             Dir::open_ambient_dir(workspace, ambient_authority()).map_err(|error| {
                 problem(
@@ -207,6 +216,13 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 None,
             )]);
         };
+        if let Err(problem) = validate_object_keys(
+            object,
+            &["changes", "documentChanges", "changeAnnotations"],
+            None,
+        ) {
+            return Err(vec![problem]);
+        }
         let annotations = object
             .get("changeAnnotations")
             .cloned()
@@ -291,13 +307,34 @@ impl<'a> WorkspaceEditPlanner<'a> {
                     continue;
                 };
                 if let Some(text_document) = change.get("textDocument") {
+                    if let Err(problem) =
+                        validate_object_keys(change, &["textDocument", "edits"], Some(index))
+                    {
+                        problems.push(problem);
+                        continue;
+                    }
+                    let Some(text_document) = text_document.as_object() else {
+                        problems.push(problem(
+                            "unknown_operation",
+                            "TextDocumentEdit.textDocument must be an object.",
+                            Some(index),
+                            None,
+                            None,
+                        ));
+                        continue;
+                    };
+                    if let Err(problem) =
+                        validate_object_keys(text_document, &["uri", "version"], Some(index))
+                    {
+                        problems.push(problem);
+                        continue;
+                    }
                     if let Some(version) = text_document.get("version")
                         && !version.is_null()
-                        && version.as_i64().is_none()
                     {
                         problems.push(problem(
                             "invalid_document_version",
-                            "TextDocumentEdit.version must be an integer or null.",
+                            "A local Workspace Edit cannot prove a non-null originating Document version.",
                             Some(index),
                             None,
                             None,
@@ -613,6 +650,9 @@ impl<'a> WorkspaceEditPlanner<'a> {
         result.extend_from_slice(&bytes[cursor..]);
         let before_digest = state.manifest.content_digest.clone().unwrap();
         let after_digest = digest_raw_bytes(&result);
+        if after_digest == before_digest {
+            return;
+        }
         state.text = Some(result);
         state.manifest.content_digest = Some(after_digest.clone());
         workspace.affected.insert(path.clone());
@@ -640,6 +680,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
         summary: &mut PreviewSummary,
         problems: &mut Vec<WorkspaceEditProblem>,
     ) {
+        if let Err(problem) = validate_resource_operation(
+            operation,
+            &["kind", "uri", "options", "annotationId"],
+            &["overwrite", "ignoreIfExists"],
+            index,
+        ) {
+            problems.push(problem);
+            return;
+        }
         if let Err(problem) = validate_annotation(operation, annotations, index) {
             problems.push(problem);
             return;
@@ -671,13 +720,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let current = workspace.entries.get(&path).unwrap().clone();
         if current.manifest.exists && !overwrite {
             if ignore_if_exists {
-                operations.push(CanonicalOperation::Create {
-                    index,
-                    uri: uri.to_owned(),
-                    path,
-                    overwrite,
-                    ignore_if_exists,
-                });
                 return;
             }
             problems.push(problem(
@@ -740,6 +782,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
         summary: &mut PreviewSummary,
         problems: &mut Vec<WorkspaceEditProblem>,
     ) {
+        if let Err(problem) = validate_resource_operation(
+            operation,
+            &["kind", "oldUri", "newUri", "options", "annotationId"],
+            &["overwrite", "ignoreIfExists"],
+            index,
+        ) {
+            problems.push(problem);
+            return;
+        }
         if let Err(problem) = validate_annotation(operation, annotations, index) {
             problems.push(problem);
             return;
@@ -781,6 +832,16 @@ impl<'a> WorkspaceEditPlanner<'a> {
             ));
             return;
         }
+        if old_path.starts_with(&new_path) || new_path.starts_with(&old_path) {
+            problems.push(problem(
+                "ambiguous_path_sequence",
+                "RenameFile cannot move a path into its own ancestor or descendant.",
+                Some(index),
+                Some(&old_path),
+                None,
+            ));
+            return;
+        }
         if let Err(problem) = self.load_resource_tree(workspace, &old_path, index) {
             problems.push(problem);
             return;
@@ -806,15 +867,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let destination = workspace.entries.get(&new_path).unwrap().clone();
         if destination.manifest.exists && !overwrite {
             if ignore_if_exists {
-                operations.push(CanonicalOperation::Rename {
-                    index,
-                    old_uri: old_uri.to_owned(),
-                    new_uri: new_uri.to_owned(),
-                    old_path,
-                    new_path,
-                    overwrite,
-                    ignore_if_exists,
-                });
                 return;
             }
             problems.push(problem(
@@ -872,7 +924,11 @@ impl<'a> WorkspaceEditPlanner<'a> {
             workspace.entries.remove(path);
             workspace.affected.insert(path.clone());
             let relative = path.strip_prefix(&old_path).unwrap();
-            let target = new_path.join(relative);
+            let target = if relative.as_os_str().is_empty() {
+                new_path.clone()
+            } else {
+                new_path.join(relative)
+            };
             let mut state = state.clone();
             state.manifest.path = target.clone();
             workspace.entries.insert(target.clone(), state);
@@ -901,6 +957,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
         summary: &mut PreviewSummary,
         problems: &mut Vec<WorkspaceEditProblem>,
     ) {
+        if let Err(problem) = validate_resource_operation(
+            operation,
+            &["kind", "uri", "options", "annotationId"],
+            &["recursive", "ignoreIfNotExists"],
+            index,
+        ) {
+            problems.push(problem);
+            return;
+        }
         if let Err(problem) = validate_annotation(operation, annotations, index) {
             problems.push(problem);
             return;
@@ -932,13 +997,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let source = workspace.entries.get(&path).unwrap();
         if !source.manifest.exists {
             if ignore_if_not_exists {
-                operations.push(CanonicalOperation::Delete {
-                    index,
-                    uri: uri.to_owned(),
-                    path,
-                    recursive,
-                    ignore_if_not_exists,
-                });
                 return;
             }
             problems.push(problem(
@@ -984,6 +1042,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
     }
 
     fn path_from_file_uri(&self, raw: &str, index: u64) -> Result<PathBuf, WorkspaceEditProblem> {
+        if uri_contains_path_traversal(raw) {
+            return Err(problem(
+                "path_traversal",
+                "Mutation URIs cannot contain dot path segments.",
+                Some(index),
+                None,
+                Some(json!({"uri": raw})),
+            ));
+        }
         let uri = Url::parse(raw).map_err(|_| {
             problem(
                 "malformed_uri",
@@ -1011,6 +1078,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 Some(json!({"uri": raw})),
             )
         })?;
+        if path.to_str().is_none() {
+            return Err(problem(
+                "malformed_uri",
+                "Mutation paths must be representable as UTF-8 JSON strings.",
+                Some(index),
+                None,
+                Some(json!({"uri": raw})),
+            ));
+        }
         if path == self.workspace {
             return Err(problem(
                 "workspace_root_mutation",
@@ -1229,7 +1305,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 None,
             ));
         };
-        if resource_kind == ResourceKind::File && metadata_link_count(&metadata) > 1 {
+        if resource_kind == ResourceKind::File && metadata_link_count(path, &metadata, index)? > 1 {
             return Err(problem(
                 "hard_link",
                 "Regular files with multiple hard links are unsupported.",
@@ -1325,6 +1401,17 @@ fn parse_text_edit(
             None,
         )
     })?;
+    validate_object_keys(
+        object,
+        &[
+            "range",
+            "newText",
+            "annotationId",
+            "insertTextFormat",
+            "snippet",
+        ],
+        Some(index),
+    )?;
     if object.contains_key("insertTextFormat") || object.contains_key("snippet") {
         return Err(problem(
             "snippet_edit_unsupported",
@@ -1454,7 +1541,10 @@ fn position_to_offset(
         }
         offset += segment.len();
     }
-    (position.line == text.split_terminator('\n').count() as u32 && position.character == 0)
+    ((text.is_empty() && position.line == 0 && position.character == 0)
+        || (text.ends_with('\n')
+            && position.line == text.split_terminator('\n').count() as u32
+            && position.character == 0))
         .then_some(text.len())
 }
 
@@ -1510,6 +1600,61 @@ fn option_bool(options: Option<&Map<String, Value>>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_resource_operation(
+    operation: &Map<String, Value>,
+    allowed_keys: &[&str],
+    allowed_option_keys: &[&str],
+    index: u64,
+) -> Result<(), WorkspaceEditProblem> {
+    validate_object_keys(operation, allowed_keys, Some(index))?;
+    let Some(options) = operation.get("options") else {
+        return Ok(());
+    };
+    if options.is_null() {
+        return Ok(());
+    }
+    let options = options.as_object().ok_or_else(|| {
+        problem(
+            "unknown_operation",
+            "A resource operation options value must be an object.",
+            Some(index),
+            None,
+            Some(options.clone()),
+        )
+    })?;
+    validate_object_keys(options, allowed_option_keys, Some(index))?;
+    if let Some((name, value)) = options.iter().find(|(_, value)| !value.is_boolean()) {
+        return Err(problem(
+            "unknown_operation",
+            "A resource operation option must be boolean.",
+            Some(index),
+            None,
+            Some(json!({"option": name, "value": value})),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_object_keys(
+    object: &Map<String, Value>,
+    allowed_keys: &[&str],
+    index: Option<u64>,
+) -> Result<(), WorkspaceEditProblem> {
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed_keys.contains(&key.as_str()))
+    {
+        return Err(problem(
+            "unknown_operation",
+            "The Workspace Edit contains an unknown field.",
+            index,
+            None,
+            Some(json!({"field": key})),
+        ));
+    }
+    Ok(())
+}
+
 fn lexically_beneath(root: &Path, path: &Path) -> bool {
     if !path.is_absolute() || !path.starts_with(root) {
         return false;
@@ -1524,6 +1669,35 @@ fn lexically_beneath(root: &Path, path: &Path) -> bool {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
+}
+
+fn uri_contains_path_traversal(raw: &str) -> bool {
+    let path = raw
+        .split_once("://")
+        .map(|(_, path)| path)
+        .unwrap_or(raw)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    path.split('/').any(|segment| {
+        let mut decoded_dots = String::new();
+        let bytes = segment.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if index + 2 < bytes.len()
+                && bytes[index] == b'%'
+                && bytes[index + 1] == b'2'
+                && matches!(bytes[index + 2], b'e' | b'E')
+            {
+                decoded_dots.push('.');
+                index += 3;
+            } else {
+                decoded_dots.push(bytes[index] as char);
+                index += 1;
+            }
+        }
+        matches!(decoded_dots.as_str(), "." | "..")
+    })
 }
 
 fn missing_manifest(path: &Path) -> ManifestEntry {
@@ -1706,6 +1880,16 @@ fn identity_digest(
 
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    let information = windows_file_information(path)?;
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    path: &Path,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
@@ -1744,9 +1928,7 @@ fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
     if close_result == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Ok((information.dwVolumeSerialNumber, file_index))
+    Ok(information)
 }
 
 fn metadata_digest(
@@ -1986,13 +2168,39 @@ fn nearest_existing_device(_path: &Path) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn metadata_link_count(metadata: &Metadata) -> u64 {
+fn metadata_link_count(
+    _path: &Path,
+    metadata: &Metadata,
+    _index: u64,
+) -> Result<u64, WorkspaceEditProblem> {
     use std::os::unix::fs::MetadataExt;
-    metadata.nlink()
+    Ok(metadata.nlink())
 }
-#[cfg(not(unix))]
-fn metadata_link_count(_metadata: &Metadata) -> u64 {
-    1
+#[cfg(windows)]
+fn metadata_link_count(
+    path: &Path,
+    _metadata: &Metadata,
+    index: u64,
+) -> Result<u64, WorkspaceEditProblem> {
+    windows_file_information(path)
+        .map(|information| u64::from(information.nNumberOfLinks))
+        .map_err(|error| {
+            problem(
+                "filesystem_capability_unavailable",
+                "A Mutation resource link count cannot be inspected.",
+                Some(index),
+                Some(path),
+                Some(json!({"reason": error.to_string()})),
+            )
+        })
+}
+#[cfg(not(any(unix, windows)))]
+fn metadata_link_count(
+    _path: &Path,
+    _metadata: &Metadata,
+    _index: u64,
+) -> Result<u64, WorkspaceEditProblem> {
+    Ok(1)
 }
 
 #[cfg(unix)]
@@ -2000,7 +2208,12 @@ fn metadata_is_sparse(metadata: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.len() > 0 && metadata.blocks().saturating_mul(512) < metadata.len()
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn metadata_is_sparse(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x200 != 0
+}
+#[cfg(not(any(unix, windows)))]
 fn metadata_is_sparse(_metadata: &Metadata) -> bool {
     false
 }
@@ -2095,5 +2308,115 @@ mod tests {
                 .iter()
                 .any(|problem| problem.code == "overlapping_edits")
         );
+    }
+
+    #[test]
+    fn positions_require_a_real_or_trailing_empty_line() {
+        assert_eq!(
+            position_to_offset(
+                "abc\nxyz",
+                ProtocolPosition {
+                    line: 1,
+                    character: 3
+                },
+                PositionEncoding::Utf8
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            position_to_offset(
+                "abc\nxyz",
+                ProtocolPosition {
+                    line: 2,
+                    character: 0
+                },
+                PositionEncoding::Utf8
+            ),
+            None
+        );
+        assert_eq!(
+            position_to_offset(
+                "abc\n",
+                ProtocolPosition {
+                    line: 1,
+                    character: 0
+                },
+                PositionEncoding::Utf8
+            ),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn rejects_unbound_versions_unknown_fields_and_dot_segments() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("main.rs");
+        fs::write(&file, "abc").unwrap();
+        let uri = Url::from_file_path(&file).unwrap().to_string();
+        let workspace_uri = Url::from_directory_path(workspace.path())
+            .unwrap()
+            .to_string();
+        let (previews, mutation) = settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            &workspace_uri,
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+
+        let versioned = planner
+            .plan_workspace_edit(&json!({"documentChanges": [{
+                "textDocument": {"uri": uri, "version": 1},
+                "edits": []
+            }]}))
+            .unwrap_err();
+        assert_eq!(versioned[0].code, "invalid_document_version");
+
+        let unknown = planner
+            .plan_workspace_edit(&json!({"changes": {}, "unexpected": true}))
+            .unwrap_err();
+        assert_eq!(unknown[0].code, "unknown_operation");
+
+        let traversal_uri = format!(
+            "file://{}/child/../main.rs",
+            workspace.path().to_string_lossy()
+        );
+        let traversal = planner
+            .plan_workspace_edit(&json!({"changes": {traversal_uri: []}}))
+            .unwrap_err();
+        assert_eq!(traversal[0].code, "path_traversal");
+    }
+
+    #[test]
+    fn omits_exact_no_op_text_edits_from_the_plan() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("main.rs");
+        fs::write(&file, "abc").unwrap();
+        let uri = Url::from_file_path(&file).unwrap().to_string();
+        let workspace_uri = Url::from_directory_path(workspace.path())
+            .unwrap()
+            .to_string();
+        let (previews, mutation) = settings();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            &workspace_uri,
+            PositionEncoding::Utf8,
+            &previews,
+            &mutation,
+        )
+        .unwrap();
+        let planned = planner
+            .plan_workspace_edit(&json!({"changes": {uri: [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 3}
+                },
+                "newText": "abc"
+            }]}}))
+            .unwrap();
+        assert!(planned.plan.operations.is_empty());
+        assert_eq!(planned.summary.files_changed, 0);
     }
 }

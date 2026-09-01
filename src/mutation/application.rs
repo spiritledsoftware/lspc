@@ -1,8 +1,8 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
-    collections::BTreeSet,
-    fs::{self, File},
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     thread,
@@ -33,6 +33,7 @@ use super::{
 
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
 type PostCommit<'a> = dyn FnMut(&ReceiptRecord, &[Value]) -> bool + 'a;
+const ARTIFACT_OWNER_FILE: &str = ".lspc-transaction-owner";
 
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
@@ -183,6 +184,7 @@ pub(crate) fn apply_preview(
         started_at: now_rfc3339(),
         artifact_directory: artifact_directory.clone(),
         backups: planned_backups(&stored.preview.plan.before_manifest, &artifact_directory),
+        operations: stored.preview.plan.operations.clone(),
         before_manifest: stored.preview.plan.before_manifest.clone(),
         intended_manifest: stored.preview.plan.intended_manifest.clone(),
         observed_manifest: current,
@@ -190,22 +192,53 @@ pub(crate) fn apply_preview(
         cleanup_pending: false,
     };
     context.store.write_transaction(&transaction)?;
-    if let Err(failure) = stage_transaction_backups(&transaction, context.mutation_limits) {
-        let _ = cleanup_transaction_artifacts(&transaction);
-        let _ = context.store.remove_transaction(&transaction_id);
-        let _ = context.store.release_preview(&mut stored);
-        return Err(failure);
+    if let Err(stage_failure) = stage_transaction(
+        &transaction,
+        &stored.preview.plan.operations,
+        context.mutation_limits,
+    ) {
+        if !stage_failure.artifact_created {
+            let _ = context.store.remove_transaction(&transaction_id);
+            let _ = context.store.release_preview(&mut stored);
+            return Err(stage_failure.failure);
+        }
+        match cleanup_transaction_artifacts(&transaction) {
+            Ok(()) => {
+                let _ = context.store.remove_transaction(&transaction_id);
+                let _ = context.store.release_preview(&mut stored);
+                return Err(stage_failure.failure);
+            }
+            Err(_) => {
+                transaction.state = TransactionState::RecoveryRequired;
+                transaction.cleanup_pending = true;
+                context.store.write_transaction(&transaction)?;
+                return Err(recovery_required_failure(&transaction));
+            }
+        }
     }
     if deadline_expired(context.caller_deadline) {
-        let _ = cleanup_transaction_artifacts(&transaction);
-        let _ = context.store.remove_transaction(&transaction_id);
-        let _ = context.store.release_preview(&mut stored);
-        return Err(application_cancelled(preview_id));
+        match cleanup_transaction_artifacts(&transaction) {
+            Ok(()) => {
+                let _ = context.store.remove_transaction(&transaction_id);
+                let _ = context.store.release_preview(&mut stored);
+                return Err(application_cancelled(preview_id));
+            }
+            Err(_) => {
+                transaction.state = TransactionState::RecoveryRequired;
+                transaction.cleanup_pending = true;
+                context.store.write_transaction(&transaction)?;
+                return Err(recovery_required_failure(&transaction));
+            }
+        }
     }
     transaction.state = TransactionState::Committing;
     context.store.write_transaction(&transaction)?;
     let started_at = transaction.started_at.clone();
-    let commit_result = commit_operations(&planner, &stored.preview.plan.operations);
+    let commit_result = commit_operations(
+        &planner,
+        &transaction.artifact_directory,
+        &stored.preview.plan.operations,
+    );
     let intended_paths = stored
         .preview
         .plan
@@ -220,8 +253,10 @@ pub(crate) fn apply_preview(
         manifest_mismatches(&stored.preview.plan.intended_manifest, &observed).is_empty();
     if commit_result.is_ok() && manifest_ok {
         transaction.observed_manifest.clone_from(&observed);
-        let cleanup_pending = cleanup_transaction_artifacts(&transaction).is_err();
-        transaction.cleanup_pending = cleanup_pending;
+        transaction.state = TransactionState::CleanupPending;
+        transaction.cleanup_pending = true;
+        transaction.manifest_digest = manifest_digest(&observed);
+        context.store.write_transaction(&transaction)?;
         let mut receipt = ReceiptRecord {
             receipt_id: preview_id.to_owned(),
             kind: "receipt".to_owned(),
@@ -241,22 +276,17 @@ pub(crate) fn apply_preview(
             intended_manifest: stored.preview.plan.intended_manifest.clone(),
             observed_manifest: observed.clone(),
             session_synchronized: false,
-            cleanup_pending,
+            cleanup_pending: true,
             durability: durability_value(),
             manifest_digest: manifest_digest(&observed),
             failure_stage: None,
             failed_change: None,
         };
-        context.store.convert_preview_to_receipt(
-            preview_id,
-            receipt.clone(),
-            context.receipt_limits,
-        )?;
-        if !cleanup_pending {
-            context.store.remove_transaction(&transaction_id)?;
-        } else {
-            context.store.write_transaction(&transaction)?;
-        }
+        receipt = context
+            .store
+            .convert_preview_to_receipt(preview_id, receipt.clone(), context.receipt_limits)?
+            .receipt;
+        receipt.cleanup_pending = finish_terminal_cleanup(context.store, &transaction, preview_id);
         let file_operations = post_commit_file_operations(&stored);
         if context
             .post_commit
@@ -274,7 +304,11 @@ pub(crate) fn apply_preview(
     transaction.observed_manifest = observed;
     match rollback_transaction(&transaction, &planner) {
         Ok(restored) => {
-            let cleanup_pending = cleanup_transaction_artifacts(&transaction).is_err();
+            transaction.state = TransactionState::CleanupPending;
+            transaction.observed_manifest.clone_from(&restored);
+            transaction.manifest_digest = manifest_digest(&restored);
+            transaction.cleanup_pending = true;
+            context.store.write_transaction(&transaction)?;
             let receipt = ReceiptRecord {
                 receipt_id: preview_id.to_owned(),
                 kind: "receipt".to_owned(),
@@ -294,7 +328,7 @@ pub(crate) fn apply_preview(
                 intended_manifest: stored.preview.plan.intended_manifest.clone(),
                 observed_manifest: restored.clone(),
                 session_synchronized: false,
-                cleanup_pending,
+                cleanup_pending: true,
                 durability: durability_value(),
                 manifest_digest: manifest_digest(&restored),
                 failure_stage: Some("commit".to_owned()),
@@ -302,12 +336,10 @@ pub(crate) fn apply_preview(
             };
             context.store.convert_preview_to_receipt(
                 preview_id,
-                receipt.clone(),
+                receipt,
                 context.receipt_limits,
             )?;
-            if !cleanup_pending {
-                context.store.remove_transaction(&transaction_id)?;
-            }
+            let _ = finish_terminal_cleanup(context.store, &transaction, preview_id);
             Err(ContractFailure {
                 exit_code: 6,
                 category: "mutation",
@@ -369,6 +401,25 @@ pub(crate) fn apply_preview(
     }
 }
 
+fn finish_terminal_cleanup(
+    store: &MutationStateStore,
+    transaction: &TransactionRecord,
+    preview_id: &str,
+) -> bool {
+    if cleanup_transaction_artifacts(transaction).is_err()
+        || store.retire_preview_after_recovery(preview_id).is_err()
+        || store
+            .remove_transaction(&transaction.transaction_id)
+            .is_err()
+        || store
+            .mark_receipt_cleanup_complete(&transaction.receipt_id)
+            .is_err()
+    {
+        return true;
+    }
+    false
+}
+
 fn post_commit_file_operations(stored: &StoredPreview) -> Vec<Value> {
     stored
         .preview
@@ -407,6 +458,70 @@ fn manifest_is_directory(manifest: &[ManifestEntry], path: &Path) -> bool {
         .iter()
         .find(|entry| entry.path == path)
         .is_some_and(|entry| entry.resource_kind == ResourceKind::Directory)
+}
+
+/// Seals an abandoned staged or committing journal into exact Recovery evidence.
+pub(crate) fn reconcile_recovery_status(
+    store: &MutationStateStore,
+    initial: TransactionRecord,
+    preview_limits: &PreviewSettings,
+    mutation_limits: &MutationSettings,
+) -> Result<Option<TransactionRecord>, ContractFailure> {
+    let lock = store.open_application_lock(&initial.workspace_uri)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Some(initial)),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(ContractFailure {
+                exit_code: 4,
+                category: "unavailable",
+                code: "state_unavailable",
+                message: "The Workspace Application lock failed.".to_owned(),
+                stage: "persist",
+                delivery: "not_applicable",
+                retry: "after_change",
+                data: json!({
+                    "recordType": "transaction",
+                    "path": "workspace-application-lock",
+                    "osCode": error.raw_os_error()
+                }),
+            });
+        }
+    }
+    let mut transaction = match store.read_transaction(&initial.transaction_id) {
+        Ok(transaction) => transaction,
+        Err(failure) if failure.code == "recovery_not_found" => return Ok(None),
+        Err(failure) => return Err(failure),
+    };
+    if !matches!(
+        transaction.state,
+        TransactionState::Staged | TransactionState::Committing
+    ) {
+        return Ok(Some(transaction));
+    }
+    let planner = WorkspaceEditPlanner::open(
+        &transaction.workspace_path,
+        &transaction.workspace_uri,
+        PositionEncoding::Utf8,
+        preview_limits,
+        mutation_limits,
+    )
+    .map_err(|problem| unsupported_filesystem_failure(&transaction.workspace_uri, &[problem]))?;
+    let current = planner
+        .inspect_manifest_paths(&transaction_paths(&transaction))
+        .map_err(|problems| {
+            unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
+        })?;
+    let abandoned_commit = transaction.state == TransactionState::Committing
+        || !manifest_mismatches(&transaction.before_manifest, &current).is_empty();
+    transaction.observed_manifest = current;
+    transaction.manifest_digest = manifest_digest(&transaction.observed_manifest);
+    if abandoned_commit {
+        transaction.state = TransactionState::RecoveryRequired;
+        transaction.cleanup_pending = true;
+    }
+    store.write_transaction(&transaction)?;
+    Ok(Some(transaction))
 }
 
 /// Rolls a recovery transaction back only while its observed manifest still matches.
@@ -458,7 +573,26 @@ fn recover_transaction(
     receipt_limits: &ReceiptSettings,
     mutation_limits: &MutationSettings,
 ) -> Result<Value, ContractFailure> {
+    let initial = store.read_transaction(transaction_id)?;
+    let lock = store.open_application_lock(&initial.workspace_uri)?;
+    lock_workspace(
+        &lock,
+        &initial.workspace_uri,
+        &mutation_limits.application_lock_timeout,
+    )?;
     let mut transaction = store.read_transaction(transaction_id)?;
+    if transaction.state == TransactionState::CleanupPending && !accept_current {
+        return Err(ContractFailure {
+            exit_code: 7,
+            category: "recovery",
+            code: "recovery_not_found",
+            message: "A cleanup-only transaction cannot be rolled back.".to_owned(),
+            stage: "recover",
+            delivery: "not_applicable",
+            retry: "never",
+            data: json!({"transactionId": transaction_id}),
+        });
+    }
     if supplied_manifest_digest != transaction.manifest_digest {
         return Err(ContractFailure {
             exit_code: 7,
@@ -476,12 +610,6 @@ fn recover_transaction(
         });
     }
     store.ensure_receipt_capacity(receipt_limits)?;
-    let lock = store.open_application_lock(&transaction.workspace_uri)?;
-    lock_workspace(
-        &lock,
-        &transaction.workspace_uri,
-        &mutation_limits.application_lock_timeout,
-    )?;
     let planner = WorkspaceEditPlanner::open(
         &transaction.workspace_path,
         &transaction.workspace_uri,
@@ -516,7 +644,7 @@ fn recover_transaction(
     let outcome = if accept_current {
         "accepted_current"
     } else if transaction.state == TransactionState::Staged
-        && rollback_manifest_mismatches(&transaction.before_manifest, &current).is_empty()
+        && manifest_mismatches(&transaction.before_manifest, &current).is_empty()
     {
         "restored"
     } else {
@@ -635,6 +763,7 @@ struct CommitFailure {
 
 fn commit_operations(
     planner: &WorkspaceEditPlanner<'_>,
+    artifact_directory: &Path,
     operations: &[CanonicalOperation],
 ) -> Result<(), CommitFailure> {
     for operation in operations {
@@ -644,14 +773,19 @@ fn commit_operations(
                 path,
                 before_digest,
                 after_digest,
-                edits,
                 ..
-            } => apply_text_operation(planner, path, before_digest, after_digest, edits).map_err(
-                |reason| CommitFailure {
-                    operation_index: *index,
-                    _reason: reason,
-                },
-            ),
+            } => apply_text_operation(
+                planner,
+                artifact_directory,
+                *index,
+                path,
+                before_digest,
+                after_digest,
+            )
+            .map_err(|reason| CommitFailure {
+                operation_index: *index,
+                _reason: reason,
+            }),
             CanonicalOperation::Create {
                 index,
                 path,
@@ -671,23 +805,37 @@ fn commit_operations(
                 overwrite,
                 ignore_if_exists,
                 ..
-            } => apply_rename_operation(planner, old_path, new_path, *overwrite, *ignore_if_exists)
-                .map_err(|reason| CommitFailure {
-                    operation_index: *index,
-                    _reason: reason,
-                }),
+            } => apply_rename_operation(
+                planner,
+                artifact_directory,
+                *index,
+                old_path,
+                new_path,
+                *overwrite,
+                *ignore_if_exists,
+            )
+            .map_err(|reason| CommitFailure {
+                operation_index: *index,
+                _reason: reason,
+            }),
             CanonicalOperation::Delete {
                 index,
                 path,
                 recursive,
                 ignore_if_not_exists,
                 ..
-            } => apply_delete_operation(planner, path, *recursive, *ignore_if_not_exists).map_err(
-                |reason| CommitFailure {
-                    operation_index: *index,
-                    _reason: reason,
-                },
-            ),
+            } => apply_delete_operation(
+                planner,
+                artifact_directory,
+                *index,
+                path,
+                *recursive,
+                *ignore_if_not_exists,
+            )
+            .map_err(|reason| CommitFailure {
+                operation_index: *index,
+                _reason: reason,
+            }),
         };
         result?;
     }
@@ -696,10 +844,11 @@ fn commit_operations(
 
 fn apply_text_operation(
     planner: &WorkspaceEditPlanner<'_>,
+    artifact_directory: &Path,
+    operation_index: u64,
     path: &Path,
     before_digest: &str,
     after_digest: &str,
-    edits: &[super::planner::CanonicalTextEdit],
 ) -> Result<(), String> {
     let relative = planner.relative_path(path)?;
     let mut read_options = CapabilityOpenOptions::new();
@@ -720,19 +869,8 @@ fn apply_text_operation(
     if digest_raw_bytes(&bytes) != before_digest {
         return Err("Text resource changed during commit.".to_owned());
     }
-    let mut result = Vec::with_capacity(bytes.len());
-    let mut cursor = 0;
-    for edit in edits {
-        let start = edit.start_byte as usize;
-        let end = edit.end_byte as usize;
-        if start < cursor || end < start || end > bytes.len() {
-            return Err("Canonical text edit range is invalid.".to_owned());
-        }
-        result.extend_from_slice(&bytes[cursor..start]);
-        result.extend_from_slice(edit.new_text.as_bytes());
-        cursor = end;
-    }
-    result.extend_from_slice(&bytes[cursor..]);
+    let result = fs::read(staged_text_path(artifact_directory, operation_index))
+        .map_err(|error| error.to_string())?;
     if digest_raw_bytes(&result) != after_digest {
         return Err("Canonical text edit digest does not match.".to_owned());
     }
@@ -787,11 +925,14 @@ fn apply_create_operation(
     let file = root
         .open_with(relative, &options)
         .map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+    file.sync_all().map_err(|error| error.to_string())?;
+    flush_parent(path).map_err(|error| error.to_string())
 }
 
 fn apply_rename_operation(
     planner: &WorkspaceEditPlanner<'_>,
+    artifact_directory: &Path,
+    operation_index: u64,
     old_path: &Path,
     new_path: &Path,
     overwrite: bool,
@@ -802,7 +943,7 @@ fn apply_rename_operation(
     let new_relative = planner.relative_path(new_path)?;
     if root.symlink_metadata(new_relative).is_ok() {
         if overwrite {
-            remove_capability_resource(root, new_relative).map_err(|error| error.to_string())?;
+            move_resource_to_undo(planner, artifact_directory, operation_index, new_path)?;
         } else if ignore_if_exists {
             return Ok(());
         } else {
@@ -810,11 +951,18 @@ fn apply_rename_operation(
         }
     }
     root.rename(old_relative, root, new_relative)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    flush_parent(old_path).map_err(|error| error.to_string())?;
+    if old_path.parent() != new_path.parent() {
+        flush_parent(new_path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn apply_delete_operation(
     planner: &WorkspaceEditPlanner<'_>,
+    artifact_directory: &Path,
+    operation_index: u64,
     path: &Path,
     recursive: bool,
     ignore_if_not_exists: bool,
@@ -828,11 +976,35 @@ fn apply_delete_operation(
             Err("DeleteFile target is missing.".to_owned())
         };
     };
-    if metadata.is_dir() && !recursive {
-        root.remove_dir(relative).map_err(|error| error.to_string())
-    } else {
-        remove_capability_resource(root, relative).map_err(|error| error.to_string())
+    if metadata.is_dir()
+        && !recursive
+        && root
+            .read_dir(relative)
+            .map_err(|error| error.to_string())?
+            .next()
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("DeleteFile directory is no longer empty.".to_owned());
     }
+    move_resource_to_undo(planner, artifact_directory, operation_index, path)
+}
+
+fn move_resource_to_undo(
+    planner: &WorkspaceEditPlanner<'_>,
+    artifact_directory: &Path,
+    operation_index: u64,
+    path: &Path,
+) -> Result<(), String> {
+    let root = planner.capability_root();
+    let relative = planner.relative_path(path)?;
+    let undo_path = undo_resource_path(artifact_directory, operation_index);
+    let undo_relative = planner.relative_path(&undo_path)?;
+    root.rename(relative, root, undo_relative)
+        .map_err(|error| error.to_string())?;
+    flush_parent(path).map_err(|error| error.to_string())?;
+    flush_parent(&undo_path).map_err(|error| error.to_string())
 }
 
 fn remove_capability_resource(root: &Dir, relative: &Path) -> std::io::Result<()> {
@@ -877,17 +1049,80 @@ fn planned_backups(before: &[ManifestEntry], artifact_directory: &Path) -> Vec<B
         .collect()
 }
 
-fn stage_transaction_backups(
+fn stage_transaction(
     transaction: &TransactionRecord,
+    operations: &[CanonicalOperation],
     limits: &MutationSettings,
-) -> Result<(), ContractFailure> {
-    fs::create_dir(&transaction.artifact_directory).map_err(|error| {
+) -> Result<(), TransactionStageFailure> {
+    create_private_directory(&transaction.artifact_directory).map_err(|error| {
+        TransactionStageFailure {
+            failure: stage_failure(
+                &transaction.transaction_id,
+                "The same-volume transaction directory cannot be created.",
+                error.raw_os_error(),
+            ),
+            artifact_created: false,
+        }
+    })?;
+    if let Err(failure) = write_artifact_owner(transaction) {
+        let _ = fs::remove_file(transaction.artifact_directory.join(ARTIFACT_OWNER_FILE));
+        let removed = fs::remove_dir(&transaction.artifact_directory).is_ok();
+        return Err(TransactionStageFailure {
+            failure,
+            artifact_created: !removed,
+        });
+    }
+    stage_transaction_contents(transaction, operations, limits).map_err(|failure| {
+        TransactionStageFailure {
+            failure,
+            artifact_created: true,
+        }
+    })
+}
+
+#[derive(Debug)]
+struct TransactionStageFailure {
+    failure: ContractFailure,
+    artifact_created: bool,
+}
+
+fn write_artifact_owner(transaction: &TransactionRecord) -> Result<(), ContractFailure> {
+    let path = transaction.artifact_directory.join(ARTIFACT_OWNER_FILE);
+    let mut owner = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            stage_failure(
+                &transaction.transaction_id,
+                "The transaction ownership marker cannot be created.",
+                error.raw_os_error(),
+            )
+        })?;
+    state_permissions::restrict_file(&path).map_err(|error| {
         stage_failure(
             &transaction.transaction_id,
-            "The same-volume transaction directory cannot be created.",
+            "The transaction ownership marker cannot be made private.",
             error.raw_os_error(),
         )
     })?;
+    owner
+        .write_all(transaction.transaction_id.as_bytes())
+        .and_then(|()| owner.sync_all())
+        .map_err(|error| {
+            stage_failure(
+                &transaction.transaction_id,
+                "The transaction ownership marker cannot be flushed.",
+                error.raw_os_error(),
+            )
+        })
+}
+
+fn stage_transaction_contents(
+    transaction: &TransactionRecord,
+    operations: &[CanonicalOperation],
+    limits: &MutationSettings,
+) -> Result<(), ContractFailure> {
     state_permissions::restrict_directory(&transaction.artifact_directory).map_err(|error| {
         stage_failure(
             &transaction.transaction_id,
@@ -921,6 +1156,7 @@ fn stage_transaction_backups(
             });
         }
     }
+    stage_text_outputs(transaction, operations, limits)?;
     flush_directory(&transaction.artifact_directory).map_err(|error| {
         stage_failure(
             &transaction.transaction_id,
@@ -930,43 +1166,508 @@ fn stage_transaction_backups(
     })
 }
 
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)?;
+    if let Err(error) = state_permissions::restrict_directory(path) {
+        let _ = fs::remove_dir(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stage_text_outputs(
+    transaction: &TransactionRecord,
+    operations: &[CanonicalOperation],
+    limits: &MutationSettings,
+) -> Result<(), ContractFailure> {
+    let mut texts = BTreeMap::<PathBuf, Vec<u8>>::new();
+    let mut unavailable = Vec::<PathBuf>::new();
+    let mut aliases = Vec::<(PathBuf, PathBuf)>::new();
+    let mut staged_bytes = 0_u64;
+    for operation in operations {
+        match operation {
+            CanonicalOperation::Text {
+                index,
+                path,
+                before_digest,
+                after_digest,
+                edits,
+                ..
+            } => {
+                let before =
+                    virtual_text(path, &texts, &unavailable, &aliases).map_err(|error| {
+                        stage_failure(
+                            &transaction.transaction_id,
+                            "A text input cannot be staged.",
+                            error.raw_os_error(),
+                        )
+                    })?;
+                if digest_raw_bytes(&before) != *before_digest {
+                    return Err(stage_failure(
+                        &transaction.transaction_id,
+                        "A staged text input no longer matches its canonical digest.",
+                        None,
+                    ));
+                }
+                let after = apply_canonical_text_edits(&before, edits)
+                    .map_err(|reason| stage_failure(&transaction.transaction_id, &reason, None))?;
+                if digest_raw_bytes(&after) != *after_digest {
+                    return Err(stage_failure(
+                        &transaction.transaction_id,
+                        "A staged text output does not match its canonical digest.",
+                        None,
+                    ));
+                }
+                staged_bytes = staged_bytes.saturating_add(after.len() as u64);
+                if staged_bytes > limits.max_staged_text_bytes {
+                    return Err(ContractFailure {
+                        exit_code: 6,
+                        category: "mutation",
+                        code: "resource_limit_exceeded",
+                        message: "Text staging exceeds the configured byte limit.".to_owned(),
+                        stage: "stage",
+                        delivery: "not_applicable",
+                        retry: "after_change",
+                        data: json!({
+                            "resource": "stagedTextBytes",
+                            "limit": limits.max_staged_text_bytes,
+                            "observed": staged_bytes,
+                            "operationIndex": index
+                        }),
+                    });
+                }
+                let staged_path = staged_text_path(&transaction.artifact_directory, *index);
+                let mut staged = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staged_path)
+                    .map_err(|error| {
+                        stage_failure(
+                            &transaction.transaction_id,
+                            "A text output cannot be created in staging.",
+                            error.raw_os_error(),
+                        )
+                    })?;
+                state_permissions::restrict_file(&staged_path).map_err(|error| {
+                    stage_failure(
+                        &transaction.transaction_id,
+                        "A staged text output cannot be made private.",
+                        error.raw_os_error(),
+                    )
+                })?;
+                staged
+                    .write_all(&after)
+                    .and_then(|()| staged.sync_all())
+                    .map_err(|error| {
+                        stage_failure(
+                            &transaction.transaction_id,
+                            "A staged text output cannot be flushed.",
+                            error.raw_os_error(),
+                        )
+                    })?;
+                texts.insert(path.clone(), after);
+                unavailable.retain(|root| root != path);
+            }
+            CanonicalOperation::Create { path, .. } => {
+                texts.retain(|candidate, _| !candidate.starts_with(path));
+                texts.insert(path.clone(), Vec::new());
+                unavailable.retain(|root| root != path);
+            }
+            CanonicalOperation::Rename {
+                old_path, new_path, ..
+            } => {
+                let physical_source = resolve_physical_path(old_path, &aliases);
+                let moved = texts
+                    .iter()
+                    .filter(|(path, _)| path.starts_with(old_path))
+                    .map(|(path, text)| (path.clone(), text.clone()))
+                    .collect::<Vec<_>>();
+                texts.retain(|path, _| !path.starts_with(old_path) && !path.starts_with(new_path));
+                for (path, text) in moved {
+                    let relative = path.strip_prefix(old_path).unwrap();
+                    let target = if relative.as_os_str().is_empty() {
+                        new_path.clone()
+                    } else {
+                        new_path.join(relative)
+                    };
+                    texts.insert(target, text);
+                }
+                unavailable.retain(|root| !root.starts_with(new_path));
+                unavailable.push(old_path.clone());
+                aliases.push((new_path.clone(), physical_source));
+            }
+            CanonicalOperation::Delete { path, .. } => {
+                texts.retain(|candidate, _| !candidate.starts_with(path));
+                unavailable.push(path.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn virtual_text(
+    path: &Path,
+    texts: &BTreeMap<PathBuf, Vec<u8>>,
+    unavailable: &[PathBuf],
+    aliases: &[(PathBuf, PathBuf)],
+) -> std::io::Result<Vec<u8>> {
+    if let Some(text) = texts.get(path) {
+        return Ok(text.clone());
+    }
+    if unavailable.iter().any(|root| path.starts_with(root)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the virtual text resource is unavailable",
+        ));
+    }
+    read_source_preserving_access_time(&resolve_physical_path(path, aliases))
+}
+
+fn read_source_preserving_access_time(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    let bytes = fs::read(path)?;
+    restore_source_access_time(path, &metadata)?;
+    Ok(bytes)
+}
+
+fn resolve_physical_path(path: &Path, aliases: &[(PathBuf, PathBuf)]) -> PathBuf {
+    let mut resolved = path.to_path_buf();
+    for (virtual_root, physical_root) in aliases.iter().rev() {
+        if let Ok(relative) = resolved.strip_prefix(virtual_root) {
+            resolved = if relative.as_os_str().is_empty() {
+                physical_root.clone()
+            } else {
+                physical_root.join(relative)
+            };
+        }
+    }
+    resolved
+}
+
+fn apply_canonical_text_edits(
+    before: &[u8],
+    edits: &[super::planner::CanonicalTextEdit],
+) -> Result<Vec<u8>, String> {
+    let mut after = Vec::with_capacity(before.len());
+    let mut cursor = 0;
+    for edit in edits {
+        let start = edit.start_byte as usize;
+        let end = edit.end_byte as usize;
+        if start < cursor || end < start || end > before.len() {
+            return Err("A canonical staged text edit range is invalid.".to_owned());
+        }
+        after.extend_from_slice(&before[cursor..start]);
+        after.extend_from_slice(edit.new_text.as_bytes());
+        cursor = end;
+    }
+    after.extend_from_slice(&before[cursor..]);
+    Ok(after)
+}
+
+fn staged_text_path(artifact_directory: &Path, operation_index: u64) -> PathBuf {
+    artifact_directory.join(format!("text-{operation_index}"))
+}
+
+fn undo_resource_path(artifact_directory: &Path, operation_index: u64) -> PathBuf {
+    artifact_directory.join(format!("undo-{operation_index}"))
+}
+
 fn rollback_transaction(
     transaction: &TransactionRecord,
     planner: &WorkspaceEditPlanner<'_>,
 ) -> Result<Vec<ManifestEntry>, String> {
-    let mut affected = transaction
+    rollback_resource_operations(transaction, planner)?;
+    let current = planner
+        .inspect_manifest_paths(&transaction_paths(transaction))
+        .map_err(|problems| {
+            format!("The partial filesystem is unsafe for automatic rollback: {problems:?}")
+        })?;
+    let mut restore_in_place = Vec::new();
+    for expected in transaction
         .before_manifest
         .iter()
-        .chain(transaction.intended_manifest.iter())
-        .map(|entry| entry.path.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    affected.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in affected {
-        if path.exists() {
-            remove_resource(&path).map_err(|error| error.to_string())?;
+        .filter(|entry| entry.exists)
+    {
+        let actual = current
+            .iter()
+            .find(|entry| entry.path == expected.path)
+            .ok_or_else(|| "A pre-Application resource is missing during rollback.".to_owned())?;
+        if expected == actual {
+            continue;
+        }
+        if expected.resource_kind == ResourceKind::File
+            && actual.resource_kind == ResourceKind::File
+            && expected.identity_digest == actual.identity_digest
+        {
+            let backup_path = backup_path_for(&transaction.backups, &expected.path)
+                .ok_or_else(|| "A required rollback backup is missing.".to_owned())?;
+            restore_in_place.push((backup_path, expected.path.clone()));
+        } else {
+            return Err(
+                "Automatic rollback cannot restore the original resource identity.".to_owned(),
+            );
         }
     }
-    let mut backups = transaction.backups.clone();
-    backups.sort_by_key(|backup| backup.path.components().count());
-    for backup in backups {
-        if backup.existed {
-            if let Some(parent) = backup.path.parent() {
-                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            fs::rename(&backup.backup_path, &backup.path).map_err(|error| error.to_string())?;
+
+    let mut created = transaction
+        .before_manifest
+        .iter()
+        .filter(|entry| !entry.exists)
+        .filter_map(|entry| {
+            current
+                .iter()
+                .find(|actual| actual.path == entry.path && actual.exists)
+                .map(|_| entry.path.clone())
+        })
+        .collect::<Vec<_>>();
+    created.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in created {
+        if path.exists() {
+            let relative = planner.relative_path(&path)?;
+            remove_capability_resource(planner.capability_root(), relative)
+                .map_err(|error| error.to_string())?;
+            flush_parent(&path).map_err(|error| error.to_string())?;
         }
+    }
+    for (backup_path, destination) in restore_in_place {
+        restore_file_backup(planner, &backup_path, &destination)
+            .map_err(|error| error.to_string())?;
     }
     let restored = planner
         .inspect_manifest_paths(&transaction_paths(transaction))
         .map_err(|_| "The restored filesystem cannot be inspected.".to_owned())?;
-    let mismatches = rollback_manifest_mismatches(&transaction.before_manifest, &restored);
+    let mismatches = manifest_mismatches(&transaction.before_manifest, &restored);
     if mismatches.is_empty() {
         Ok(restored)
     } else {
         Err("The rollback manifest does not match its preconditions.".to_owned())
     }
+}
+
+fn rollback_resource_operations(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+) -> Result<(), String> {
+    for operation in transaction.operations.iter().rev() {
+        match operation {
+            CanonicalOperation::Text { .. } => {}
+            CanonicalOperation::Create { path, .. } => {
+                let expected = manifest_for_path(&transaction.before_manifest, path)?;
+                let actual = inspect_manifest_path(planner, path)?;
+                if !expected.exists && actual.exists {
+                    let relative = planner.relative_path(path)?;
+                    remove_capability_resource(planner.capability_root(), relative)
+                        .map_err(|error| error.to_string())?;
+                    flush_parent(path).map_err(|error| error.to_string())?;
+                }
+            }
+            CanonicalOperation::Rename {
+                index,
+                old_path,
+                new_path,
+                ..
+            } => rollback_rename_operation(transaction, planner, *index, old_path, new_path)?,
+            CanonicalOperation::Delete { index, path, .. } => {
+                rollback_delete_operation(transaction, planner, *index, path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_rename_operation(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+    operation_index: u64,
+    old_path: &Path,
+    new_path: &Path,
+) -> Result<(), String> {
+    let expected_old = manifest_for_path(&transaction.before_manifest, old_path)?;
+    let actual_old = inspect_manifest_path(planner, old_path)?;
+    if !actual_old.exists {
+        let actual_new = inspect_manifest_path(planner, new_path)?;
+        if !actual_new.exists
+            || (expected_old.exists && !same_resource_identity(expected_old, &actual_new))
+        {
+            return Err("The renamed resource identity is unavailable for rollback.".to_owned());
+        }
+        rename_capability_resource(planner, new_path, old_path)?;
+    } else if expected_old.exists && !same_resource_identity(expected_old, &actual_old) {
+        return Err("The original rename source changed before rollback.".to_owned());
+    }
+
+    let expected_new = manifest_for_path(&transaction.before_manifest, new_path)?;
+    let undo_path = undo_resource_path(&transaction.artifact_directory, operation_index);
+    let undo = inspect_manifest_path(planner, &undo_path)?;
+    if undo.exists {
+        if expected_new.exists && !same_resource_identity(expected_new, &undo) {
+            return Err("The overwritten rename destination changed in staging.".to_owned());
+        }
+        if inspect_manifest_path(planner, new_path)?.exists {
+            return Err("The rename destination is occupied during rollback.".to_owned());
+        }
+        rename_capability_resource(planner, &undo_path, new_path)?;
+    } else {
+        let actual_new = inspect_manifest_path(planner, new_path)?;
+        if expected_new.exists && !same_resource_identity(expected_new, &actual_new) {
+            return Err("The original rename destination is unavailable for rollback.".to_owned());
+        }
+        if !expected_new.exists && actual_new.exists {
+            return Err("The rename destination remains occupied after rollback.".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn rollback_delete_operation(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+    operation_index: u64,
+    path: &Path,
+) -> Result<(), String> {
+    let expected = manifest_for_path(&transaction.before_manifest, path)?;
+    let actual = inspect_manifest_path(planner, path)?;
+    let undo_path = undo_resource_path(&transaction.artifact_directory, operation_index);
+    let undo = inspect_manifest_path(planner, &undo_path)?;
+    if actual.exists {
+        if !undo.exists && (!expected.exists || same_resource_identity(expected, &actual)) {
+            return Ok(());
+        }
+        return Err("The deleted resource path is occupied during rollback.".to_owned());
+    }
+    if !undo.exists || (expected.exists && !same_resource_identity(expected, &undo)) {
+        return Err("The deleted resource identity is unavailable for rollback.".to_owned());
+    }
+    rename_capability_resource(planner, &undo_path, path)
+}
+
+fn manifest_for_path<'a>(
+    manifest: &'a [ManifestEntry],
+    path: &Path,
+) -> Result<&'a ManifestEntry, String> {
+    manifest
+        .iter()
+        .find(|entry| entry.path == path)
+        .ok_or_else(|| "A rollback manifest path is missing.".to_owned())
+}
+
+fn inspect_manifest_path(
+    planner: &WorkspaceEditPlanner<'_>,
+    path: &Path,
+) -> Result<ManifestEntry, String> {
+    planner
+        .inspect_manifest_paths(&[path.to_path_buf()])
+        .map_err(|_| "A rollback resource cannot be inspected safely.".to_owned())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "A rollback resource manifest is missing.".to_owned())
+}
+
+fn same_resource_identity(expected: &ManifestEntry, actual: &ManifestEntry) -> bool {
+    expected.exists
+        && actual.exists
+        && expected.resource_kind == actual.resource_kind
+        && expected.identity_digest == actual.identity_digest
+}
+
+fn rename_capability_resource(
+    planner: &WorkspaceEditPlanner<'_>,
+    from: &Path,
+    to: &Path,
+) -> Result<(), String> {
+    let root = planner.capability_root();
+    let from_relative = planner.relative_path(from)?;
+    let to_relative = planner.relative_path(to)?;
+    root.rename(from_relative, root, to_relative)
+        .map_err(|error| error.to_string())?;
+    flush_parent(from).map_err(|error| error.to_string())?;
+    if from.parent() != to.parent() {
+        flush_parent(to).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn restore_file_backup(
+    planner: &WorkspaceEditPlanner<'_>,
+    backup_path: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    let mut source = File::open(backup_path)?;
+    let metadata = source.metadata()?;
+    let relative = planner
+        .relative_path(destination)
+        .map_err(std::io::Error::other)?;
+    let mut options = CapabilityOpenOptions::new();
+    options
+        .write(true)
+        .truncate(true)
+        .follow(FollowSymlinks::No);
+    let mut output = planner.capability_root().open_with(relative, &options)?;
+    std::io::copy(&mut source, &mut output)?;
+    let output = output.into_std();
+    preserve_open_file_metadata(&source, &output, &metadata)?;
+    output.sync_all()
+}
+
+fn preserve_open_file_metadata(
+    source: &File,
+    destination: &File,
+    metadata: &fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+        copy_open_file_extended_attributes(source, destination)?;
+        if unsafe { libc::fchown(destination.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = source;
+    destination.set_permissions(metadata.permissions())?;
+    let times = fs::FileTimes::new()
+        .set_accessed(metadata.accessed()?)
+        .set_modified(metadata.modified()?);
+    destination.set_times(times)
+}
+
+#[cfg(unix)]
+fn copy_open_file_extended_attributes(source: &File, destination: &File) -> std::io::Result<()> {
+    use xattr::FileExt;
+
+    let source_names = source.list_xattr()?.collect::<BTreeSet<_>>();
+    for name in destination.list_xattr()? {
+        if !source_names.contains(&name) {
+            destination.remove_xattr(&name)?;
+        }
+    }
+    for name in source_names {
+        if let Some(value) = source.get_xattr(&name)? {
+            destination.set_xattr(&name, &value)?;
+        }
+    }
+    Ok(())
+}
+
+fn backup_path_for(backups: &[BackupEntry], path: &Path) -> Option<PathBuf> {
+    backups.iter().find_map(|backup| {
+        path.strip_prefix(&backup.path).ok().map(|relative| {
+            if relative.as_os_str().is_empty() {
+                backup.backup_path.clone()
+            } else {
+                backup.backup_path.join(relative)
+            }
+        })
+    })
 }
 
 fn transaction_paths(transaction: &TransactionRecord) -> Vec<PathBuf> {
@@ -978,21 +1679,6 @@ fn transaction_paths(transaction: &TransactionRecord) -> Vec<PathBuf> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn rollback_manifest_mismatches(
-    expected: &[ManifestEntry],
-    actual: &[ManifestEntry],
-) -> Vec<Value> {
-    let mut normalized_expected = expected.to_vec();
-    let mut normalized_actual = actual.to_vec();
-    for entry in normalized_expected
-        .iter_mut()
-        .chain(normalized_actual.iter_mut())
-    {
-        entry.identity_digest = None;
-    }
-    manifest_mismatches(&normalized_expected, &normalized_actual)
 }
 
 fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> std::io::Result<()> {
@@ -1183,17 +1869,20 @@ fn copy_extended_attributes(_source: &Path, _destination: &Path) -> std::io::Res
     Ok(0)
 }
 
-fn remove_resource(path: &Path) -> std::io::Result<()> {
-    if fs::symlink_metadata(path)?.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
 fn cleanup_transaction_artifacts(transaction: &TransactionRecord) -> Result<(), String> {
     if transaction.artifact_directory.exists() {
+        let expected_directory = transaction
+            .workspace_path
+            .join(format!(".lspc-{}", transaction.transaction_id));
+        if transaction.artifact_directory != expected_directory {
+            return Err("The transaction artifact path is not canonical.".to_owned());
+        }
+        let marker = transaction.artifact_directory.join(ARTIFACT_OWNER_FILE);
+        if fs::read_to_string(marker).ok().as_deref() != Some(transaction.transaction_id.as_str()) {
+            return Err("The transaction artifact ownership cannot be verified.".to_owned());
+        }
         fs::remove_dir_all(&transaction.artifact_directory).map_err(|error| error.to_string())?;
+        flush_parent(&transaction.artifact_directory).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -1524,6 +2213,10 @@ fn durability_value() -> Value {
     })
 }
 
+fn flush_parent(path: &Path) -> std::io::Result<()> {
+    path.parent().map_or(Ok(()), flush_directory)
+}
+
 #[cfg(unix)]
 fn flush_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
@@ -1662,5 +2355,298 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.code, "application_cancelled");
         assert_eq!(failure.data["previewId"], preview_id);
+    }
+
+    #[test]
+    fn staging_never_cleans_an_unowned_artifact_path() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_directory = workspace.path().join(".lspc-collision");
+        fs::create_dir(&artifact_directory).unwrap();
+        let sentinel = artifact_directory.join("sentinel");
+        fs::write(&sentinel, "owned by the workspace").unwrap();
+        let transaction = TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: "txn_00000000000000000000000000000000".to_owned(),
+            preview_id: "prv_00000000000000000000000000000000".to_owned(),
+            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+            workspace_path: workspace.path().to_path_buf(),
+            workspace_uri: url::Url::from_directory_path(workspace.path())
+                .unwrap()
+                .to_string(),
+            state: TransactionState::Staged,
+            started_at: now_rfc3339(),
+            artifact_directory,
+            backups: Vec::new(),
+            operations: Vec::new(),
+            before_manifest: Vec::new(),
+            intended_manifest: Vec::new(),
+            observed_manifest: Vec::new(),
+            manifest_digest: manifest_digest(&[]),
+            cleanup_pending: false,
+        };
+        let failure = stage_transaction(
+            &transaction,
+            &[],
+            &MutationSettings {
+                application_lock_timeout: "1s".to_owned(),
+                max_entries: 1,
+                max_recursion_depth: 1,
+                max_rollback_bytes: 1,
+                max_staged_text_bytes: 1,
+                max_preauthorized_callbacks: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(!failure.artifact_created);
+        assert!(cleanup_transaction_artifacts(&transaction).is_err());
+        assert_eq!(
+            fs::read_to_string(sentinel).unwrap(),
+            "owned by the workspace"
+        );
+    }
+
+    #[test]
+    fn text_output_is_complete_private_staging_before_commit() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("main.rs");
+        fs::write(&file, "old\n").unwrap();
+        let original_accessed =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(original_accessed))
+            .unwrap();
+        let preview_limits = PreviewSettings {
+            max_count: 64,
+            max_total_bytes: 1_000_000,
+            max_document_text_bytes: 1_000_000,
+            max_text_bytes: 1_000_000,
+        };
+        let mutation_limits = MutationSettings {
+            application_lock_timeout: "1s".to_owned(),
+            max_entries: 100,
+            max_recursion_depth: 20,
+            max_rollback_bytes: 1_000_000,
+            max_staged_text_bytes: 1_000_000,
+            max_preauthorized_callbacks: 64,
+        };
+        let workspace_uri = url::Url::from_directory_path(workspace.path())
+            .unwrap()
+            .to_string();
+        let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            &workspace_uri,
+            PositionEncoding::Utf8,
+            &preview_limits,
+            &mutation_limits,
+        )
+        .unwrap();
+        let planned = planner
+            .plan_workspace_edit(&json!({"changes": {file_uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "longer"}]}}))
+            .unwrap();
+        let transaction_id = "txn_00000000000000000000000000000000";
+        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let transaction = TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            preview_id: "prv_00000000000000000000000000000000".to_owned(),
+            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+            workspace_path: workspace.path().to_path_buf(),
+            workspace_uri: workspace_uri.clone(),
+            state: TransactionState::Staged,
+            started_at: now_rfc3339(),
+            artifact_directory: artifact_directory.clone(),
+            backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
+            operations: planned.plan.operations.clone(),
+            before_manifest: planned.plan.before_manifest.clone(),
+            intended_manifest: planned.plan.intended_manifest.clone(),
+            observed_manifest: planned.plan.before_manifest.clone(),
+            manifest_digest: manifest_digest(&planned.plan.before_manifest),
+            cleanup_pending: false,
+        };
+
+        stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
+
+        assert_eq!(
+            fs::read(staged_text_path(&artifact_directory, 0)).unwrap(),
+            b"longer\n"
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().accessed().unwrap(),
+            original_accessed
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"old\n");
+        cleanup_transaction_artifacts(&transaction).unwrap();
+    }
+
+    #[test]
+    fn rollback_restores_resource_identities_after_rename_delete_and_create() {
+        let workspace = TempDir::new().unwrap();
+        let source = workspace.path().join("source.txt");
+        let destination = workspace.path().join("destination.txt");
+        let deleted = workspace.path().join("deleted.txt");
+        let created = workspace.path().join("created.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        fs::write(&deleted, "deleted").unwrap();
+        let preview_limits = PreviewSettings {
+            max_count: 64,
+            max_total_bytes: 1_000_000,
+            max_document_text_bytes: 1_000_000,
+            max_text_bytes: 1_000_000,
+        };
+        let mutation_limits = MutationSettings {
+            application_lock_timeout: "1s".to_owned(),
+            max_entries: 100,
+            max_recursion_depth: 20,
+            max_rollback_bytes: 1_000_000,
+            max_staged_text_bytes: 1_000_000,
+            max_preauthorized_callbacks: 64,
+        };
+        let workspace_uri = url::Url::from_directory_path(workspace.path())
+            .unwrap()
+            .to_string();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            &workspace_uri,
+            PositionEncoding::Utf8,
+            &preview_limits,
+            &mutation_limits,
+        )
+        .unwrap();
+        let planned = planner
+            .plan_workspace_edit(&json!({"documentChanges": [
+                {
+                    "kind": "rename",
+                    "oldUri": url::Url::from_file_path(&source).unwrap(),
+                    "newUri": url::Url::from_file_path(&destination).unwrap(),
+                    "options": {"overwrite": true}
+                },
+                {
+                    "kind": "delete",
+                    "uri": url::Url::from_file_path(&deleted).unwrap()
+                },
+                {
+                    "kind": "create",
+                    "uri": url::Url::from_file_path(&created).unwrap()
+                }
+            ]}))
+            .unwrap();
+        let transaction_id = "txn_00000000000000000000000000000000";
+        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let transaction = TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            preview_id: "prv_00000000000000000000000000000000".to_owned(),
+            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+            workspace_path: workspace.path().to_path_buf(),
+            workspace_uri: workspace_uri.clone(),
+            state: TransactionState::Committing,
+            started_at: now_rfc3339(),
+            artifact_directory: artifact_directory.clone(),
+            backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
+            operations: planned.plan.operations.clone(),
+            before_manifest: planned.plan.before_manifest.clone(),
+            intended_manifest: planned.plan.intended_manifest.clone(),
+            observed_manifest: planned.plan.before_manifest.clone(),
+            manifest_digest: manifest_digest(&planned.plan.before_manifest),
+            cleanup_pending: false,
+        };
+        stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
+        commit_operations(&planner, &artifact_directory, &transaction.operations).unwrap();
+
+        let restored = rollback_transaction(&transaction, &planner).unwrap();
+
+        assert!(manifest_mismatches(&transaction.before_manifest, &restored).is_empty());
+        assert_eq!(fs::read_to_string(source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination");
+        assert_eq!(fs::read_to_string(deleted).unwrap(), "deleted");
+        assert!(!created.exists());
+        cleanup_transaction_artifacts(&transaction).unwrap();
+    }
+
+    #[test]
+    fn abandoned_commit_is_sealed_and_rolled_back_without_replaying_writes() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let file = workspace.path().join("main.rs");
+        fs::write(&file, "old\n").unwrap();
+        let store = MutationStateStore::open_at(state.path().join("state")).unwrap();
+        let preview_limits = PreviewSettings {
+            max_count: 64,
+            max_total_bytes: 1_000_000,
+            max_document_text_bytes: 1_000_000,
+            max_text_bytes: 1_000_000,
+        };
+        let receipt_limits = ReceiptSettings { max_count: 100 };
+        let mutation_limits = MutationSettings {
+            application_lock_timeout: "1s".to_owned(),
+            max_entries: 100,
+            max_recursion_depth: 20,
+            max_rollback_bytes: 1_000_000,
+            max_staged_text_bytes: 1_000_000,
+            max_preauthorized_callbacks: 64,
+        };
+        let workspace_uri = url::Url::from_directory_path(workspace.path())
+            .unwrap()
+            .to_string();
+        let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
+        let planner = WorkspaceEditPlanner::open(
+            workspace.path(),
+            &workspace_uri,
+            PositionEncoding::Utf8,
+            &preview_limits,
+            &mutation_limits,
+        )
+        .unwrap();
+        let planned = planner
+            .plan_workspace_edit(&json!({"changes": {file_uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "longer"}]}}))
+            .unwrap();
+        let transaction_id = "txn_00000000000000000000000000000000";
+        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let transaction = TransactionRecord {
+            format_version: MUTATION_STATE_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            preview_id: "prv_00000000000000000000000000000000".to_owned(),
+            receipt_id: "prv_00000000000000000000000000000000".to_owned(),
+            workspace_path: workspace.path().to_path_buf(),
+            workspace_uri: workspace_uri.clone(),
+            state: TransactionState::Committing,
+            started_at: now_rfc3339(),
+            artifact_directory: artifact_directory.clone(),
+            backups: planned_backups(&planned.plan.before_manifest, &artifact_directory),
+            operations: planned.plan.operations.clone(),
+            before_manifest: planned.plan.before_manifest.clone(),
+            intended_manifest: planned.plan.intended_manifest.clone(),
+            observed_manifest: planned.plan.before_manifest.clone(),
+            manifest_digest: manifest_digest(&planned.plan.before_manifest),
+            cleanup_pending: false,
+        };
+        store.write_transaction(&transaction).unwrap();
+        stage_transaction(&transaction, &transaction.operations, &mutation_limits).unwrap();
+        commit_operations(&planner, &artifact_directory, &transaction.operations).unwrap();
+
+        let transaction =
+            reconcile_recovery_status(&store, transaction, &preview_limits, &mutation_limits)
+                .unwrap()
+                .unwrap();
+        assert_eq!(transaction.state, TransactionState::RecoveryRequired);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "longer\n");
+
+        let result = recover_rollback(
+            &store,
+            transaction_id,
+            &transaction.manifest_digest,
+            &preview_limits,
+            &receipt_limits,
+            &mutation_limits,
+        )
+        .unwrap();
+
+        assert_eq!(result["outcome"], "restored");
+        assert_eq!(fs::read_to_string(file).unwrap(), "old\n");
+        assert!(store.read_transaction(transaction_id).is_err());
     }
 }

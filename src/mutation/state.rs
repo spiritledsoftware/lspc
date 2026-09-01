@@ -19,7 +19,9 @@ use crate::{
     state_permissions,
 };
 
-use super::planner::{CanonicalPlan, ManifestEntry, PreviewSummary, WorkspaceEditProblem};
+use super::planner::{
+    CanonicalOperation, CanonicalPlan, ManifestEntry, PreviewSummary, WorkspaceEditProblem,
+};
 
 pub(crate) const MUTATION_STATE_VERSION: u32 = 1;
 const PREVIEW_RETENTION_HOURS: i64 = 24;
@@ -120,6 +122,7 @@ pub(crate) enum TransactionState {
     Staged,
     Committing,
     RecoveryRequired,
+    CleanupPending,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +138,8 @@ pub(crate) struct TransactionRecord {
     pub(crate) started_at: String,
     pub(crate) artifact_directory: PathBuf,
     pub(crate) backups: Vec<BackupEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) operations: Vec<CanonicalOperation>,
     pub(crate) before_manifest: Vec<ManifestEntry>,
     pub(crate) intended_manifest: Vec<ManifestEntry>,
     pub(crate) observed_manifest: Vec<ManifestEntry>,
@@ -308,16 +313,31 @@ impl MutationStateStore {
     pub(crate) fn discard_preview(&self, preview_id: &str) -> Result<(), ContractFailure> {
         let preview = self.read_preview(preview_id)?;
         if preview.preview.reserved {
-            return Err(ContractFailure {
-                exit_code: 6,
-                category: "mutation",
-                code: "application_busy",
-                message: "A reserved Preview cannot be discarded.".to_owned(),
-                stage: "reserve",
-                delivery: "not_applicable",
-                retry: "safe",
-                data: json!({"previewId": preview_id}),
-            });
+            let lock = self.open_application_lock(&preview.preview.workspace_uri)?;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(application_busy(preview_id));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(state_failure(
+                        "transaction",
+                        &self.application_lock_path(&preview.preview.workspace_uri),
+                        "The Workspace Application lock failed.",
+                        error.raw_os_error(),
+                    ));
+                }
+            }
+            if self
+                .list_transactions()?
+                .into_iter()
+                .any(|transaction| match transaction {
+                    Ok(transaction) => transaction.preview_id == preview_id,
+                    Err(_) => true,
+                })
+            {
+                return Err(application_busy(preview_id));
+            }
         }
         fs::remove_file(self.preview_path(preview_id)).map_err(|error| {
             state_failure(
@@ -438,6 +458,20 @@ impl MutationStateStore {
         write_record(&path, &bytes, "receipt")
     }
 
+    pub(crate) fn mark_receipt_cleanup_complete(
+        &self,
+        receipt_id: &str,
+    ) -> Result<(), ContractFailure> {
+        let mut stored = self.read_receipt(receipt_id)?;
+        if !stored.receipt.cleanup_pending {
+            return Ok(());
+        }
+        stored.receipt.cleanup_pending = false;
+        let path = self.receipt_path(receipt_id);
+        let bytes = serialize_record(&stored, "receipt", &path)?;
+        write_record(&path, &bytes, "receipt")
+    }
+
     pub(crate) fn list_receipts(&self) -> Result<Vec<StoredReceipt>, ContractFailure> {
         self.prune_expired_records()?;
         let mut records = self.read_all_receipts()?;
@@ -462,15 +496,15 @@ impl MutationStateStore {
         receipt: ReceiptRecord,
         limits: &ReceiptSettings,
     ) -> Result<StoredReceipt, ContractFailure> {
-        let stored = self.write_receipt(receipt, limits)?;
-        fs::remove_file(self.preview_path(preview_id)).map_err(|error| {
-            state_failure(
-                "preview",
-                &self.preview_path(preview_id),
-                "The applied Preview cannot be retired.",
-                error.raw_os_error(),
-            )
-        })?;
+        let mut stored = self.write_receipt(receipt, limits)?;
+        if let Err(error) = fs::remove_file(self.preview_path(preview_id))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            stored.receipt.cleanup_pending = true;
+            let path = self.receipt_path(&stored.receipt.receipt_id);
+            let bytes = serialize_record(&stored, "receipt", &path)?;
+            write_record(&path, &bytes, "receipt")?;
+        }
         Ok(stored)
     }
 
@@ -790,6 +824,19 @@ fn receipt_chain_protected(chain: &[&StoredReceipt]) -> bool {
             && !record.receipt.cleanup_pending
     });
     !terminal_recovery && chain.iter().any(|record| record.receipt.cleanup_pending)
+}
+
+fn application_busy(preview_id: &str) -> ContractFailure {
+    ContractFailure {
+        exit_code: 6,
+        category: "mutation",
+        code: "application_busy",
+        message: "A reserved Preview is owned by an active or recoverable Application.".to_owned(),
+        stage: "reserve",
+        delivery: "not_applicable",
+        retry: "safe",
+        data: json!({"previewId": preview_id}),
+    }
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -1126,9 +1173,11 @@ mod tests {
                 &limits,
             )
             .unwrap();
-        let mut reserved = store.reserve_preview(&id).unwrap();
+        let lock = store.open_application_lock("file:///workspace/").unwrap();
+        lock.lock().unwrap();
+        let _reserved = store.reserve_preview(&id).unwrap();
         assert!(store.discard_preview(&id).is_err());
-        store.release_preview(&mut reserved).unwrap();
+        drop(lock);
         store.discard_preview(&id).unwrap();
         assert!(store.read_preview(&id).is_err());
     }

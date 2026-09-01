@@ -26,8 +26,8 @@ use crate::{
 };
 
 use application::{
-    ApplicationContext, apply_preview, lock_workspace, manifest_mismatches, recover_accept_current,
-    recover_rollback,
+    ApplicationContext, apply_preview, lock_workspace, manifest_mismatches,
+    reconcile_recovery_status, recover_accept_current, recover_rollback,
 };
 use planner::{CanonicalOperation, PlannedWorkspaceEdit, WorkspaceEditPlanner};
 use state::{MutationStateStore, PreviewRecord, ReceiptRecord, StoredPreview, TransactionState};
@@ -657,17 +657,27 @@ fn recovery_status(invocation: &ParsedInvocation) -> Result<Value, ContractFailu
         .unwrap(),
     };
     let store = MutationStateStore::open()?;
+    let (previews, _, mutation) = default_mutation_settings();
     let mut entries = Vec::new();
     for entry in store.list_transactions()? {
         match entry {
             Ok(transaction) if transaction.workspace_uri == workspace_uri => {
+                let Some(transaction) =
+                    reconcile_recovery_status(&store, transaction, &previews, &mutation)?
+                else {
+                    continue;
+                };
                 entries.push(json!({
                     "kind": "valid",
                     "transactionId": transaction.transaction_id,
                     "workspaceUri": transaction.workspace_uri,
                     "manifestDigest": transaction.manifest_digest,
                     "receiptId": transaction.receipt_id,
-                    "filesystemState": if transaction.state == TransactionState::RecoveryRequired { "partial" } else { "in_transition" },
+                    "filesystemState": match transaction.state {
+                        TransactionState::RecoveryRequired => "partial",
+                        TransactionState::CleanupPending => "changed",
+                        TransactionState::Staged | TransactionState::Committing => "in_transition",
+                    },
                     "cleanupPending": transaction.cleanup_pending,
                     "protected": true,
                     "intendedManifest": transaction.intended_manifest,
