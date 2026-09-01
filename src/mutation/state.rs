@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -13,6 +15,7 @@ use crate::{
     canonical_value::digest_canonical_value,
     configuration::{PreviewSettings, ReceiptSettings},
     contract::ContractFailure,
+    state_permissions,
 };
 
 use super::planner::{CanonicalPlan, ManifestEntry, PreviewSummary, WorkspaceEditProblem};
@@ -325,6 +328,23 @@ impl MutationStateStore {
         })
     }
 
+    pub(crate) fn retire_preview_after_recovery(
+        &self,
+        preview_id: &str,
+    ) -> Result<(), ContractFailure> {
+        let path = self.preview_path(preview_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(state_failure(
+                "preview",
+                &path,
+                "The recovered Preview cannot be retired.",
+                error.raw_os_error(),
+            )),
+        }
+    }
+
     pub(crate) fn list_previews(&self) -> Result<Vec<StoredPreview>, ContractFailure> {
         self.prune_expired_records()?;
         let mut records = self
@@ -391,7 +411,11 @@ impl MutationStateStore {
         let receipt: StoredReceipt =
             read_record(&path, "receipt", receipt_id).map_err(|mut failure| {
                 if failure.code == "preview_unknown" {
-                    failure.data = json!({"receiptId": receipt_id});
+                    failure.exit_code = 3;
+                    failure.category = "blocked";
+                    failure.code = "state_record_unknown";
+                    failure.message = "The requested Receipt is unknown or expired.".to_owned();
+                    failure.data = json!({"recordType": "receipt", "id": receipt_id});
                 }
                 failure
             })?;
@@ -514,6 +538,7 @@ impl MutationStateStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|error| {
                 state_failure(
@@ -892,10 +917,8 @@ fn capacity_failure(
     }
 }
 
-#[cfg(unix)]
 fn restrict_directory(path: &Path) -> Result<(), ContractFailure> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+    state_permissions::restrict_directory(path).map_err(|error| {
         state_failure(
             "mutation",
             path,
@@ -904,15 +927,9 @@ fn restrict_directory(path: &Path) -> Result<(), ContractFailure> {
         )
     })
 }
-#[cfg(not(unix))]
-fn restrict_directory(_path: &Path) -> Result<(), ContractFailure> {
-    Ok(())
-}
 
-#[cfg(unix)]
 fn restrict_file(path: &Path) -> Result<(), ContractFailure> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+    state_permissions::restrict_file(path).map_err(|error| {
         state_failure(
             "mutation",
             path,
@@ -920,10 +937,6 @@ fn restrict_file(path: &Path) -> Result<(), ContractFailure> {
             error.raw_os_error(),
         )
     })
-}
-#[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> Result<(), ContractFailure> {
-    Ok(())
 }
 
 #[cfg(test)]

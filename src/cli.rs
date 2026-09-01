@@ -71,6 +71,13 @@ impl ParsedInvocation {
             .get(index)
             .map(|value| value.to_string_lossy().into_owned())
     }
+
+    pub(crate) fn positionals_strings(&self) -> Vec<String> {
+        self.positionals
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
 }
 
 /// Parses one CLI invocation and emits exactly one JSON envelope.
@@ -168,10 +175,27 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
                 }
             }
         }
+        [group, ..] if matches!(group.as_str(), "preview" | "recovery" | "receipt" | "state") => {
+            dispatch_mutation(invocation)
+        }
+        [command] if command == "apply" => dispatch_mutation(invocation),
         _ => emit_envelope(
             &internal_error_envelope(invocation.command, "implementation_pending"),
             ExitCode::from(INTERNAL_ERROR_EXIT_CODE),
         ),
+    }
+}
+
+fn dispatch_mutation(invocation: ParsedInvocation) -> ExitCode {
+    match crate::mutation::dispatch_mutation_command(&invocation) {
+        Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
+        Err(failure) => {
+            let exit_code = failure.exit_code;
+            emit_envelope(
+                &failure_envelope(invocation.command, &failure),
+                ExitCode::from(exit_code),
+            )
+        }
     }
 }
 

@@ -341,9 +341,18 @@ pub(crate) fn select_server(
             )
         })?
     };
+    select_named_server(configuration, &name, invocation)
+}
+
+/// Selects one exact stored server name while still applying invocation-scoped launch fields.
+pub(crate) fn select_named_server(
+    configuration: &LoadedConfiguration,
+    name: &str,
+    invocation: &ParsedInvocation,
+) -> Result<EffectiveServer, ContractFailure> {
     let mut server = configuration
         .servers
-        .get(&name)
+        .get(name)
         .cloned()
         .ok_or_else(|| server_selection_failure("The selected server has no declaration."))?;
     apply_cli_overrides(&mut server, invocation)?;

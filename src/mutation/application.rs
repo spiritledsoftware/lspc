@@ -1,18 +1,23 @@
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapabilityOpenOptions};
 use serde_json::{Value, json};
 
 use crate::{
     canonical_value::digest_raw_bytes,
     configuration::{MutationSettings, PreviewSettings, ReceiptSettings},
     contract::ContractFailure,
+    state_permissions,
     workspace::PositionEncoding,
 };
 
@@ -26,12 +31,14 @@ use super::{
     },
 };
 
-#[derive(Debug)]
+type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
+
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
     pub(crate) preview_limits: &'a PreviewSettings,
     pub(crate) receipt_limits: &'a ReceiptSettings,
     pub(crate) mutation_limits: &'a MutationSettings,
+    pub(crate) reauthorize: Option<&'a ReauthorizePreview<'a>>,
 }
 
 /// Applies one exact Preview under the Workspace lock and records at-most-once completion.
@@ -43,7 +50,7 @@ pub(crate) fn apply_preview(
         && receipt.receipt.outcome == "applied"
     {
         return Ok(application_success(&receipt.receipt, "already_applied"));
-    }
+    };
     let mut stored = context.store.reserve_preview(preview_id)?;
     let lock_file = context
         .store
@@ -56,18 +63,43 @@ pub(crate) fn apply_preview(
         let _ = context.store.release_preview(&mut stored);
         return Err(failure);
     }
-    if let Some(transaction) = context
-        .store
-        .list_transactions()?
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|transaction| {
-            transaction.workspace_uri == stored.preview.workspace_uri
-                && transaction.state == TransactionState::RecoveryRequired
-        })
-    {
-        let _ = context.store.release_preview(&mut stored);
-        return Err(recovery_required_failure(&transaction));
+    if let Some(reauthorize) = context.reauthorize {
+        let stale_reasons = match reauthorize(&stored) {
+            Ok(reasons) => reasons,
+            Err(failure) => {
+                let _ = context.store.release_preview(&mut stored);
+                return Err(failure);
+            }
+        };
+        if !stale_reasons.is_empty() {
+            let _ = context.store.release_preview(&mut stored);
+            return Err(preview_stale_failure(&stored, stale_reasons));
+        }
+    }
+    for transaction in context.store.list_transactions()? {
+        match transaction {
+            Ok(transaction) if transaction.workspace_uri == stored.preview.workspace_uri => {
+                let _ = context.store.release_preview(&mut stored);
+                return Err(recovery_required_failure(&transaction));
+            }
+            Ok(_) => {}
+            Err(evidence) => {
+                let _ = context.store.release_preview(&mut stored);
+                return Err(ContractFailure {
+                    exit_code: 7,
+                    category: "recovery",
+                    code: "recovery_evidence_invalid",
+                    message: "Corrupt Recovery evidence blocks Workspace Application.".to_owned(),
+                    stage: "recover",
+                    delivery: "not_applicable",
+                    retry: "never",
+                    data: json!({
+                        "transactionId": transaction_id_from_evidence(&evidence),
+                        "problems": evidence["problems"]
+                    }),
+                });
+            }
+        }
     }
     context
         .store
@@ -143,7 +175,7 @@ pub(crate) fn apply_preview(
     transaction.state = TransactionState::Committing;
     context.store.write_transaction(&transaction)?;
     let started_at = transaction.started_at.clone();
-    let commit_result = commit_operations(&stored.preview.plan.operations);
+    let commit_result = commit_operations(&planner, &stored.preview.plan.operations);
     let intended_paths = stored
         .preview
         .plan
@@ -199,7 +231,7 @@ pub(crate) fn apply_preview(
     }
 
     transaction.observed_manifest = observed;
-    match rollback_transaction(&transaction) {
+    match rollback_transaction(&transaction, &planner) {
         Ok(restored) => {
             let cleanup_pending = cleanup_transaction_artifacts(&transaction).is_err();
             let receipt = ReceiptRecord {
@@ -256,7 +288,9 @@ pub(crate) fn apply_preview(
         }
         Err(_) => {
             transaction.state = TransactionState::RecoveryRequired;
-            transaction.observed_manifest = inspect_paths_best_effort(&transaction.before_manifest);
+            transaction.observed_manifest = planner
+                .inspect_manifest_paths(&transaction_paths(&transaction))
+                .unwrap_or_else(|_| inspect_paths_best_effort(&transaction.before_manifest));
             transaction.manifest_digest = manifest_digest(&transaction.observed_manifest);
             context.store.write_transaction(&transaction)?;
             let receipt = ReceiptRecord {
@@ -299,8 +333,19 @@ pub(crate) fn recover_rollback(
     store: &MutationStateStore,
     transaction_id: &str,
     supplied_manifest_digest: &str,
+    preview_limits: &PreviewSettings,
+    receipt_limits: &ReceiptSettings,
+    mutation_limits: &MutationSettings,
 ) -> Result<Value, ContractFailure> {
-    recover_transaction(store, transaction_id, supplied_manifest_digest, false)
+    recover_transaction(
+        store,
+        transaction_id,
+        supplied_manifest_digest,
+        false,
+        preview_limits,
+        receipt_limits,
+        mutation_limits,
+    )
 }
 
 /// Accepts the exact current recovery manifest without replaying filesystem writes.
@@ -308,8 +353,19 @@ pub(crate) fn recover_accept_current(
     store: &MutationStateStore,
     transaction_id: &str,
     supplied_manifest_digest: &str,
+    preview_limits: &PreviewSettings,
+    receipt_limits: &ReceiptSettings,
+    mutation_limits: &MutationSettings,
 ) -> Result<Value, ContractFailure> {
-    recover_transaction(store, transaction_id, supplied_manifest_digest, true)
+    recover_transaction(
+        store,
+        transaction_id,
+        supplied_manifest_digest,
+        true,
+        preview_limits,
+        receipt_limits,
+        mutation_limits,
+    )
 }
 
 fn recover_transaction(
@@ -317,20 +373,11 @@ fn recover_transaction(
     transaction_id: &str,
     supplied_manifest_digest: &str,
     accept_current: bool,
+    preview_limits: &PreviewSettings,
+    receipt_limits: &ReceiptSettings,
+    mutation_limits: &MutationSettings,
 ) -> Result<Value, ContractFailure> {
     let mut transaction = store.read_transaction(transaction_id)?;
-    if transaction.state != TransactionState::RecoveryRequired {
-        return Err(ContractFailure {
-            exit_code: 7,
-            category: "recovery",
-            code: "recovery_not_found",
-            message: "The transaction does not require Recovery.".to_owned(),
-            stage: "recover",
-            delivery: "not_applicable",
-            retry: "never",
-            data: json!({"transactionId": transaction_id}),
-        });
-    }
     if supplied_manifest_digest != transaction.manifest_digest {
         return Err(ContractFailure {
             exit_code: 7,
@@ -347,9 +394,26 @@ fn recover_transaction(
             }),
         });
     }
+    store.ensure_receipt_capacity(receipt_limits)?;
     let lock = store.open_application_lock(&transaction.workspace_uri)?;
-    lock_workspace(&lock, &transaction.workspace_uri, "30s")?;
-    let current = inspect_paths_best_effort(&transaction.observed_manifest);
+    lock_workspace(
+        &lock,
+        &transaction.workspace_uri,
+        &mutation_limits.application_lock_timeout,
+    )?;
+    let planner = WorkspaceEditPlanner::open(
+        &transaction.workspace_path,
+        &transaction.workspace_uri,
+        PositionEncoding::Utf8,
+        preview_limits,
+        mutation_limits,
+    )
+    .map_err(|problem| unsupported_filesystem_failure(&transaction.workspace_uri, &[problem]))?;
+    let current = planner
+        .inspect_manifest_paths(&transaction_paths(&transaction))
+        .map_err(|problems| {
+            unsupported_filesystem_failure(&transaction.workspace_uri, &problems)
+        })?;
     let current_digest = manifest_digest(&current);
     if current_digest != transaction.manifest_digest {
         return Err(ContractFailure {
@@ -370,8 +434,12 @@ fn recover_transaction(
     }
     let outcome = if accept_current {
         "accepted_current"
+    } else if transaction.state == TransactionState::Staged
+        && rollback_manifest_mismatches(&transaction.before_manifest, &current).is_empty()
+    {
+        "restored"
     } else {
-        rollback_transaction(&transaction).map_err(|failure| ContractFailure {
+        rollback_transaction(&transaction, &planner).map_err(|failure| ContractFailure {
             exit_code: 7,
             category: "recovery",
             code: "recovery_failed",
@@ -392,19 +460,33 @@ fn recover_transaction(
     let final_manifest = if accept_current {
         current
     } else {
-        inspect_paths_best_effort(&transaction.before_manifest)
+        planner
+            .inspect_manifest_paths(&transaction_paths(&transaction))
+            .unwrap_or_else(|_| inspect_paths_best_effort(&transaction.before_manifest))
     };
     let recovery_receipt_id = store.new_receipt_id()?;
-    let original = store.read_receipt(&transaction.receipt_id)?;
+    let original = store.read_receipt(&transaction.receipt_id).ok();
+    let pending_preview = store.read_preview(&transaction.preview_id).ok();
     let receipt = ReceiptRecord {
         receipt_id: recovery_receipt_id.clone(),
         kind: "recovery_receipt".to_owned(),
         transaction_id: transaction_id.to_owned(),
         workspace_uri: transaction.workspace_uri.clone(),
-        server: original.receipt.server.clone(),
-        session_identity: original.receipt.session_identity.clone(),
-        preview_id: original.receipt.preview_id.clone(),
-        linked_receipt_id: Some(original.receipt.receipt_id.clone()),
+        server: original
+            .as_ref()
+            .and_then(|record| record.receipt.server.clone())
+            .or_else(|| pending_preview.as_ref()?.preview.server.clone()),
+        session_identity: original
+            .as_ref()
+            .and_then(|record| record.receipt.session_identity.clone())
+            .or_else(|| Some(pending_preview.as_ref()?.preview.session_identity.clone())),
+        preview_id: original
+            .as_ref()
+            .and_then(|record| record.receipt.preview_id.clone())
+            .or_else(|| Some(transaction.preview_id.clone())),
+        linked_receipt_id: original
+            .as_ref()
+            .map(|record| record.receipt.receipt_id.clone()),
         preauthorized: false,
         started_at: now_rfc3339(),
         completed_at: now_rfc3339(),
@@ -415,7 +497,15 @@ fn recover_transaction(
             "unchanged"
         }
         .to_owned(),
-        summary: original.receipt.summary,
+        summary: original
+            .as_ref()
+            .map(|record| record.receipt.summary.clone())
+            .or_else(|| {
+                pending_preview
+                    .as_ref()
+                    .map(|record| record.preview.summary.clone())
+            })
+            .unwrap_or_default(),
         before_manifest: transaction.observed_manifest.clone(),
         intended_manifest: final_manifest.clone(),
         observed_manifest: final_manifest.clone(),
@@ -426,7 +516,8 @@ fn recover_transaction(
         failure_stage: None,
         failed_change: None,
     };
-    store.write_receipt(receipt, &ReceiptSettings { max_count: 1024 })?;
+    store.write_receipt(receipt, receipt_limits)?;
+    store.retire_preview_after_recovery(&transaction.preview_id)?;
     cleanup_transaction_artifacts(&transaction).map_err(|error| ContractFailure {
         exit_code: 7,
         category: "recovery",
@@ -461,7 +552,10 @@ struct CommitFailure {
     _reason: String,
 }
 
-fn commit_operations(operations: &[CanonicalOperation]) -> Result<(), CommitFailure> {
+fn commit_operations(
+    planner: &WorkspaceEditPlanner<'_>,
+    operations: &[CanonicalOperation],
+) -> Result<(), CommitFailure> {
     for operation in operations {
         let result = match operation {
             CanonicalOperation::Text {
@@ -471,24 +565,24 @@ fn commit_operations(operations: &[CanonicalOperation]) -> Result<(), CommitFail
                 after_digest,
                 edits,
                 ..
-            } => apply_text_operation(path, before_digest, after_digest, edits).map_err(|reason| {
-                CommitFailure {
+            } => apply_text_operation(planner, path, before_digest, after_digest, edits).map_err(
+                |reason| CommitFailure {
                     operation_index: *index,
                     _reason: reason,
-                }
-            }),
+                },
+            ),
             CanonicalOperation::Create {
                 index,
                 path,
                 overwrite,
                 ignore_if_exists,
                 ..
-            } => apply_create_operation(path, *overwrite, *ignore_if_exists).map_err(|reason| {
-                CommitFailure {
+            } => apply_create_operation(planner, path, *overwrite, *ignore_if_exists).map_err(
+                |reason| CommitFailure {
                     operation_index: *index,
                     _reason: reason,
-                }
-            }),
+                },
+            ),
             CanonicalOperation::Rename {
                 index,
                 old_path,
@@ -496,26 +590,23 @@ fn commit_operations(operations: &[CanonicalOperation]) -> Result<(), CommitFail
                 overwrite,
                 ignore_if_exists,
                 ..
-            } => apply_rename_operation(old_path, new_path, *overwrite, *ignore_if_exists).map_err(
-                |reason| CommitFailure {
+            } => apply_rename_operation(planner, old_path, new_path, *overwrite, *ignore_if_exists)
+                .map_err(|reason| CommitFailure {
                     operation_index: *index,
                     _reason: reason,
-                },
-            ),
+                }),
             CanonicalOperation::Delete {
                 index,
                 path,
                 recursive,
                 ignore_if_not_exists,
                 ..
-            } => {
-                apply_delete_operation(path, *recursive, *ignore_if_not_exists).map_err(|reason| {
-                    CommitFailure {
-                        operation_index: *index,
-                        _reason: reason,
-                    }
-                })
-            }
+            } => apply_delete_operation(planner, path, *recursive, *ignore_if_not_exists).map_err(
+                |reason| CommitFailure {
+                    operation_index: *index,
+                    _reason: reason,
+                },
+            ),
         };
         result?;
     }
@@ -523,12 +614,23 @@ fn commit_operations(operations: &[CanonicalOperation]) -> Result<(), CommitFail
 }
 
 fn apply_text_operation(
+    planner: &WorkspaceEditPlanner<'_>,
     path: &Path,
     before_digest: &str,
     after_digest: &str,
     edits: &[super::planner::CanonicalTextEdit],
 ) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let relative = planner.relative_path(path)?;
+    let mut read_options = CapabilityOpenOptions::new();
+    read_options.read(true).follow(FollowSymlinks::No);
+    let mut source = planner
+        .capability_root()
+        .open_with(relative, &read_options)
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    source
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
     if digest_raw_bytes(&bytes) != before_digest {
         return Err("Text resource changed during commit.".to_owned());
     }
@@ -548,9 +650,11 @@ fn apply_text_operation(
     if digest_raw_bytes(&result) != after_digest {
         return Err("Canonical text edit digest does not match.".to_owned());
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
+    let mut write_options = CapabilityOpenOptions::new();
+    write_options.write(true).follow(FollowSymlinks::No);
+    let mut file = planner
+        .capability_root()
+        .open_with(relative, &write_options)
         .map_err(|error| error.to_string())?;
     file.set_len(0).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(0))
@@ -560,16 +664,22 @@ fn apply_text_operation(
 }
 
 fn apply_create_operation(
+    planner: &WorkspaceEditPlanner<'_>,
     path: &Path,
     overwrite: bool,
     ignore_if_exists: bool,
 ) -> Result<(), String> {
-    if path.exists() {
+    let root = planner.capability_root();
+    let relative = planner.relative_path(path)?;
+    if root.symlink_metadata(relative).is_ok() {
         if overwrite {
-            let file = OpenOptions::new()
+            let mut options = CapabilityOpenOptions::new();
+            options
                 .write(true)
                 .truncate(true)
-                .open(path)
+                .follow(FollowSymlinks::No);
+            let file = root
+                .open_with(relative, &options)
                 .map_err(|error| error.to_string())?;
             return file.sync_all().map_err(|error| error.to_string());
         }
@@ -578,48 +688,67 @@ fn apply_create_operation(
         }
         return Err("CreateFile target exists.".to_owned());
     }
-    let file = OpenOptions::new()
+    let mut options = CapabilityOpenOptions::new();
+    options
         .write(true)
         .create_new(true)
-        .open(path)
+        .follow(FollowSymlinks::No);
+    let file = root
+        .open_with(relative, &options)
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())
 }
 
 fn apply_rename_operation(
+    planner: &WorkspaceEditPlanner<'_>,
     old_path: &Path,
     new_path: &Path,
     overwrite: bool,
     ignore_if_exists: bool,
 ) -> Result<(), String> {
-    if new_path.exists() {
+    let root = planner.capability_root();
+    let old_relative = planner.relative_path(old_path)?;
+    let new_relative = planner.relative_path(new_path)?;
+    if root.symlink_metadata(new_relative).is_ok() {
         if overwrite {
-            remove_resource(new_path).map_err(|error| error.to_string())?;
+            remove_capability_resource(root, new_relative).map_err(|error| error.to_string())?;
         } else if ignore_if_exists {
             return Ok(());
         } else {
             return Err("RenameFile destination exists.".to_owned());
         }
     }
-    fs::rename(old_path, new_path).map_err(|error| error.to_string())
+    root.rename(old_relative, root, new_relative)
+        .map_err(|error| error.to_string())
 }
 
 fn apply_delete_operation(
+    planner: &WorkspaceEditPlanner<'_>,
     path: &Path,
     recursive: bool,
     ignore_if_not_exists: bool,
 ) -> Result<(), String> {
-    if !path.exists() {
+    let root = planner.capability_root();
+    let relative = planner.relative_path(path)?;
+    let Ok(metadata) = root.symlink_metadata(relative) else {
         return if ignore_if_not_exists {
             Ok(())
         } else {
             Err("DeleteFile target is missing.".to_owned())
         };
-    }
-    if path.is_dir() && !recursive {
-        fs::remove_dir(path).map_err(|error| error.to_string())
+    };
+    if metadata.is_dir() && !recursive {
+        root.remove_dir(relative).map_err(|error| error.to_string())
     } else {
-        remove_resource(path).map_err(|error| error.to_string())
+        remove_capability_resource(root, relative).map_err(|error| error.to_string())
+    }
+}
+
+fn remove_capability_resource(root: &Dir, relative: &Path) -> std::io::Result<()> {
+    if root.symlink_metadata(relative)?.is_dir() {
+        root.remove_dir_all(relative)
+    } else {
+        root.remove_file(relative)
     }
 }
 
@@ -668,7 +797,7 @@ fn stage_transaction_backups(
             error.raw_os_error(),
         )
     })?;
-    restrict_directory(&transaction.artifact_directory).map_err(|error| {
+    state_permissions::restrict_directory(&transaction.artifact_directory).map_err(|error| {
         stage_failure(
             &transaction.transaction_id,
             &error.to_string(),
@@ -710,7 +839,10 @@ fn stage_transaction_backups(
     })
 }
 
-fn rollback_transaction(transaction: &TransactionRecord) -> Result<Vec<ManifestEntry>, String> {
+fn rollback_transaction(
+    transaction: &TransactionRecord,
+    planner: &WorkspaceEditPlanner<'_>,
+) -> Result<Vec<ManifestEntry>, String> {
     let mut affected = transaction
         .before_manifest
         .iter()
@@ -735,13 +867,41 @@ fn rollback_transaction(transaction: &TransactionRecord) -> Result<Vec<ManifestE
             fs::rename(&backup.backup_path, &backup.path).map_err(|error| error.to_string())?;
         }
     }
-    let restored = inspect_paths_best_effort(&transaction.before_manifest);
-    let mismatches = manifest_mismatches(&transaction.before_manifest, &restored);
+    let restored = planner
+        .inspect_manifest_paths(&transaction_paths(transaction))
+        .map_err(|_| "The restored filesystem cannot be inspected.".to_owned())?;
+    let mismatches = rollback_manifest_mismatches(&transaction.before_manifest, &restored);
     if mismatches.is_empty() {
         Ok(restored)
     } else {
         Err("The rollback manifest does not match its preconditions.".to_owned())
     }
+}
+
+fn transaction_paths(transaction: &TransactionRecord) -> Vec<PathBuf> {
+    transaction
+        .before_manifest
+        .iter()
+        .chain(transaction.intended_manifest.iter())
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn rollback_manifest_mismatches(
+    expected: &[ManifestEntry],
+    actual: &[ManifestEntry],
+) -> Vec<Value> {
+    let mut normalized_expected = expected.to_vec();
+    let mut normalized_actual = actual.to_vec();
+    for entry in normalized_expected
+        .iter_mut()
+        .chain(normalized_actual.iter_mut())
+    {
+        entry.identity_digest = None;
+    }
+    manifest_mismatches(&normalized_expected, &normalized_actual)
 }
 
 fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> std::io::Result<()> {
@@ -836,7 +996,10 @@ fn inspect_path_best_effort(path: &Path) -> ManifestEntry {
     }
 }
 
-fn manifest_mismatches(expected: &[ManifestEntry], actual: &[ManifestEntry]) -> Vec<Value> {
+pub(crate) fn manifest_mismatches(
+    expected: &[ManifestEntry],
+    actual: &[ManifestEntry],
+) -> Vec<Value> {
     expected
         .iter()
         .filter_map(|expected| {
@@ -879,6 +1042,23 @@ fn manifest_mismatches(expected: &[ManifestEntry], actual: &[ManifestEntry]) -> 
         .collect()
 }
 
+fn preview_stale_failure(stored: &StoredPreview, reasons: Vec<Value>) -> ContractFailure {
+    ContractFailure {
+        exit_code: 6,
+        category: "mutation",
+        code: "preview_stale",
+        message: "The Preview authorization or immutable inputs changed.".to_owned(),
+        stage: "reserve",
+        delivery: "not_applicable",
+        retry: "after_change",
+        data: json!({
+            "previewId": stored.preview.preview_id,
+            "reasons": reasons,
+            "preconditions": stored.preview.preconditions
+        }),
+    }
+}
+
 fn application_success(receipt: &ReceiptRecord, outcome: &str) -> Value {
     json!({
         "schemaVersion": 1,
@@ -894,7 +1074,9 @@ fn application_success(receipt: &ReceiptRecord, outcome: &str) -> Value {
             "filesystemState": receipt.filesystem_state,
             "sessionSynchronized": receipt.session_synchronized,
             "cleanupPending": receipt.cleanup_pending,
-            "durability": receipt.durability,
+            "durability": {
+                "directoryFlush": receipt.durability["directoryFlush"]
+            },
             "manifest": receipt.observed_manifest
         }
     })
@@ -983,6 +1165,14 @@ fn recovery_required_failure(transaction: &TransactionRecord) -> ContractFailure
     }
 }
 
+fn transaction_id_from_evidence(evidence: &Value) -> String {
+    evidence
+        .get("transactionId")
+        .and_then(Value::as_str)
+        .unwrap_or("txn_00000000000000000000000000000000")
+        .to_owned()
+}
+
 fn unsupported_filesystem_failure(
     workspace_uri: &str,
     problems: &[WorkspaceEditProblem],
@@ -1038,23 +1228,12 @@ fn flush_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn restrict_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn restrict_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::mutation::{create_preview_record, planner::PreviewSummary};
+    use crate::mutation::{PreviewRecordContext, create_preview_record};
 
     #[test]
     fn exact_text_preview_applies_once_and_returns_same_receipt() {
@@ -1094,16 +1273,17 @@ mod tests {
         let planned = planner.plan_workspace_edit(&edit).unwrap();
         let id = store.new_preview_id().unwrap();
         let record = create_preview_record(
-            &id,
-            &workspace_uri,
-            None,
-            &format!("sid_{}", "0".repeat(64)),
-            "utf-8",
-            json!({"kind": "test"}),
-            edit,
-            None,
+            PreviewRecordContext {
+                preview_id: &id,
+                workspace_uri: &workspace_uri,
+                server: None,
+                session_identity: &format!("sid_{}", "0".repeat(64)),
+                position_encoding: "utf-8",
+                source: json!({"kind": "test"}),
+                edit,
+                command: None,
+            },
             planned,
-            PreviewSummary::default(),
         );
         store
             .create_preview(
@@ -1119,6 +1299,7 @@ mod tests {
             preview_limits: &preview_limits,
             receipt_limits: &receipt_limits,
             mutation_limits: &mutation_limits,
+            reauthorize: None,
         };
         let first = apply_preview(&context, &id).unwrap();
         let second = apply_preview(&context, &id).unwrap();

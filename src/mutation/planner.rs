@@ -1,7 +1,9 @@
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, Metadata},
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -127,13 +129,11 @@ pub(crate) struct PlannedWorkspaceEdit {
     pub(crate) plan: CanonicalPlan,
     pub(crate) annotations: Value,
     pub(crate) summary: PreviewSummary,
-    pub(crate) total_new_text_bytes: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceEditPlanner<'a> {
     workspace: &'a Path,
-    workspace_uri: &'a str,
     position_encoding: PositionEncoding,
     preview_limits: &'a PreviewSettings,
     mutation_limits: &'a MutationSettings,
@@ -159,7 +159,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
     /// Opens the canonical Workspace as the capability root for Mutation planning.
     pub(crate) fn open(
         workspace: &'a Path,
-        workspace_uri: &'a str,
+        _workspace_uri: &'a str,
         position_encoding: PositionEncoding,
         preview_limits: &'a PreviewSettings,
         mutation_limits: &'a MutationSettings,
@@ -185,7 +185,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
         })?;
         Ok(Self {
             workspace,
-            workspace_uri,
             position_encoding,
             preview_limits,
             mutation_limits,
@@ -255,7 +254,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 )]);
             };
             let mut entries = changes.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(uri, _)| *uri);
             for (index, (uri, edits)) in entries.into_iter().enumerate() {
                 self.plan_text_operation(
                     index as u64,
@@ -413,12 +412,14 @@ impl<'a> WorkspaceEditPlanner<'a> {
         }
 
         for path in virtual_workspace.affected.clone() {
-            if !virtual_workspace.before.contains_key(&path) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                virtual_workspace.before.entry(path)
+            {
                 let before = self
-                    .inspect_resource(&path, 0, false)
+                    .inspect_resource(entry.key(), 0, false)
                     .map_err(|problem| vec![problem])?
                     .manifest;
-                virtual_workspace.before.insert(path, before);
+                entry.insert(before);
             }
         }
         let before_manifest = virtual_workspace.before.into_values().collect::<Vec<_>>();
@@ -453,7 +454,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
             },
             annotations,
             summary,
-            total_new_text_bytes,
         })
     }
 
@@ -480,6 +480,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
         } else {
             Err(problems)
         }
+    }
+
+    pub(crate) fn capability_root(&self) -> &Dir {
+        &self._workspace_dir
+    }
+
+    pub(crate) fn relative_path<'p>(&self, path: &'p Path) -> Result<&'p Path, String> {
+        path.strip_prefix(self.workspace)
+            .map_err(|_| "A canonical operation path escaped the Workspace capability.".to_owned())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1434,51 +1443,19 @@ fn position_to_offset(
     encoding: PositionEncoding,
 ) -> Option<usize> {
     let mut offset = 0;
-    let mut lines = text.split_inclusive('\n');
-    let line = loop {
-        let current = lines.next()?;
-        if position.line == 0 {
-            break current
-                .strip_suffix('\n')
-                .unwrap_or(current)
-                .strip_suffix('\r')
-                .unwrap_or(current.strip_suffix('\n').unwrap_or(current));
-        }
-        offset += current.len();
-        let remaining = position.line.checked_sub(1)?;
-        return position_to_offset_after_lines(
-            text,
-            remaining,
-            position.character,
-            encoding,
-            offset,
-        );
-    };
-    offset_in_line(line, position.character, encoding).map(|value| offset + value)
-}
-
-fn position_to_offset_after_lines(
-    text: &str,
-    line: u32,
-    character: u32,
-    encoding: PositionEncoding,
-    _ignored: usize,
-) -> Option<usize> {
-    let mut offset = 0;
-    for (current_line, segment) in text.split_inclusive('\n').enumerate() {
-        if current_line == line as usize + 1 {
+    for (line_number, segment) in text.split_inclusive('\n').enumerate() {
+        if line_number == position.line as usize {
             let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
-            let content = without_newline
+            let line = without_newline
                 .strip_suffix('\r')
                 .unwrap_or(without_newline);
-            return offset_in_line(content, character, encoding).map(|value| offset + value);
+            return offset_in_line(line, position.character, encoding)
+                .map(|line_offset| offset + line_offset);
         }
         offset += segment.len();
     }
-    if text.ends_with('\n') && line as usize + 1 == text.lines().count() {
-        return (character == 0).then_some(text.len());
-    }
-    None
+    (position.line == text.split_terminator('\n').count() as u32 && position.character == 0)
+        .then_some(text.len())
 }
 
 fn offset_in_line(line: &str, character: u32, encoding: PositionEncoding) -> Option<usize> {
@@ -1602,7 +1579,7 @@ fn hash_file(path: &Path, index: u64) -> Result<String, WorkspaceEditProblem> {
         if read == 0 {
             break;
         }
-        hasher.write_all(&buffer[..read]).unwrap();
+        hasher.update(&buffer[..read]);
     }
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
