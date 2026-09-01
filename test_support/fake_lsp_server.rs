@@ -152,7 +152,10 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                         "renameProvider": {"prepareProvider": true},
                         "codeActionProvider": {"resolveProvider": true},
                         "executeCommandProvider": {"commands": ["fixture.run"]},
-                        "diagnosticProvider": {"workspaceDiagnostics": true}
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": true
+                        }
                     })
                 } else {
                     json!({})
