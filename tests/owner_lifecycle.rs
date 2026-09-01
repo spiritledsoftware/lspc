@@ -420,6 +420,70 @@ fn owner_reports_bounded_stderr_after_an_unexpected_server_exit() {
 }
 
 #[test]
+fn owner_bounds_tracks_and_cancels_server_requests() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+
+    let bounded = fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/server-request-limit",
+    ]);
+    assert_eq!(bounded["result"], json!({"accepted": 64, "busy": 1}));
+
+    let cancelled = fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/cancel-server-request",
+    ]);
+    assert_eq!(
+        cancelled["result"]["callbackResponse"]["error"]["code"],
+        -32800
+    );
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+}
+
+#[test]
+fn duplicate_active_server_request_id_terminates_the_owner() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    let output = fixture.output(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/duplicate-server-request-id",
+    ]);
+
+    assert_eq!(output.status.code(), Some(5));
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "protocol_failed");
+    assert!(
+        failure["error"]["data"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("reused an active request identifier"))
+    );
+}
+
+#[test]
 fn query_failure_preserves_server_error_partial_results_context_and_trace() {
     let fixture = Fixture::new();
     let workspace = fixture.workspace.to_str().unwrap();

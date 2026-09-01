@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
     io,
     num::NonZeroUsize,
@@ -48,6 +48,7 @@ use crate::{
 const TRACE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const SERVER_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const OWNER_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVER_REQUEST_LIMIT: usize = 64;
 
 pub(crate) struct OwnerBootstrap {
     pub(crate) session_identity: String,
@@ -107,9 +108,31 @@ struct OwnerStartupFailure {
     contract: Value,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ServerRequestId {
+    Integer(i64),
+    String(String),
+}
+
+impl ServerRequestId {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(value) => value.as_i64().map(Self::Integer),
+            Value::String(value) => Some(Self::String(value.clone())),
+            _ => None,
+        }
+    }
+}
+
+struct PendingServerRequest {
+    message: Value,
+}
+
 struct LspRuntime {
     process: SupervisedServerProcess,
-    reader: JsonRpcFrameReader<tokio::process::ChildStdout>,
+    reader: Option<JsonRpcFrameReader<tokio::process::ChildStdout>>,
+    frames: Option<mpsc::Receiver<Result<Option<JsonRpcFrame>, String>>>,
+    reader_task: Option<JoinHandle<()>>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
     stderr: mpsc::Receiver<String>,
     stderr_tail: Arc<Mutex<String>>,
@@ -118,6 +141,8 @@ struct LspRuntime {
     diagnostics: DiagnosticCache,
     documents: DocumentStore,
     progress: BTreeMap<String, Value>,
+    server_requests: BTreeMap<ServerRequestId, PendingServerRequest>,
+    server_request_order: VecDeque<ServerRequestId>,
     settings: Value,
     workspace_uri: String,
     workspace_path: PathBuf,
@@ -241,6 +266,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         let idle_sleep = tokio_time::sleep_until(TokioInstant::from_std(idle_deadline));
         tokio::pin!(idle_sleep);
         tokio::select! {
+            biased;
             pending = controls_rx.recv() => {
                 let Some(pending) = pending else { break };
                 if *pending.cancelled.borrow() {
@@ -404,9 +430,9 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     lsp.log.push("server_stderr", "error", stderr);
                 }
             }
-            frame = lsp.reader.read_json_rpc_frame_with_bytes() => {
+            frame = lsp.frames.as_mut().expect("ready Owners have an LSP reader pump").recv() => {
                 match frame {
-                    Ok(Some(frame)) => {
+                    Some(Ok(Some(frame))) => {
                         if let Err(error) = lsp.handle_concurrent_frame(
                             &bootstrap.owner_generation,
                             frame,
@@ -422,7 +448,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             should_stop = true;
                         }
                     }
-                    Ok(None) => {
+                    Some(Ok(None)) | None => {
                         let failure = server_exited_failure(
                             lsp.process.try_wait().ok().flatten(),
                             &lsp.server_stderr_tail(),
@@ -431,8 +457,8 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
                         should_stop = true;
                     }
-                    Err(error) => {
-                        let failure = protocol_failure(error.to_string());
+                    Some(Err(error)) => {
+                        let failure = protocol_failure(error);
                         fail_active_queries(
                             &bootstrap.owner_generation,
                             &mut active_queries,
@@ -442,6 +468,19 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         lsp.process.terminate_process_tree(Duration::ZERO).await;
                         should_stop = true;
                     }
+                }
+            }
+            _ = std::future::ready(()), if lsp.has_pending_server_requests() => {
+                let result = lsp.process_next_server_request(&mut active_queries).await;
+                if let Err(error) = result {
+                    lsp.log.push("protocol_violation", "error", &error);
+                    fail_active_queries(
+                        &bootstrap.owner_generation,
+                        &mut active_queries,
+                        protocol_failure(error),
+                    ).await;
+                    lsp.process.terminate_process_tree(Duration::ZERO).await;
+                    should_stop = true;
                 }
             }
             _ = &mut idle_sleep, if active_queries.is_empty() => {
@@ -546,7 +585,9 @@ impl LspRuntime {
         };
         let mut runtime = Self {
             process,
-            reader: JsonRpcFrameReader::with_body_limit(stdout, body_limit),
+            reader: Some(JsonRpcFrameReader::with_body_limit(stdout, body_limit)),
+            frames: None,
+            reader_task: None,
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
             stderr: stderr_rx,
             stderr_tail,
@@ -562,6 +603,8 @@ impl LspRuntime {
                 settings.max_total_text_bytes,
             ),
             progress: BTreeMap::new(),
+            server_requests: BTreeMap::new(),
+            server_request_order: VecDeque::new(),
             settings: settings.settings.clone(),
             workspace_uri: bootstrap.workspace_uri.clone(),
             workspace_path: bootstrap.workspace_path.clone(),
@@ -578,6 +621,7 @@ impl LspRuntime {
             receipt_settings: settings.receipts.clone(),
             mutation_settings: settings.mutation.clone(),
         };
+        runtime.start_reader_pump();
         runtime
             .log
             .push("lifecycle", "info", "Language server process started");
@@ -598,6 +642,27 @@ impl LspRuntime {
             .log
             .push("lifecycle", "info", "Language server initialized");
         Ok(runtime)
+    }
+
+    fn start_reader_pump(&mut self) {
+        let mut reader = self
+            .reader
+            .take()
+            .expect("the LSP reader pump starts exactly once");
+        let (sender, receiver) = mpsc::channel(OWNER_QUEUE_LIMIT);
+        self.frames = Some(receiver);
+        self.reader_task = Some(tokio::spawn(async move {
+            loop {
+                let frame = reader
+                    .read_json_rpc_frame_with_bytes()
+                    .await
+                    .map_err(|error| error.to_string());
+                let terminal = !matches!(frame, Ok(Some(_)));
+                if sender.send(frame).await.is_err() || terminal {
+                    break;
+                }
+            }
+        }));
     }
 
     fn server_stderr_tail(&self) -> String {
@@ -638,8 +703,9 @@ impl LspRuntime {
                         self.log.push("server_stderr", "error", stderr);
                     }
                 }
-                frame = self.reader.read_json_rpc_frame_with_bytes() => {
+                frame = self.frames.as_mut().expect("initializing Owners have an LSP reader pump").recv() => {
                     let frame = frame
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "LSP reader stopped during initialization"))?
                         .map_err(io::Error::other)?
                         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Server exited during initialization"))?;
                     if let Some(trace) = &mut self.startup_trace {
@@ -868,22 +934,7 @@ impl LspRuntime {
         }
 
         if message.get("id").is_some() && message.get("method").is_some() {
-            let response = if message["method"] == "workspace/applyEdit" {
-                self.handle_apply_edit_callback(&message, active).await
-            } else {
-                self.route_server_request(message).await
-            };
-            let (header, body) = self
-                .writer
-                .write_json_rpc_frame_with_bytes(&response)
-                .await
-                .map_err(|error| error.to_string())?;
-            for query in active.values_mut() {
-                if let Some(trace) = &mut query.trace {
-                    trace.push("client_to_server", &header, &body, &response);
-                }
-            }
-            return Ok(());
+            return self.queue_server_request(message, active).await;
         }
 
         if message.get("method").is_some() && message.get("id").is_none() {
@@ -941,12 +992,118 @@ impl LspRuntime {
                     }
                 }
             }
-            if !matched_partial {
+            if method == "$/cancelRequest" {
+                self.cancel_server_request(&message, active).await?;
+            } else if !matched_partial {
                 self.handle_notification(&message, None);
             }
             return Ok(());
         }
         Err("Malformed JSON-RPC routing".to_owned())
+    }
+
+    async fn queue_server_request(
+        &mut self,
+        message: Value,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        let id = message.get("id").cloned().unwrap_or(Value::Null);
+        let Some(key) = ServerRequestId::from_value(&id) else {
+            let response = json_rpc_error(
+                Value::Null,
+                -32600,
+                "Invalid server request identifier",
+                None,
+            );
+            return self.write_server_response(&response, active).await;
+        };
+        if self.server_requests.contains_key(&key) {
+            return Err("The server reused an active request identifier".to_owned());
+        }
+        if self.server_requests.len() >= SERVER_REQUEST_LIMIT {
+            let response = json_rpc_error(
+                id,
+                -32803,
+                "Client busy",
+                Some(json!({"reason": "client_busy", "limit": SERVER_REQUEST_LIMIT})),
+            );
+            return self.write_server_response(&response, active).await;
+        }
+        self.server_request_order.push_back(key.clone());
+        self.server_requests
+            .insert(key, PendingServerRequest { message });
+        Ok(())
+    }
+
+    fn has_pending_server_requests(&self) -> bool {
+        !self.server_request_order.is_empty()
+    }
+
+    async fn process_next_server_request(
+        &mut self,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        let Some(key) = self.server_request_order.pop_front() else {
+            return Ok(());
+        };
+        let Some(pending) = self.server_requests.remove(&key) else {
+            // A cancelled request leaves an order tombstone so cancellation
+            // never needs an O(n) queue scan.
+            return Ok(());
+        };
+        let response = if pending.message["method"] == "workspace/applyEdit" {
+            self.handle_apply_edit_callback(&pending.message, active)
+                .await
+        } else {
+            self.route_server_request(pending.message).await
+        };
+        self.write_server_response(&response, active).await
+    }
+
+    async fn cancel_server_request(
+        &mut self,
+        message: &Value,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        let Some(id) = message.pointer("/params/id") else {
+            return Ok(());
+        };
+        let Some(key) = ServerRequestId::from_value(id) else {
+            return Ok(());
+        };
+        let Some(pending) = self.server_requests.remove(&key) else {
+            self.log.push(
+                "server_request_cancellation",
+                "debug",
+                "Ignored late or unknown server request cancellation",
+            );
+            return Ok(());
+        };
+        let response = json_rpc_error(
+            pending.message.get("id").cloned().unwrap_or(Value::Null),
+            -32800,
+            "Request cancelled",
+            None,
+        );
+        self.write_server_response(&response, active).await
+    }
+
+    async fn write_server_response(
+        &mut self,
+        response: &Value,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        let (header, body) = self
+            .writer
+            .write_json_rpc_frame_with_bytes(response)
+            .await
+            .map_err(|error| error.to_string())?;
+        for query in active.values_mut() {
+            if let Some(trace) = &mut query.trace {
+                trace.push("client_to_server", &header, &body, response);
+            }
+        }
+        Ok(())
     }
 
     async fn handle_apply_edit_callback(
@@ -1534,46 +1691,6 @@ impl LspRuntime {
         }
     }
 
-    async fn handle_server_message(
-        &mut self,
-        message: Value,
-        partial_token: Option<&Value>,
-        partial_items: &mut Vec<Value>,
-        partial_bytes: &mut usize,
-        trace: Option<&mut ProtocolTrace>,
-    ) -> io::Result<()> {
-        if message.get("id").is_some() && message.get("method").is_some() {
-            let response = self.route_server_request(message).await;
-            return self.write_lsp_message_traced(&response, trace).await;
-        }
-        if message.get("method").is_some() && message.get("id").is_none() {
-            self.handle_notification(&message, partial_token);
-            if partial_token.is_some()
-                && message["method"] == "$/progress"
-                && message.pointer("/params/token") == partial_token
-            {
-                let value = message
-                    .pointer("/params/value")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                *partial_bytes = partial_bytes.saturating_add(
-                    serde_json::to_vec(&value)
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(usize::MAX),
-                );
-                match value {
-                    Value::Array(items) => partial_items.extend(items),
-                    value => partial_items.push(value),
-                }
-            }
-            return Ok(());
-        }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Malformed JSON-RPC routing",
-        ))
-    }
-
     async fn route_server_request(&mut self, message: Value) -> Value {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message["method"].as_str().unwrap_or_default();
@@ -1736,21 +1853,43 @@ impl LspRuntime {
             .is_ok()
         {
             let deadline = TokioInstant::now() + self.shutdown_timeout;
+            let mut no_active_queries = BTreeMap::new();
             loop {
                 tokio::select! {
+                    biased;
                     _ = tokio_time::sleep_until(deadline) => break,
-                    frame = self.reader.read_json_rpc_frame_with_bytes() => {
+                    frame = self.frames.as_mut().expect("ready Owners have an LSP reader pump").recv() => {
                         match frame {
-                            Ok(Some(frame)) if is_response_for(&frame.message, &json!(id)) => {
+                            Some(Ok(Some(frame))) if is_response_for(&frame.message, &json!(id)) => {
                                 if frame.message.get("result") != Some(&Value::Null) {
                                     self.log.push("protocol_violation", "warning", "Shutdown returned a non-null result");
                                 }
                                 break;
                             }
-                            Ok(Some(frame)) => {
-                                let _ = self.handle_server_message(frame.message, None, &mut Vec::new(), &mut 0, None).await;
+                            Some(Ok(Some(frame))) => {
+                                let message = frame.message;
+                                if message.get("id").is_some() && message.get("method").is_some() {
+                                    if self.queue_server_request(message, &mut no_active_queries).await.is_err() {
+                                        break;
+                                    }
+                                } else if message.get("method").is_some() && message.get("id").is_none() {
+                                    if message["method"] == "$/cancelRequest" {
+                                        if self.cancel_server_request(&message, &mut no_active_queries).await.is_err() {
+                                            break;
+                                        }
+                                    } else {
+                                        self.handle_notification(&message, None);
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
                             _ => break,
+                        }
+                    }
+                    _ = std::future::ready(()), if self.has_pending_server_requests() => {
+                        if self.process_next_server_request(&mut no_active_queries).await.is_err() {
+                            break;
                         }
                     }
                 }

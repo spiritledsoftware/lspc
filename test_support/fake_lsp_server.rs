@@ -345,6 +345,103 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            Some("test/server-request-limit") => {
+                for id in 0..=64 {
+                    let callback = json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("fixture-callback-{id}"),
+                        "method": "workspace/configuration",
+                        "params": {"items": [{"section": "fixture"}]}
+                    });
+                    if write_frame(&mut output, &callback, scenario).is_err() {
+                        return ExitCode::from(1);
+                    }
+                }
+                let mut accepted = 0;
+                let mut busy = 0;
+                for _ in 0..=64 {
+                    let Some(response) = read_callback_message(&mut input, &mut open_documents)
+                    else {
+                        return ExitCode::from(1);
+                    };
+                    if response
+                        .pointer("/error/data/reason")
+                        .and_then(Value::as_str)
+                        == Some("client_busy")
+                    {
+                        busy += 1;
+                    } else if response.get("result").is_some() {
+                        accepted += 1;
+                    }
+                }
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"accepted": accepted, "busy": busy}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/cancel-server-request") => {
+                let callback_id = json!("fixture-cancelled-callback");
+                if write_frame(
+                    &mut output,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": callback_id,
+                        "method": "workspace/configuration",
+                        "params": {"items": []}
+                    }),
+                    scenario,
+                )
+                .is_err()
+                    || write_frame(
+                        &mut output,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "$/cancelRequest",
+                            "params": {"id": callback_id}
+                        }),
+                        scenario,
+                    )
+                    .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+                let Some(callback_response) =
+                    read_callback_message(&mut input, &mut open_documents)
+                else {
+                    return ExitCode::from(1);
+                };
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"callbackResponse": callback_response}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/duplicate-server-request-id") => {
+                let callback = json!({
+                    "jsonrpc": "2.0",
+                    "id": "fixture-duplicate-callback",
+                    "method": "workspace/configuration",
+                    "params": {"items": []}
+                });
+                if write_frame(&mut output, &callback, scenario).is_err()
+                    || write_frame(&mut output, &callback, scenario).is_err()
+                {
+                    return ExitCode::from(1);
+                }
+                thread::sleep(Duration::from_secs(30));
+                return ExitCode::from(1);
+            }
             Some("textDocument/didOpen") => {
                 if let Some(uri) = message
                     .pointer("/params/textDocument/uri")
@@ -460,6 +557,37 @@ fn read_callback_result<R: BufRead>(
         let message = read_frame(input).ok().flatten()?;
         if message.get("method").is_none() && message.get("id") == Some(callback_id) {
             return message.get("result").cloned();
+        }
+        match message.get("method").and_then(Value::as_str) {
+            Some("textDocument/didOpen") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.insert(uri.to_owned());
+                }
+            }
+            Some("textDocument/didClose") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.remove(uri);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_callback_message<R: BufRead>(
+    input: &mut R,
+    open_documents: &mut BTreeSet<String>,
+) -> Option<Value> {
+    loop {
+        let message = read_frame(input).ok().flatten()?;
+        if message.get("method").is_none() && message.get("id").is_some() {
+            return Some(message);
         }
         match message.get("method").and_then(Value::as_str) {
             Some("textDocument/didOpen") => {
