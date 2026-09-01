@@ -57,6 +57,12 @@ impl ParsedInvocation {
     pub(crate) fn has_option(&self, name: &str) -> bool {
         self.options.contains_key(name)
     }
+
+    pub(crate) fn positional_string(&self, index: usize) -> Option<String> {
+        self.positionals
+            .get(index)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
 }
 
 /// Parses one CLI invocation and emits exactly one JSON envelope.
@@ -108,6 +114,30 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
         }
         [group, ..] if group == "trust" => {
             match crate::configuration::dispatch_trust_command(&invocation) {
+                Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
+                Err(failure) => {
+                    let exit_code = failure.exit_code;
+                    emit_envelope(
+                        &failure_envelope(invocation.command, &failure),
+                        ExitCode::from(exit_code),
+                    )
+                }
+            }
+        }
+        [group, ..] if group == "session" => {
+            match crate::session::dispatch_session_command(&invocation) {
+                Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
+                Err(failure) => {
+                    let exit_code = failure.exit_code;
+                    emit_envelope(
+                        &failure_envelope(invocation.command, &failure),
+                        ExitCode::from(exit_code),
+                    )
+                }
+            }
+        }
+        [command] if command == "raw" || command == "capabilities" => {
+            match crate::session::dispatch_owner_query_command(&invocation) {
                 Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
                 Err(failure) => {
                     let exit_code = failure.exit_code;

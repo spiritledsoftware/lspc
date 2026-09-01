@@ -362,6 +362,31 @@ pub(crate) fn select_server(
     Ok(server)
 }
 
+/// Selects one declared server without applying invocation-scoped launch overrides.
+pub(crate) fn select_named_server(
+    configuration: &LoadedConfiguration,
+    name: &str,
+) -> Result<EffectiveServer, ContractFailure> {
+    let server = configuration
+        .servers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| server_selection_failure("The selected server has no declaration."))?;
+    if server.executable.is_none() {
+        return Err(ContractFailure {
+            exit_code: 3,
+            category: "blocked",
+            code: "server_declaration_incomplete",
+            message: "The selected server declaration is incomplete.".to_owned(),
+            stage: "select_server",
+            delivery: "not_sent",
+            retry: "after_change",
+            data: json!({"server": name, "missingFields": ["executable"]}),
+        });
+    }
+    Ok(server)
+}
+
 /// Derives one synchronized Document language ID for the selected server.
 pub(crate) fn document_language_id(
     configuration: &LoadedConfiguration,

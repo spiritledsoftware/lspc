@@ -15,6 +15,13 @@ pub(crate) struct JsonRpcFrameReader<R> {
     max_body_bytes: NonZeroUsize,
 }
 
+/// One decoded JSON-RPC message with its exact wire bytes.
+pub(crate) struct JsonRpcFrame {
+    pub(crate) message: Value,
+    pub(crate) header: Vec<u8>,
+    pub(crate) body: Vec<u8>,
+}
+
 impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
     /// Creates a frame reader with the default 64 MiB body limit.
     pub(crate) fn new(input: R) -> Self {
@@ -36,6 +43,16 @@ impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
     pub(crate) async fn read_json_rpc_frame(
         &mut self,
     ) -> Result<Option<Value>, JsonRpcTransportError> {
+        Ok(self
+            .read_json_rpc_frame_with_bytes()
+            .await?
+            .map(|frame| frame.message))
+    }
+
+    /// Reads one message while retaining the exact header and body for explicit tracing.
+    pub(crate) async fn read_json_rpc_frame_with_bytes(
+        &mut self,
+    ) -> Result<Option<JsonRpcFrame>, JsonRpcTransportError> {
         let Some(header) = self.read_bounded_header().await? else {
             return Ok(None);
         };
@@ -52,12 +69,16 @@ impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
             .read_exact(&mut body)
             .await
             .map_err(JsonRpcTransportError::ReadBody)?;
-        let body = str::from_utf8(&body).map_err(JsonRpcTransportError::NonUtf8Body)?;
+        let body_text = str::from_utf8(&body).map_err(JsonRpcTransportError::NonUtf8Body)?;
         let message: Value =
-            serde_json::from_str(body).map_err(JsonRpcTransportError::InvalidJsonBody)?;
+            serde_json::from_str(body_text).map_err(JsonRpcTransportError::InvalidJsonBody)?;
 
         match message {
-            Value::Object(_) => Ok(Some(message)),
+            Value::Object(_) => Ok(Some(JsonRpcFrame {
+                message,
+                header,
+                body,
+            })),
             Value::Array(_) => Err(JsonRpcTransportError::BatchUnsupported),
             _ => Err(JsonRpcTransportError::MessageNotObject),
         }
@@ -135,6 +156,16 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
         &mut self,
         message: &Value,
     ) -> Result<(), JsonRpcTransportError> {
+        self.write_json_rpc_frame_with_bytes(message)
+            .await
+            .map(|_| ())
+    }
+
+    /// Writes one message and returns its exact header and body for explicit tracing.
+    pub(crate) async fn write_json_rpc_frame_with_bytes(
+        &mut self,
+        message: &Value,
+    ) -> Result<(Vec<u8>, Vec<u8>), JsonRpcTransportError> {
         if !message.is_object() {
             return Err(JsonRpcTransportError::MessageNotObject);
         }
@@ -147,9 +178,9 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
             });
         }
 
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let header = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         self.output
-            .write_all(header.as_bytes())
+            .write_all(&header)
             .await
             .map_err(JsonRpcTransportError::WriteFrame)?;
         self.output
@@ -159,7 +190,8 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
         self.output
             .flush()
             .await
-            .map_err(JsonRpcTransportError::WriteFrame)
+            .map_err(JsonRpcTransportError::WriteFrame)?;
+        Ok((header, body))
     }
 }
 

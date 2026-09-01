@@ -13,9 +13,11 @@ fake-server = []
 
 [dependencies]
 atomic-write-file = "0.3"
+async-lsp = { version = "0.2.4", default-features = false }
 clap = { version = "4.5", features = ["string"] }
 directories = "6"
 dunce = "1"
+fs2 = "0.4"
 hex = "0.4"
 getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -24,10 +26,14 @@ semver = "1"
 sha2 = "0.11"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml = "1.1"
+tower-service = "0.3"
 url = "2"
 which = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -35,6 +41,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
 ] }
