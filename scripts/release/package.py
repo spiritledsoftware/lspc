@@ -40,6 +40,9 @@ def main() -> None:
     rust_version = command(["rustc", "-Vv"]).splitlines()[0]
     if target:
         subprocess.run([sys.executable, str(ROOT / "scripts/release/build_archive.py"), "--binary", str(binary), "--target", arguments.target, "--version", package["version"], "--commit", arguments.commit, "--rust-version", rust_version, "--output-dir", str(arguments.output_dir)], cwd=ROOT, check=True)
+        extension = "zip" if "windows" in arguments.target else "tar.gz"
+        archive = arguments.output_dir / f"lspc-v{package['version']}-{arguments.target}.{extension}"
+        subprocess.run([sys.executable, str(ROOT / "scripts/release/verify_archive.py"), str(archive), "--target", arguments.target, "--version", package["version"]], cwd=ROOT, check=True)
     schema = subprocess.run([str(binary), "schema", "--full"], check=True, capture_output=True).stdout
     with tempfile.TemporaryDirectory(prefix="lspc-skill-schema-") as temporary:
         schema_path = Path(temporary) / "schema.json"
