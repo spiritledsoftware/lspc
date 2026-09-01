@@ -45,6 +45,27 @@ pub(crate) enum QueryCommand {
 }
 
 impl QueryCommand {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::References => "references",
+            Self::Hover => "hover",
+            Self::DocumentSymbols => "document-symbols",
+            Self::WorkspaceSymbols => "workspace-symbols",
+            Self::DocumentDiagnostics => "document-diagnostics",
+            Self::WorkspaceDiagnostics => "workspace-diagnostics",
+            Self::PublishedDiagnostics => "published-diagnostics",
+            Self::PrepareRename => "prepare-rename",
+            Self::Rename => "rename",
+            Self::Format => "format",
+            Self::CodeActions => "code-actions",
+            Self::ResolveCodeAction => "resolve-code-action",
+            Self::ExecuteCommand => "execute-command",
+            Self::Raw => "raw",
+            Self::Capabilities => "capabilities",
+        }
+    }
+
     pub(crate) fn from_path(path: &[String]) -> Option<Self> {
         Some(match path {
             [name] if name == "definition" => Self::Definition,
@@ -377,7 +398,6 @@ pub(crate) struct Page {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct PreviewProposal {
     pub(crate) command: QueryCommand,
     pub(crate) method: String,

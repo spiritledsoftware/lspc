@@ -372,7 +372,7 @@ pub(crate) fn select_named_server(
 }
 
 /// Selects one declared server without applying invocation-scoped launch overrides.
-pub(crate) fn select_named_server(
+pub(crate) fn select_configured_server(
     configuration: &LoadedConfiguration,
     name: &str,
 ) -> Result<EffectiveServer, ContractFailure> {

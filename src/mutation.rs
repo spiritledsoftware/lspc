@@ -13,10 +13,11 @@ use crate::{
     canonical_value::digest_canonical_value,
     cli::ParsedInvocation,
     configuration::{
-        MutationSettings, PreviewSettings, ReceiptSettings, authorize_server, load_configuration,
-        select_named_server,
+        AuthorizedServer, LoadedConfiguration, MutationSettings, PreviewSettings, ReceiptSettings,
+        authorize_server, load_configuration, select_named_server,
     },
     contract::ContractFailure,
+    query::PreviewProposal,
     workspace::PositionEncoding,
 };
 
@@ -88,6 +89,66 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
         });
     }
 
+    let preview = persist_preview(
+        &configuration,
+        &authorized,
+        position_encoding,
+        source,
+        edit,
+        command,
+    )?;
+    if preview.is_null() {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "ok": true,
+            "command": ["preview", "create"],
+            "outcome": "unchanged",
+            "result": null
+        }));
+    }
+    Ok(json!({
+        "schemaVersion": 1,
+        "ok": true,
+        "command": ["preview", "create"],
+        "outcome": "previewed",
+        "result": preview
+    }))
+}
+
+/// Validates and persists the Workspace Edit produced by a live Query.
+pub(crate) fn create_query_preview(
+    configuration: &LoadedConfiguration,
+    authorized: &AuthorizedServer,
+    position_encoding: PositionEncoding,
+    proposal: PreviewProposal,
+) -> Result<Value, ContractFailure> {
+    let source = json!({
+        "kind": "lsp_request",
+        "command": proposal.command.name(),
+        "method": proposal.method,
+        "context": proposal.context,
+        "resolvedAction": proposal.resolved_action,
+        "trace": proposal.trace,
+        "applyEditLedger": proposal.apply_edit_ledger,
+    });
+    persist_preview(
+        configuration,
+        authorized,
+        position_encoding,
+        source,
+        proposal.edit,
+        proposal.command_payload,
+    )
+}
+
+fn persist_preview(
+    configuration: &LoadedConfiguration,
+    authorized: &AuthorizedServer,
+    position_encoding: PositionEncoding,
+    source: Value,
+    edit: Value,
+    command: Option<Value>,
+) -> Result<Value, ContractFailure> {
     let planner = WorkspaceEditPlanner::open(
         &configuration.workspace,
         &configuration.workspace_uri,
@@ -100,13 +161,7 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
         .plan_workspace_edit(&edit)
         .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
     if planned.plan.operations.is_empty() {
-        return Ok(json!({
-            "schemaVersion": 1,
-            "ok": true,
-            "command": ["preview", "create"],
-            "outcome": "unchanged",
-            "result": null
-        }));
+        return Ok(Value::Null);
     }
     let current = planner
         .inspect_manifest_paths(
@@ -147,7 +202,7 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
         PreviewRecordContext {
             preview_id: &preview_id,
             workspace_uri: &configuration.workspace_uri,
-            server: Some(server_name),
+            server: Some(authorized.server.name.clone()),
             session_identity: &authorized.session_identity,
             position_encoding: position_encoding.name(),
             source,
@@ -158,7 +213,7 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
     );
     let mut stored = store.create_preview(
         record,
-        configuration.workspace,
+        configuration.workspace.clone(),
         authorization_digest,
         recovery_manifest_digest,
         &configuration.previews,
@@ -168,13 +223,16 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
         &configuration.previews,
         &configuration.mutation,
     );
-    Ok(json!({
-        "schemaVersion": 1,
-        "ok": true,
-        "command": ["preview", "create"],
-        "outcome": "previewed",
-        "result": stored.preview
-    }))
+    serde_json::to_value(stored.preview).map_err(|error| ContractFailure {
+        exit_code: 70,
+        category: "internal",
+        code: "internal_error",
+        message: "The Preview result cannot be serialized.".to_owned(),
+        stage: "create_preview",
+        delivery: "sent",
+        retry: "after_change",
+        data: json!({"reason": error.to_string()}),
+    })
 }
 
 fn preview_show(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {

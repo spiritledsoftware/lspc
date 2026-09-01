@@ -1266,7 +1266,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 path: path.to_path_buf(),
                 exists: true,
                 resource_kind,
-                identity_digest: Some(identity_digest(&metadata)),
+                identity_digest: Some(identity_digest(path, &metadata, index)?),
                 content_digest,
                 metadata_digest: Some(metadata_digest(path, &metadata, index)?),
             },
@@ -1616,21 +1616,82 @@ fn read_text_file(path: &Path, limit: u64, index: u64) -> Result<Vec<u8>, Worksp
     })
 }
 
-fn identity_digest(metadata: &Metadata) -> String {
+fn identity_digest(
+    path: &Path,
+    metadata: &Metadata,
+    index: u64,
+) -> Result<String, WorkspaceEditProblem> {
     let mut identity = json!({"length": metadata.len()});
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         identity["device"] = json!(metadata.dev());
         identity["inode"] = json!(metadata.ino());
+        let _ = (path, index);
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        identity["volumeSerial"] = json!(metadata.volume_serial_number());
-        identity["fileIndex"] = json!(metadata.file_index());
+        let (volume_serial, file_index) = windows_file_identity(path).map_err(|error| {
+            problem(
+                "filesystem_capability_unavailable",
+                "A Mutation resource identity cannot be inspected.",
+                Some(index),
+                Some(path),
+                Some(json!({"reason": error.to_string()})),
+            )
+        })?;
+        identity["volumeSerial"] = json!(volume_serial);
+        identity["fileIndex"] = json!(file_index);
     }
-    digest_canonical_value("lspc-resource-identity-v1", &identity)
+    Ok(digest_canonical_value(
+        "lspc-resource-identity-v1",
+        &identity,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GetFileInformationByHandle, OPEN_EXISTING,
+        },
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    let close_result = unsafe { CloseHandle(handle) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
 }
 
 fn metadata_digest(
@@ -1674,6 +1735,7 @@ fn metadata_digest(
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        let _ = (path, index);
         value["fileAttributes"] = json!(metadata.file_attributes());
         value["creationTime"] = json!(metadata.creation_time());
     }

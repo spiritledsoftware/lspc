@@ -28,7 +28,7 @@ use crate::{
     cli::ParsedInvocation,
     configuration::{
         AuthorizedServer, LoadedConfiguration, authorize_server, load_configuration,
-        select_named_server, select_server,
+        select_configured_server, select_named_server, select_server,
     },
     contract::ContractFailure,
     query::{
@@ -183,12 +183,17 @@ pub(crate) fn dispatch_owner_query_command(
             endpoint: &endpoint,
             request_timeout,
         };
+        let mut previews = MutationPreviewCreator {
+            configuration: &configuration,
+            authorized: &authorized,
+            position_encoding,
+        };
         execute(
             &mut dispatcher,
             composed,
             context,
             &mut diagnostics,
-            &mut PendingPreviewCreator,
+            &mut previews,
         )
     })
 }
@@ -273,20 +278,20 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
     }
 }
 
-struct PendingPreviewCreator;
+struct MutationPreviewCreator<'a> {
+    configuration: &'a LoadedConfiguration,
+    authorized: &'a AuthorizedServer,
+    position_encoding: PositionEncoding,
+}
 
-impl PreviewCreator for PendingPreviewCreator {
-    fn create_preview(&mut self, _proposal: PreviewProposal) -> Result<Value, ContractFailure> {
-        Err(ContractFailure {
-            exit_code: 70,
-            category: "internal",
-            code: "implementation_pending",
-            message: "Mutation Preview integration is not available.".to_owned(),
-            stage: "create_preview",
-            delivery: "sent",
-            retry: "after_change",
-            data: json!({}),
-        })
+impl PreviewCreator for MutationPreviewCreator<'_> {
+    fn create_preview(&mut self, proposal: PreviewProposal) -> Result<Value, ContractFailure> {
+        crate::mutation::create_query_preview(
+            self.configuration,
+            self.authorized,
+            self.position_encoding,
+            proposal,
+        )
     }
 }
 
@@ -390,7 +395,7 @@ fn reauthorize_project_launch(
         return Ok(());
     }
     let fresh_configuration = load_configuration(&configuration.workspace, false)?;
-    let fresh_server = select_named_server(&fresh_configuration, &authorized.server.name)?;
+    let fresh_server = select_configured_server(&fresh_configuration, &authorized.server.name)?;
     let fresh_authorized = authorize_server(&fresh_configuration, fresh_server)?;
     if fresh_authorized.declaration_digest != authorized.declaration_digest {
         return Err(ContractFailure {
@@ -508,7 +513,7 @@ async fn restart_session(invocation: &ParsedInvocation) -> Result<Value, Contrac
         .and_then(|uri| uri.to_file_path().ok())
         .ok_or_else(|| session_selection_failure("The Owner Workspace URI is invalid.", vec![]))?;
     let configuration = load_configuration(&workspace_path, false)?;
-    let server = select_named_server(&configuration, &endpoint.server)?;
+    let server = select_named_server(&configuration, &endpoint.server, invocation)?;
     let authorized = authorize_server(&configuration, server)?;
     let replacement = connect_or_start_owner(&configuration, &authorized, false).await?;
     Ok(success_envelope(
