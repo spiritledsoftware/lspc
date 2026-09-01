@@ -1,0 +1,984 @@
+use std::{
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+
+use atomic_write_file::AtomicWriteFile;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+
+use crate::{
+    canonical_value::digest_canonical_value,
+    configuration::{PreviewSettings, ReceiptSettings},
+    contract::ContractFailure,
+};
+
+use super::planner::{CanonicalPlan, ManifestEntry, PreviewSummary, WorkspaceEditProblem};
+
+pub(crate) const MUTATION_STATE_VERSION: u32 = 1;
+const PREVIEW_RETENTION_HOURS: i64 = 24;
+const RECEIPT_RETENTION_HOURS: i64 = 720;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreviewRecord {
+    pub(crate) preview_id: String,
+    pub(crate) workspace_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) server: Option<String>,
+    pub(crate) session_identity: String,
+    pub(crate) position_encoding: String,
+    pub(crate) expires_at: String,
+    pub(crate) source: Value,
+    pub(crate) summary: PreviewSummary,
+    pub(crate) edit: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<Value>,
+    pub(crate) annotations: Value,
+    pub(crate) plan: CanonicalPlan,
+    pub(crate) preconditions: Vec<ManifestEntry>,
+    pub(crate) conflicts: Vec<WorkspaceEditProblem>,
+    pub(crate) stale_reasons: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diff: Option<String>,
+    pub(crate) reserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StoredPreview {
+    pub(crate) format_version: u32,
+    pub(crate) created_unix_seconds: i64,
+    pub(crate) expires_unix_seconds: i64,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) authorization_digest: String,
+    pub(crate) recovery_manifest_digest: Option<String>,
+    pub(crate) preview: PreviewRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReceiptRecord {
+    pub(crate) receipt_id: String,
+    pub(crate) kind: String,
+    pub(crate) transaction_id: String,
+    pub(crate) workspace_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preview_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) linked_receipt_id: Option<String>,
+    pub(crate) preauthorized: bool,
+    pub(crate) started_at: String,
+    pub(crate) completed_at: String,
+    pub(crate) outcome: String,
+    pub(crate) filesystem_state: String,
+    pub(crate) summary: PreviewSummary,
+    pub(crate) before_manifest: Vec<ManifestEntry>,
+    pub(crate) intended_manifest: Vec<ManifestEntry>,
+    pub(crate) observed_manifest: Vec<ManifestEntry>,
+    pub(crate) session_synchronized: bool,
+    pub(crate) cleanup_pending: bool,
+    pub(crate) durability: Value,
+    pub(crate) manifest_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_change: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StoredReceipt {
+    pub(crate) format_version: u32,
+    pub(crate) completed_unix_seconds: i64,
+    pub(crate) expires_unix_seconds: i64,
+    pub(crate) receipt: ReceiptRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BackupEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) backup_path: PathBuf,
+    pub(crate) existed: bool,
+    pub(crate) resource_kind: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransactionState {
+    Staged,
+    Committing,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TransactionRecord {
+    pub(crate) format_version: u32,
+    pub(crate) transaction_id: String,
+    pub(crate) preview_id: String,
+    pub(crate) receipt_id: String,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) workspace_uri: String,
+    pub(crate) state: TransactionState,
+    pub(crate) started_at: String,
+    pub(crate) artifact_directory: PathBuf,
+    pub(crate) backups: Vec<BackupEntry>,
+    pub(crate) before_manifest: Vec<ManifestEntry>,
+    pub(crate) intended_manifest: Vec<ManifestEntry>,
+    pub(crate) observed_manifest: Vec<ManifestEntry>,
+    pub(crate) manifest_digest: String,
+    pub(crate) cleanup_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MutationStateStore {
+    root: PathBuf,
+}
+
+impl MutationStateStore {
+    /// Opens the versioned user-private Preview, Receipt, and Recovery store.
+    pub(crate) fn open() -> Result<Self, ContractFailure> {
+        let project = directories::ProjectDirs::from("", "", "lspc").ok_or_else(|| {
+            state_failure(
+                "mutation",
+                Path::new(""),
+                "The user state directory is unavailable.",
+                None,
+            )
+        })?;
+        let root = project
+            .state_dir()
+            .unwrap_or_else(|| project.data_local_dir())
+            .join("mutation-v1");
+        Self::open_at(root)
+    }
+
+    pub(crate) fn open_at(root: PathBuf) -> Result<Self, ContractFailure> {
+        for directory in [
+            root.clone(),
+            root.join("previews"),
+            root.join("receipts"),
+            root.join("transactions"),
+            root.join("locks"),
+        ] {
+            fs::create_dir_all(&directory).map_err(|error| {
+                state_failure(
+                    "mutation",
+                    &directory,
+                    "A Mutation state directory cannot be created.",
+                    error.raw_os_error(),
+                )
+            })?;
+            restrict_directory(&directory)?;
+        }
+        Ok(Self { root })
+    }
+
+    pub(crate) fn new_preview_id(&self) -> Result<String, ContractFailure> {
+        random_identifier("prv_")
+    }
+
+    pub(crate) fn new_transaction_id(&self) -> Result<String, ContractFailure> {
+        random_identifier("txn_")
+    }
+
+    pub(crate) fn new_receipt_id(&self) -> Result<String, ContractFailure> {
+        random_identifier("rcp_")
+    }
+
+    pub(crate) fn create_preview(
+        &self,
+        mut preview: PreviewRecord,
+        workspace_path: PathBuf,
+        authorization_digest: String,
+        recovery_manifest_digest: Option<String>,
+        limits: &PreviewSettings,
+    ) -> Result<StoredPreview, ContractFailure> {
+        self.prune_expired_records()?;
+        let now = OffsetDateTime::now_utc();
+        let expires = now + Duration::hours(PREVIEW_RETENTION_HOURS);
+        preview.expires_at = expires.format(&Rfc3339).unwrap();
+        let stored = StoredPreview {
+            format_version: MUTATION_STATE_VERSION,
+            created_unix_seconds: now.unix_timestamp(),
+            expires_unix_seconds: expires.unix_timestamp(),
+            workspace_path,
+            authorization_digest,
+            recovery_manifest_digest,
+            preview,
+        };
+        let bytes = serialize_record(
+            &stored,
+            "preview",
+            &self.preview_path(&stored.preview.preview_id),
+        )?;
+        let previews = self.preview_files()?;
+        let current_bytes = previews
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        if previews.len() as u64 >= limits.max_count {
+            return Err(capacity_failure(
+                "previewCount",
+                limits.max_count,
+                previews.len() as u64,
+                1,
+                self.expired_preview_ids()?,
+            ));
+        }
+        if current_bytes.saturating_add(bytes.len() as u64) > limits.max_total_bytes {
+            return Err(capacity_failure(
+                "previewBytes",
+                limits.max_total_bytes,
+                current_bytes,
+                bytes.len() as u64,
+                self.expired_preview_ids()?,
+            ));
+        }
+        write_record(
+            &self.preview_path(&stored.preview.preview_id),
+            &bytes,
+            "preview",
+        )?;
+        Ok(stored)
+    }
+
+    pub(crate) fn read_preview(&self, preview_id: &str) -> Result<StoredPreview, ContractFailure> {
+        let path = self.preview_path(preview_id);
+        let preview: StoredPreview = read_record(&path, "preview", preview_id)?;
+        validate_record_version(preview.format_version, "preview", &path)?;
+        if preview.expires_unix_seconds <= OffsetDateTime::now_utc().unix_timestamp()
+            && !preview.preview.reserved
+        {
+            let _ = fs::remove_file(path);
+            return Err(preview_unknown(preview_id, "inspect"));
+        }
+        Ok(preview)
+    }
+
+    pub(crate) fn write_preview(&self, preview: &StoredPreview) -> Result<(), ContractFailure> {
+        let path = self.preview_path(&preview.preview.preview_id);
+        let bytes = serialize_record(preview, "preview", &path)?;
+        write_record(&path, &bytes, "preview")
+    }
+
+    pub(crate) fn reserve_preview(
+        &self,
+        preview_id: &str,
+    ) -> Result<StoredPreview, ContractFailure> {
+        let mut preview = self.read_preview(preview_id)?;
+        if preview.preview.reserved {
+            return Err(ContractFailure {
+                exit_code: 6,
+                category: "mutation",
+                code: "application_busy",
+                message: "The Preview is already reserved by an Application.".to_owned(),
+                stage: "reserve",
+                delivery: "not_applicable",
+                retry: "safe",
+                data: json!({"previewId": preview_id}),
+            });
+        }
+        preview.preview.reserved = true;
+        self.write_preview(&preview)?;
+        Ok(preview)
+    }
+
+    pub(crate) fn release_preview(
+        &self,
+        preview: &mut StoredPreview,
+    ) -> Result<(), ContractFailure> {
+        preview.preview.reserved = false;
+        self.write_preview(preview)
+    }
+
+    pub(crate) fn discard_preview(&self, preview_id: &str) -> Result<(), ContractFailure> {
+        let preview = self.read_preview(preview_id)?;
+        if preview.preview.reserved {
+            return Err(ContractFailure {
+                exit_code: 6,
+                category: "mutation",
+                code: "application_busy",
+                message: "A reserved Preview cannot be discarded.".to_owned(),
+                stage: "reserve",
+                delivery: "not_applicable",
+                retry: "safe",
+                data: json!({"previewId": preview_id}),
+            });
+        }
+        fs::remove_file(self.preview_path(preview_id)).map_err(|error| {
+            state_failure(
+                "preview",
+                &self.preview_path(preview_id),
+                "The Preview cannot be discarded.",
+                error.raw_os_error(),
+            )
+        })
+    }
+
+    pub(crate) fn list_previews(&self) -> Result<Vec<StoredPreview>, ContractFailure> {
+        self.prune_expired_records()?;
+        let mut records = self
+            .preview_files()?
+            .into_iter()
+            .map(|path| {
+                let id = file_stem(&path);
+                self.read_preview(&id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_unix_seconds));
+        Ok(records)
+    }
+
+    pub(crate) fn write_receipt(
+        &self,
+        receipt: ReceiptRecord,
+        limits: &ReceiptSettings,
+    ) -> Result<StoredReceipt, ContractFailure> {
+        self.prune_expired_records()?;
+        let now = OffsetDateTime::now_utc();
+        let stored = StoredReceipt {
+            format_version: MUTATION_STATE_VERSION,
+            completed_unix_seconds: now.unix_timestamp(),
+            expires_unix_seconds: (now + Duration::hours(RECEIPT_RETENTION_HOURS)).unix_timestamp(),
+            receipt,
+        };
+        let receipts = self.receipt_files()?;
+        if receipts.len() as u64 >= limits.max_count {
+            return Err(capacity_failure(
+                "receiptCount",
+                limits.max_count,
+                receipts.len() as u64,
+                1,
+                self.expired_receipt_ids()?,
+            ));
+        }
+        let path = self.receipt_path(&stored.receipt.receipt_id);
+        let bytes = serialize_record(&stored, "receipt", &path)?;
+        write_record(&path, &bytes, "receipt")?;
+        Ok(stored)
+    }
+
+    pub(crate) fn ensure_receipt_capacity(
+        &self,
+        limits: &ReceiptSettings,
+    ) -> Result<(), ContractFailure> {
+        self.prune_expired_records()?;
+        let receipts = self.receipt_files()?;
+        if receipts.len() as u64 >= limits.max_count {
+            return Err(capacity_failure(
+                "receiptCount",
+                limits.max_count,
+                receipts.len() as u64,
+                1,
+                self.expired_receipt_ids()?,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_receipt(&self, receipt_id: &str) -> Result<StoredReceipt, ContractFailure> {
+        let path = self.receipt_path(receipt_id);
+        let receipt: StoredReceipt =
+            read_record(&path, "receipt", receipt_id).map_err(|mut failure| {
+                if failure.code == "preview_unknown" {
+                    failure.data = json!({"receiptId": receipt_id});
+                }
+                failure
+            })?;
+        validate_record_version(receipt.format_version, "receipt", &path)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn list_receipts(&self) -> Result<Vec<StoredReceipt>, ContractFailure> {
+        self.prune_expired_records()?;
+        let mut records = self
+            .receipt_files()?
+            .into_iter()
+            .map(|path| {
+                let id = file_stem(&path);
+                self.read_receipt(&id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by_key(|record| std::cmp::Reverse(record.completed_unix_seconds));
+        Ok(records)
+    }
+
+    pub(crate) fn already_applied(
+        &self,
+        preview_id: &str,
+    ) -> Result<Option<StoredReceipt>, ContractFailure> {
+        let path = self.receipt_path(preview_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_receipt(preview_id).map(Some)
+    }
+
+    pub(crate) fn convert_preview_to_receipt(
+        &self,
+        preview_id: &str,
+        receipt: ReceiptRecord,
+        limits: &ReceiptSettings,
+    ) -> Result<StoredReceipt, ContractFailure> {
+        let stored = self.write_receipt(receipt, limits)?;
+        fs::remove_file(self.preview_path(preview_id)).map_err(|error| {
+            state_failure(
+                "preview",
+                &self.preview_path(preview_id),
+                "The applied Preview cannot be retired.",
+                error.raw_os_error(),
+            )
+        })?;
+        Ok(stored)
+    }
+
+    pub(crate) fn write_transaction(
+        &self,
+        transaction: &TransactionRecord,
+    ) -> Result<(), ContractFailure> {
+        let path = self.transaction_path(&transaction.transaction_id);
+        let bytes = serialize_record(transaction, "transaction", &path)?;
+        write_record(&path, &bytes, "transaction")
+    }
+
+    pub(crate) fn read_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<TransactionRecord, ContractFailure> {
+        let path = self.transaction_path(transaction_id);
+        let transaction: TransactionRecord = read_record(&path, "transaction", transaction_id)
+            .map_err(|failure| {
+                if failure.code == "preview_unknown" {
+                    recovery_not_found(transaction_id)
+                } else {
+                    failure
+                }
+            })?;
+        validate_record_version(transaction.format_version, "transaction", &path)?;
+        Ok(transaction)
+    }
+
+    pub(crate) fn list_transactions(
+        &self,
+    ) -> Result<Vec<Result<TransactionRecord, Value>>, ContractFailure> {
+        let mut results = Vec::new();
+        for path in self.transaction_files()? {
+            match fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<TransactionRecord>(&bytes).ok()) {
+                Some(record) if record.format_version == MUTATION_STATE_VERSION => results.push(Ok(record)),
+                _ => results.push(Err(json!({
+                    "kind": "corrupt",
+                    "protected": true,
+                    "path": path,
+                    "problems": [{"code": "corrupt_journal", "message": "The transaction journal is invalid."}]
+                }))),
+            }
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn remove_transaction(&self, transaction_id: &str) -> Result<(), ContractFailure> {
+        fs::remove_file(self.transaction_path(transaction_id)).map_err(|error| {
+            state_failure(
+                "transaction",
+                &self.transaction_path(transaction_id),
+                "The transaction journal cannot be removed.",
+                error.raw_os_error(),
+            )
+        })
+    }
+
+    pub(crate) fn application_lock_path(&self, workspace_uri: &str) -> PathBuf {
+        let digest =
+            digest_canonical_value("lspc-workspace-application-lock-v1", &json!(workspace_uri));
+        self.root
+            .join("locks")
+            .join(format!("{}.lock", digest.trim_start_matches("sha256:")))
+    }
+
+    pub(crate) fn open_application_lock(
+        &self,
+        workspace_uri: &str,
+    ) -> Result<fs::File, ContractFailure> {
+        let path = self.application_lock_path(workspace_uri);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|error| {
+                state_failure(
+                    "transaction",
+                    &path,
+                    "The Workspace Application lock cannot be opened.",
+                    error.raw_os_error(),
+                )
+            })?;
+        restrict_file(&path)?;
+        Ok(file)
+    }
+
+    pub(crate) fn prune_state(
+        &self,
+        requested_ids: &[String],
+    ) -> Result<Vec<String>, ContractFailure> {
+        if requested_ids.is_empty() {
+            return self.prune_expired_records();
+        }
+        let mut paths = Vec::new();
+        let mut problems = Vec::new();
+        for id in requested_ids {
+            let path = if id.starts_with("prv_") && self.preview_path(id).exists() {
+                match self.read_preview(id) {
+                    Ok(record) if record.preview.reserved => {
+                        problems.push(json!({"id": id, "code": "protected", "message": "A reserved Preview is protected."}));
+                        continue;
+                    }
+                    Ok(_) => self.preview_path(id),
+                    Err(_) => {
+                        problems.push(json!({"id": id, "code": "unknown", "message": "The state identifier is unknown."}));
+                        continue;
+                    }
+                }
+            } else if (id.starts_with("prv_") || id.starts_with("rcp_"))
+                && self.receipt_path(id).exists()
+            {
+                self.receipt_path(id)
+            } else if id.starts_with("txn_") && self.transaction_path(id).exists() {
+                problems.push(json!({"id": id, "code": "protected", "message": "Recovery transaction evidence is protected."}));
+                continue;
+            } else {
+                problems.push(json!({"id": id, "code": "unknown", "message": "The state identifier is unknown."}));
+                continue;
+            };
+            paths.push((id.clone(), path));
+        }
+        if !problems.is_empty() {
+            return Err(ContractFailure {
+                exit_code: 3,
+                category: "blocked",
+                code: "state_prune_rejected",
+                message: "The requested state prune is not safe.".to_owned(),
+                stage: "prune",
+                delivery: "not_applicable",
+                retry: "after_change",
+                data: json!({"problems": problems}),
+            });
+        }
+        for (_, path) in &paths {
+            fs::remove_file(path).map_err(|error| {
+                state_failure(
+                    "mutation",
+                    path,
+                    "A state record cannot be pruned.",
+                    error.raw_os_error(),
+                )
+            })?;
+        }
+        Ok(paths.into_iter().map(|(id, _)| id).collect())
+    }
+
+    fn prune_expired_records(&self) -> Result<Vec<String>, ContractFailure> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut removed = Vec::new();
+        for path in self.preview_files()? {
+            let bytes = fs::read(&path).map_err(|error| {
+                state_failure(
+                    "preview",
+                    &path,
+                    "A Preview cannot be inspected for pruning.",
+                    error.raw_os_error(),
+                )
+            })?;
+            let record: StoredPreview = serde_json::from_slice(&bytes)
+                .map_err(|_| stored_version_failure("preview", &path, 0))?;
+            validate_record_version(record.format_version, "preview", &path)?;
+            if record.expires_unix_seconds <= now && !record.preview.reserved {
+                fs::remove_file(&path).map_err(|error| {
+                    state_failure(
+                        "preview",
+                        &path,
+                        "An expired Preview cannot be pruned.",
+                        error.raw_os_error(),
+                    )
+                })?;
+                removed.push(record.preview.preview_id);
+            }
+        }
+        for path in self.receipt_files()? {
+            let bytes = fs::read(&path).map_err(|error| {
+                state_failure(
+                    "receipt",
+                    &path,
+                    "A Receipt cannot be inspected for pruning.",
+                    error.raw_os_error(),
+                )
+            })?;
+            let record: StoredReceipt = serde_json::from_slice(&bytes)
+                .map_err(|_| stored_version_failure("receipt", &path, 0))?;
+            validate_record_version(record.format_version, "receipt", &path)?;
+            if record.expires_unix_seconds <= now && !record.receipt.cleanup_pending {
+                fs::remove_file(&path).map_err(|error| {
+                    state_failure(
+                        "receipt",
+                        &path,
+                        "An expired Receipt cannot be pruned.",
+                        error.raw_os_error(),
+                    )
+                })?;
+                removed.push(record.receipt.receipt_id);
+            }
+        }
+        Ok(removed)
+    }
+
+    fn expired_preview_ids(&self) -> Result<Vec<String>, ContractFailure> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        Ok(self
+            .list_previews()?
+            .into_iter()
+            .filter(|record| record.expires_unix_seconds <= now && !record.preview.reserved)
+            .map(|record| record.preview.preview_id)
+            .collect())
+    }
+
+    fn expired_receipt_ids(&self) -> Result<Vec<String>, ContractFailure> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        Ok(self
+            .list_receipts()?
+            .into_iter()
+            .filter(|record| record.expires_unix_seconds <= now && !record.receipt.cleanup_pending)
+            .map(|record| record.receipt.receipt_id)
+            .collect())
+    }
+
+    fn preview_path(&self, id: &str) -> PathBuf {
+        self.root.join("previews").join(format!("{id}.json"))
+    }
+    fn receipt_path(&self, id: &str) -> PathBuf {
+        self.root.join("receipts").join(format!("{id}.json"))
+    }
+    fn transaction_path(&self, id: &str) -> PathBuf {
+        self.root.join("transactions").join(format!("{id}.json"))
+    }
+    fn preview_files(&self) -> Result<Vec<PathBuf>, ContractFailure> {
+        record_files(&self.root.join("previews"), "preview")
+    }
+    fn receipt_files(&self) -> Result<Vec<PathBuf>, ContractFailure> {
+        record_files(&self.root.join("receipts"), "receipt")
+    }
+    fn transaction_files(&self) -> Result<Vec<PathBuf>, ContractFailure> {
+        record_files(&self.root.join("transactions"), "transaction")
+    }
+}
+
+pub(crate) fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc().format(&Rfc3339).unwrap()
+}
+
+pub(crate) fn manifest_digest(manifest: &[ManifestEntry]) -> String {
+    digest_canonical_value(
+        "lspc-mutation-manifest-v1",
+        &serde_json::to_value(manifest).unwrap(),
+    )
+}
+
+fn random_identifier(prefix: &str) -> Result<String, ContractFailure> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        state_failure(
+            "mutation",
+            Path::new(""),
+            &format!("A random state identifier cannot be generated: {error}"),
+            None,
+        )
+    })?;
+    Ok(format!("{prefix}{}", hex::encode(bytes)))
+}
+
+fn record_files(directory: &Path, record_type: &str) -> Result<Vec<PathBuf>, ContractFailure> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        state_failure(
+            record_type,
+            directory,
+            "A state directory cannot be read.",
+            error.raw_os_error(),
+        )
+    })?;
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn serialize_record<T: Serialize>(
+    record: &T,
+    record_type: &str,
+    path: &Path,
+) -> Result<Vec<u8>, ContractFailure> {
+    serde_json::to_vec(record).map_err(|_| {
+        state_failure(
+            record_type,
+            path,
+            "A state record cannot be serialized.",
+            None,
+        )
+    })
+}
+
+fn read_record<T: DeserializeOwned>(
+    path: &Path,
+    record_type: &str,
+    id: &str,
+) -> Result<T, ContractFailure> {
+    let mut bytes = Vec::new();
+    match fs::File::open(path) {
+        Ok(mut file) => file.read_to_end(&mut bytes).map_err(|error| {
+            state_failure(
+                record_type,
+                path,
+                "A state record cannot be read.",
+                error.raw_os_error(),
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(preview_unknown(id, "inspect"));
+        }
+        Err(error) => {
+            return Err(state_failure(
+                record_type,
+                path,
+                "A state record cannot be opened.",
+                error.raw_os_error(),
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|_| stored_version_failure(record_type, path, 0))
+}
+
+fn write_record(path: &Path, bytes: &[u8], record_type: &str) -> Result<(), ContractFailure> {
+    let mut file = AtomicWriteFile::open(path).map_err(|error| {
+        state_failure(
+            record_type,
+            path,
+            "A state record cannot be staged.",
+            error.raw_os_error(),
+        )
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.commit())
+        .map_err(|error| {
+            state_failure(
+                record_type,
+                path,
+                "A state record cannot be committed.",
+                error.raw_os_error(),
+            )
+        })?;
+    restrict_file(path)
+}
+
+fn validate_record_version(
+    version: u32,
+    record_type: &str,
+    path: &Path,
+) -> Result<(), ContractFailure> {
+    if version == MUTATION_STATE_VERSION {
+        Ok(())
+    } else {
+        Err(stored_version_failure(record_type, path, version))
+    }
+}
+
+fn preview_unknown(id: &str, stage: &'static str) -> ContractFailure {
+    ContractFailure {
+        exit_code: 6,
+        category: "mutation",
+        code: "preview_unknown",
+        message: "The Preview is unknown or expired.".to_owned(),
+        stage,
+        delivery: "not_applicable",
+        retry: "never",
+        data: json!({"previewId": id}),
+    }
+}
+
+fn recovery_not_found(id: &str) -> ContractFailure {
+    ContractFailure {
+        exit_code: 7,
+        category: "recovery",
+        code: "recovery_not_found",
+        message: "The Recovery transaction is unknown.".to_owned(),
+        stage: "recover",
+        delivery: "not_applicable",
+        retry: "never",
+        data: json!({"transactionId": id}),
+    }
+}
+
+fn stored_version_failure(record_type: &str, path: &Path, version: u32) -> ContractFailure {
+    ContractFailure {
+        exit_code: 3,
+        category: "blocked",
+        code: "stored_state_version_unsupported",
+        message: "Stored Mutation state is invalid or uses unsupported semantics.".to_owned(),
+        stage: "inspect",
+        delivery: "not_applicable",
+        retry: "never",
+        data: json!({"recordType": record_type, "path": path, "foundVersion": version, "supportedVersions": [MUTATION_STATE_VERSION]}),
+    }
+}
+
+fn state_failure(
+    record_type: &str,
+    path: &Path,
+    message: &str,
+    os_code: Option<i32>,
+) -> ContractFailure {
+    let mut data = json!({"recordType": record_type, "path": path});
+    if let Some(code) = os_code {
+        data["osCode"] = json!(code);
+    }
+    ContractFailure {
+        exit_code: 4,
+        category: "unavailable",
+        code: "state_unavailable",
+        message: message.to_owned(),
+        stage: "persist",
+        delivery: "not_applicable",
+        retry: "after_change",
+        data,
+    }
+}
+
+fn capacity_failure(
+    record_type: &str,
+    limit: u64,
+    current: u64,
+    required: u64,
+    prunable_ids: Vec<String>,
+) -> ContractFailure {
+    ContractFailure {
+        exit_code: 4,
+        category: "unavailable",
+        code: "state_capacity_exceeded",
+        message: "Mutation state capacity is exhausted.".to_owned(),
+        stage: "reserve",
+        delivery: "not_applicable",
+        retry: "after_change",
+        data: json!({"recordType": record_type, "limit": limit, "current": current, "required": required, "prunableIds": prunable_ids}),
+    }
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> Result<(), ContractFailure> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        state_failure(
+            "mutation",
+            path,
+            "Mutation state directory permissions cannot be restricted.",
+            error.raw_os_error(),
+        )
+    })
+}
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) -> Result<(), ContractFailure> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> Result<(), ContractFailure> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        state_failure(
+            "mutation",
+            path,
+            "Mutation state file permissions cannot be restricted.",
+            error.raw_os_error(),
+        )
+    })
+}
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> Result<(), ContractFailure> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn preview_store_reserves_and_discards_exact_records() {
+        let directory = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+        let id = store.new_preview_id().unwrap();
+        let preview = PreviewRecord {
+            preview_id: id.clone(),
+            workspace_uri: "file:///workspace/".to_owned(),
+            server: None,
+            session_identity: format!("sid_{}", "0".repeat(64)),
+            position_encoding: "utf-8".to_owned(),
+            expires_at: String::new(),
+            source: json!({}),
+            summary: PreviewSummary::default(),
+            edit: json!({}),
+            command: None,
+            annotations: json!({}),
+            plan: CanonicalPlan {
+                operations: vec![],
+                before_manifest: vec![],
+                intended_manifest: vec![],
+            },
+            preconditions: vec![],
+            conflicts: vec![],
+            stale_reasons: vec![],
+            diff: None,
+            reserved: false,
+        };
+        let limits = PreviewSettings {
+            max_count: 2,
+            max_total_bytes: 100_000,
+            max_document_text_bytes: 100,
+            max_text_bytes: 100,
+        };
+        store
+            .create_preview(
+                preview,
+                directory.path().to_path_buf(),
+                "sha256:test".to_owned(),
+                None,
+                &limits,
+            )
+            .unwrap();
+        let mut reserved = store.reserve_preview(&id).unwrap();
+        assert!(store.discard_preview(&id).is_err());
+        store.release_preview(&mut reserved).unwrap();
+        store.discard_preview(&id).unwrap();
+        assert!(store.read_preview(&id).is_err());
+    }
+}
