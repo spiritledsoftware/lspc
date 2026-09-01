@@ -54,6 +54,14 @@ impl ParsedInvocation {
             .map(std::path::PathBuf::from)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn option_paths(&self, name: &str) -> Vec<std::path::PathBuf> {
+        self.options
+            .get(name)
+            .map(|values| values.iter().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn has_option(&self, name: &str) -> bool {
         self.options.contains_key(name)
     }

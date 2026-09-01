@@ -20,12 +20,24 @@ pub(crate) struct DiagnosticResult {
     pub(crate) uri: String,
     pub(crate) diagnostics: Value,
     pub(crate) raw_report: Value,
+    /// The effective full report. For an `unchanged` response this is reconstructed
+    /// from the cached full report while `raw_report` preserves the wire payload.
+    pub(crate) effective_report: Value,
     pub(crate) result_id: Option<String>,
     pub(crate) version: Option<i64>,
     pub(crate) fresh: bool,
     pub(crate) complete: bool,
     pub(crate) closed: bool,
     pub(crate) cached: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceDiagnosticResult {
+    pub(crate) effective_report: Value,
+    pub(crate) raw_report: Value,
+    pub(crate) fresh: bool,
+    pub(crate) complete: bool,
+    pub(crate) workspace_complete: bool,
 }
 
 /// Bounded LRU cache for published and pull-diagnostic effective snapshots.
@@ -86,6 +98,7 @@ impl DiagnosticCache {
             DiagnosticResult {
                 uri: uri.to_owned(),
                 diagnostics,
+                effective_report: raw_report.clone(),
                 raw_report,
                 result_id: None,
                 version,
@@ -111,13 +124,14 @@ impl DiagnosticCache {
                 && snapshot.received_for_version.is_some()
                 && snapshot.received_for_version == current_version;
             if exact_version || usable_versionless {
-                return render(snapshot, exact_version, true, true);
+                return render(snapshot, true, true, true);
             }
         }
         DiagnosticResult {
             uri: uri.to_owned(),
             diagnostics: Value::Array(Vec::new()),
             raw_report: Value::Null,
+            effective_report: Value::Null,
             result_id: None,
             version: current_version,
             fresh: false,
@@ -140,14 +154,22 @@ impl DiagnosticCache {
                     .or_else(|| snapshot.result_id.clone());
                 snapshot.result_id.clone_from(&result_id);
                 let mut result = render(snapshot, true, true, true);
-                result.raw_report = report;
+                result.raw_report = report.clone();
                 result.result_id = result_id;
+                if let Some(result_id) = &result.result_id {
+                    result.effective_report["resultId"] = Value::String(result_id.clone());
+                }
+                result.effective_report["uri"] = Value::String(uri.to_owned());
+                if let Some(version) = report.get("version") {
+                    result.effective_report["version"] = version.clone();
+                }
                 return result;
             }
             return DiagnosticResult {
                 uri: uri.to_owned(),
                 diagnostics: Value::Array(Vec::new()),
                 raw_report: report,
+                effective_report: Value::Null,
                 result_id: None,
                 version: None,
                 fresh: false,
@@ -181,13 +203,61 @@ impl DiagnosticCache {
         DiagnosticResult {
             uri: uri.to_owned(),
             diagnostics,
+            effective_report: report.clone(),
             raw_report: report,
             result_id,
             version: None,
             fresh: true,
-            complete: cached,
+            complete: true,
             closed: false,
             cached,
+        }
+    }
+
+    /// Reconstructs effective full items in a Workspace diagnostic report while
+    /// retaining an exact report containing `unchanged` items as metadata.
+    pub(crate) fn apply_workspace_pull_report(
+        &mut self,
+        report: Value,
+    ) -> WorkspaceDiagnosticResult {
+        let Some(items) = report.get("items").and_then(Value::as_array) else {
+            return WorkspaceDiagnosticResult {
+                effective_report: report.clone(),
+                raw_report: Value::Null,
+                fresh: false,
+                complete: false,
+                workspace_complete: false,
+            };
+        };
+        let mut effective_items = Vec::with_capacity(items.len());
+        let mut fresh = true;
+        let mut complete = true;
+        let mut had_unchanged = false;
+        for item in items {
+            let Some(uri) = item.get("uri").and_then(Value::as_str) else {
+                effective_items.push(item.clone());
+                fresh = false;
+                complete = false;
+                continue;
+            };
+            had_unchanged |= item.get("kind").and_then(Value::as_str) == Some("unchanged");
+            let current = self.apply_pull_report(uri, item.clone());
+            fresh &= current.fresh;
+            complete &= current.complete;
+            if current.effective_report.is_null() {
+                effective_items.push(item.clone());
+            } else {
+                effective_items.push(current.effective_report);
+            }
+        }
+        let mut effective_report = report.clone();
+        effective_report["items"] = Value::Array(effective_items);
+        WorkspaceDiagnosticResult {
+            effective_report,
+            raw_report: if had_unchanged { report } else { Value::Null },
+            fresh,
+            complete,
+            workspace_complete: complete,
         }
     }
 
@@ -294,6 +364,7 @@ fn render(
         uri: snapshot.uri.clone(),
         diagnostics: snapshot.diagnostics.clone(),
         raw_report: snapshot.raw_report.clone(),
+        effective_report: snapshot.raw_report.clone(),
         result_id: snapshot.result_id.clone(),
         version: snapshot.version,
         fresh,
@@ -321,7 +392,7 @@ mod tests {
         assert!(versioned.complete);
 
         let versionless = cache.publish("file:///a", None, json!([]), Some(2), true);
-        assert!(!versionless.fresh);
+        assert!(versionless.fresh);
         assert!(versionless.complete);
         let later_revision = cache.published("file:///a", Some(3), true);
         assert!(!later_revision.complete);
