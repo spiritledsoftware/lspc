@@ -13,7 +13,7 @@ use atomic_write_file::AtomicWriteFile;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -462,12 +462,12 @@ impl LspRuntime {
         } else {
             response.get("result").cloned().unwrap_or(Value::Null)
         };
-        if !partial_items.is_empty() {
-            if let Some(items) = result.as_array_mut() {
-                let mut combined = std::mem::take(&mut partial_items);
-                combined.append(items);
-                result = Value::Array(combined);
-            }
+        if !partial_items.is_empty()
+            && let Some(items) = result.as_array_mut()
+        {
+            let mut combined = std::mem::take(&mut partial_items);
+            combined.append(items);
+            result = Value::Array(combined);
         }
         let mut output = json!({
             "result": result,
@@ -1001,6 +1001,7 @@ pub(crate) fn read_launch_settings(path: &Path) -> io::Result<OwnerLaunchSetting
 fn acquire_owner_lock(path: &Path) -> io::Result<std::fs::File> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
@@ -1015,15 +1016,8 @@ fn write_endpoint(path: &Path, endpoint: &OwnerEndpoint) -> io::Result<()> {
     restrict_private_file(path)
 }
 
-#[cfg(unix)]
 fn restrict_private_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_private_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+    crate::state_permissions::restrict_file(path)
 }
 
 fn is_response_for(message: &Value, id: &Value) -> bool {

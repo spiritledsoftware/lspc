@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 pub(crate) mod json_rpc_transport;
 
 mod capabilities;
@@ -676,6 +678,7 @@ impl OwnerStatePaths {
 fn acquire_startup_lock(path: &Path, timeout: Duration) -> Result<std::fs::File, ContractFailure> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -707,6 +710,7 @@ fn acquire_startup_lock(path: &Path, timeout: Duration) -> Result<std::fs::File,
 fn owner_lock_is_free(path: &Path) -> bool {
     let Ok(file) = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -906,24 +910,10 @@ fn run_async<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-#[cfg(unix)]
 fn restrict_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    crate::state_permissions::restrict_directory(path)
 }
 
-#[cfg(unix)]
 fn restrict_private_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_private_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+    crate::state_permissions::restrict_file(path)
 }

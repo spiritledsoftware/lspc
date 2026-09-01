@@ -1,4 +1,4 @@
-use std::{ffi::OsString, io, path::Path, process::Stdio, time::Duration};
+use std::{io, path::Path, process::Stdio, time::Duration};
 
 use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
@@ -66,21 +66,33 @@ impl SupervisedServerProcess {
         if self.child.try_wait().ok().flatten().is_some() {
             return;
         }
-        terminate_tree_soft(self.pid, self.platform_job());
+        self.terminate_tree_soft();
         if time::timeout(grace, self.child.wait()).await.is_ok() {
             return;
         }
-        terminate_tree_force(self.pid, self.platform_job());
+        self.terminate_tree_force();
         let _ = self.child.wait().await;
     }
 
     #[cfg(windows)]
-    fn platform_job(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.job
+    fn terminate_tree_soft(&self) {
+        terminate_tree_soft(self.pid, self.job);
     }
 
     #[cfg(not(windows))]
-    fn platform_job(&self) {}
+    fn terminate_tree_soft(&self) {
+        terminate_tree_soft(self.pid, ());
+    }
+
+    #[cfg(windows)]
+    fn terminate_tree_force(&self) {
+        terminate_tree_force(self.pid, self.job);
+    }
+
+    #[cfg(not(windows))]
+    fn terminate_tree_force(&self) {
+        terminate_tree_force(self.pid, ());
+    }
 }
 
 #[cfg(windows)]
@@ -171,8 +183,4 @@ fn create_kill_on_close_job(pid: u32) -> io::Result<windows_sys::Win32::Foundati
         }
         Ok(job)
     }
-}
-
-pub(crate) fn current_environment() -> Vec<(OsString, OsString)> {
-    std::env::vars_os().collect()
 }

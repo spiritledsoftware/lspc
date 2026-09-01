@@ -1,13 +1,16 @@
 use std::{io, num::NonZeroUsize, str};
 
-use serde_json::{Map, Number, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::{Map, Number};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Maximum inbound LSP header size, including the final blank line.
 pub(crate) const JSON_RPC_HEADER_LIMIT_BYTES: usize = 8 * 1024;
 /// Default maximum JSON-RPC body size in bytes.
-pub(crate) const DEFAULT_JSON_RPC_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const DEFAULT_JSON_RPC_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Reads bounded Language Server Protocol JSON-RPC frames from one byte stream.
 pub(crate) struct JsonRpcFrameReader<R> {
@@ -24,6 +27,7 @@ pub(crate) struct JsonRpcFrame {
 
 impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
     /// Creates a frame reader with the default 64 MiB body limit.
+    #[cfg(test)]
     pub(crate) fn new(input: R) -> Self {
         Self::with_body_limit(
             input,
@@ -40,6 +44,7 @@ impl<R: AsyncRead + Unpin> JsonRpcFrameReader<R> {
     }
 
     /// Returns `None` only when the stream ends between complete frames.
+    #[cfg(test)]
     pub(crate) async fn read_json_rpc_frame(
         &mut self,
     ) -> Result<Option<Value>, JsonRpcTransportError> {
@@ -136,6 +141,7 @@ pub(crate) struct JsonRpcFrameWriter<W> {
 
 impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
     /// Creates a frame writer with the default 64 MiB body limit.
+    #[cfg(test)]
     pub(crate) fn new(output: W) -> Self {
         Self::with_body_limit(
             output,
@@ -152,6 +158,7 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
     }
 
     /// Serializes, bounds, writes, and flushes one JSON-RPC object.
+    #[cfg(test)]
     pub(crate) async fn write_json_rpc_frame(
         &mut self,
         message: &Value,
@@ -196,12 +203,14 @@ impl<W: AsyncWrite + Unpin> JsonRpcFrameWriter<W> {
 }
 
 /// Distinguishes an omitted request parameter member from any supplied JSON value.
+#[cfg(test)]
 pub(crate) enum RawRequestParameters {
     Omitted,
     Present(Value),
 }
 
 /// Builds one raw JSON-RPC request without collapsing explicit `params: null`.
+#[cfg(test)]
 pub(crate) fn build_json_rpc_request(
     id: JsonRpcRequestId,
     method: String,
@@ -218,11 +227,13 @@ pub(crate) fn build_json_rpc_request(
 }
 
 /// A JSON-RPC request identifier supported by the LSP transport.
+#[cfg(test)]
 pub(crate) enum JsonRpcRequestId {
     Integer(i64),
     String(String),
 }
 
+#[cfg(test)]
 impl JsonRpcRequestId {
     fn into_value(self) -> Value {
         match self {
