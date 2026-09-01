@@ -253,6 +253,84 @@ fn queued_operation_deadline_removes_work_before_dispatch() {
 }
 
 #[test]
+fn owner_accepts_status_and_queues_work_during_initialization() {
+    let fixture = Fixture::with_server_arguments(&["--scenario=delayed-initialization"]);
+    let workspace = fixture.workspace.to_str().unwrap();
+
+    std::thread::scope(|scope| {
+        let query = scope.spawn(|| {
+            fixture.command(&[
+                "raw",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+                "--method",
+                "fixture/queued-during-initialization",
+            ])
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let status = fixture.output(&[
+                "session",
+                "status",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+            ]);
+            if status.status.success() {
+                let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+                if status["result"]["state"] == "initializing" {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Owner never exposed its initializing state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(query.join().unwrap()["result"], json!({"fixture": true}));
+    });
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+}
+
+#[test]
+fn initialization_failure_rejects_queued_work_with_the_same_cause() {
+    let fixture = Fixture::with_server_arguments(&["--scenario=crash"]);
+    let workspace = fixture.workspace.to_str().unwrap();
+
+    let output = fixture.output(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/never-dispatched",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "initialization_failed");
+    assert_eq!(failure["error"]["delivery"], "not_sent");
+}
+
+#[test]
 fn force_stop_cancels_an_active_query_without_waiting_for_it() {
     let fixture = Fixture::new();
     let workspace = fixture.workspace.to_str().unwrap();
@@ -309,6 +387,36 @@ fn force_stop_cancels_an_active_query_without_waiting_for_it() {
         assert_eq!(failure["error"]["code"], "request_cancelled");
         assert_eq!(failure["error"]["data"]["source"], "force_stop");
     });
+}
+
+#[test]
+fn owner_reports_bounded_stderr_after_an_unexpected_server_exit() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    let output = fixture.output(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/crash",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "server_exited");
+    assert_eq!(failure["error"]["data"]["status"]["code"], 42);
+    assert!(
+        failure["error"]["data"]["stderrTail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("fixture server crashed while handling test/crash"))
+    );
 }
 
 #[test]

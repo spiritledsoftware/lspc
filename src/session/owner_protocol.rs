@@ -23,7 +23,7 @@ pub(crate) struct OwnerEndpoint {
     pub(crate) started_at: String,
     pub(crate) state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) failure: Option<String>,
+    pub(crate) failure: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

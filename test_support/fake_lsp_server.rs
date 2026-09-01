@@ -20,6 +20,7 @@ enum Scenario {
     Standard,
     Fragmented,
     Delayed,
+    DelayedInitialization,
     OutOfOrder,
     MalformedHeader,
     MalformedJson,
@@ -38,6 +39,7 @@ impl Scenario {
             "standard" => Ok(Self::Standard),
             "fragmented" => Ok(Self::Fragmented),
             "delayed" => Ok(Self::Delayed),
+            "delayed-initialization" => Ok(Self::DelayedInitialization),
             "out-of-order" => Ok(Self::OutOfOrder),
             "malformed-header" => Ok(Self::MalformedHeader),
             "malformed-json" => Ok(Self::MalformedJson),
@@ -54,7 +56,10 @@ fn main() -> ExitCode {
     let event_log =
         env::args().find_map(|argument| argument.strip_prefix("--event-log=").map(PathBuf::from));
     match Scenario::from_arguments() {
-        Ok(Scenario::Crash) => ExitCode::from(42),
+        Ok(Scenario::Crash) => {
+            eprintln!("fixture server crashed before initialization");
+            ExitCode::from(42)
+        }
         Ok(Scenario::Hang) => {
             thread::sleep(Duration::from_secs(30));
             ExitCode::SUCCESS
@@ -118,6 +123,9 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
         match message.get("method").and_then(Value::as_str) {
             Some("exit") => return ExitCode::SUCCESS,
             Some("initialize") => {
+                if scenario == Scenario::DelayedInitialization {
+                    thread::sleep(Duration::from_millis(500));
+                }
                 for response in [
                     json!({"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"fixture initialized"}}),
                     json!({"jsonrpc":"2.0","method":"$/progress","params":{"token":"fixture-progress","value":{"kind":"begin","title":"fixture"}}}),
@@ -128,7 +136,10 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 }
-                let capabilities = if scenario == Scenario::Standard {
+                let capabilities = if matches!(
+                    scenario,
+                    Scenario::Standard | Scenario::DelayedInitialization
+                ) {
                     json!({
                         "positionEncoding": "utf-16",
                         "textDocumentSync": {"openClose": true},
@@ -376,6 +387,10 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
                     return ExitCode::from(1);
                 }
+            }
+            Some("test/crash") => {
+                eprintln!("fixture server crashed while handling test/crash");
+                return ExitCode::from(42);
             }
             Some("test/slow") => delayed = Some(message),
             Some("test/fast") => {

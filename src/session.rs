@@ -551,14 +551,20 @@ pub(crate) async fn connect_or_start_owner(
     while Instant::now() < deadline {
         if let Some(endpoint) = read_endpoint(&endpoint_path) {
             if endpoint.state == "failed" {
-                let reason = endpoint
-                    .failure
-                    .as_deref()
-                    .unwrap_or("owner_initialization_failed")
-                    .to_owned();
+                let failure = endpoint.failure.unwrap_or_else(|| {
+                    json!({
+                        "category": "query",
+                        "code": "initialization_failed",
+                        "message": "The language server failed to initialize.",
+                        "stage": "initialize",
+                        "delivery": "not_sent",
+                        "retry": "after_change",
+                        "data": {"server": authorized.server.name, "reason": "owner_initialization_failed"}
+                    })
+                });
                 let _ = fs::remove_file(&endpoint_path);
                 drop(startup_lock);
-                return Err(owner_unavailable(&authorized.session_identity, &reason));
+                return Err(contract_failure_from_owner(failure));
             }
             if endpoint.session_identity == authorized.session_identity
                 && probe_endpoint(&endpoint).await.is_ok()
@@ -684,6 +690,11 @@ async fn restart_session(invocation: &ParsedInvocation) -> Result<Value, Contrac
     let configuration = load_configuration(&workspace_path, false)?;
     let server = select_named_server(&configuration, &endpoint.server, invocation)?;
     let authorized = authorize_server(&configuration, server)?;
+    wait_for_owner_exit(
+        &endpoint,
+        parse_duration(&configuration.session.owner_startup_timeout),
+    )
+    .await?;
     let replacement = connect_or_start_owner(&configuration, &authorized, false).await?;
     Ok(success_envelope(
         invocation.command_path(),
@@ -692,6 +703,34 @@ async fn restart_session(invocation: &ParsedInvocation) -> Result<Value, Contrac
             "ownerGeneration": replacement.owner_generation
         }),
     ))
+}
+
+async fn wait_for_owner_exit(
+    endpoint: &OwnerEndpoint,
+    timeout: Duration,
+) -> Result<(), ContractFailure> {
+    let paths = OwnerStatePaths::new()?;
+    let endpoint_path = paths.endpoint_path(&endpoint.session_identity);
+    let owner_lock_path = paths.owner_lock_path(&endpoint.session_identity);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match read_endpoint(&endpoint_path) {
+            Some(current) if current.owner_generation != endpoint.owner_generation => {
+                if probe_endpoint(&current).await.is_ok() {
+                    return Ok(());
+                }
+            }
+            None if owner_lock_is_free(&owner_lock_path) => return Ok(()),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(owner_unavailable(
+                &endpoint.session_identity,
+                "restart_shutdown_deadline_exceeded",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn select_live_endpoint(
@@ -749,6 +788,11 @@ async fn live_endpoints() -> Result<Vec<OwnerEndpoint>, ContractFailure> {
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(endpoint) = read_endpoint(&path) else {
+            if let Some(identity) = endpoint_identity_from_path(&path)
+                && owner_lock_is_free(&paths.owner_lock_path(identity))
+            {
+                let _ = fs::remove_file(path);
+            }
             continue;
         };
         if probe_endpoint(&endpoint).await.is_ok() {
@@ -1051,6 +1095,12 @@ fn acquire_startup_lock(path: &Path, timeout: Duration) -> Result<std::fs::File,
                 &error.to_string(),
             )
         })?;
+    restrict_private_file(path).map_err(|error| {
+        owner_unavailable(
+            "sid_0000000000000000000000000000000000000000000000000000000000000000",
+            &format!("startup_lock_permissions_failed: {error}"),
+        )
+    })?;
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
@@ -1080,6 +1130,9 @@ fn owner_lock_is_free(path: &Path) -> bool {
     else {
         return false;
     };
+    if restrict_private_file(path).is_err() {
+        return false;
+    }
     file.try_lock_exclusive().is_ok()
 }
 
@@ -1095,6 +1148,14 @@ fn read_endpoint(path: &Path) -> Option<OwnerEndpoint> {
     let bytes = fs::read(path).ok()?;
     let endpoint: OwnerEndpoint = serde_json::from_slice(&bytes).ok()?;
     (endpoint.format_version == 1).then_some(endpoint)
+}
+
+fn endpoint_identity_from_path(path: &Path) -> Option<&str> {
+    let identity = path.file_stem()?.to_str()?;
+    (identity.len() == 68
+        && identity.starts_with("sid_")
+        && identity[4..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(identity)
 }
 
 fn random_hex(bytes: usize) -> Result<String, ContractFailure> {

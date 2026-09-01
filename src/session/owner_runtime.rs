@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -46,6 +46,8 @@ use crate::{
 };
 
 const TRACE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
+const SERVER_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const OWNER_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct OwnerBootstrap {
     pub(crate) session_identity: String,
@@ -78,6 +80,7 @@ struct ActiveQuery {
     params: Option<Value>,
     started_at: String,
     response: Option<oneshot::Sender<OwnerResponse>>,
+    delivered: Option<oneshot::Receiver<()>>,
     cancelled: watch::Receiver<bool>,
     deadline: TokioInstant,
     timeout: Duration,
@@ -99,11 +102,17 @@ struct QueryCancellation {
     failure: Value,
 }
 
+struct OwnerStartupFailure {
+    source: io::Error,
+    contract: Value,
+}
+
 struct LspRuntime {
     process: SupervisedServerProcess,
     reader: JsonRpcFrameReader<tokio::process::ChildStdout>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
     stderr: mpsc::Receiver<String>,
+    stderr_tail: Arc<Mutex<String>>,
     next_request_id: i64,
     negotiated: NegotiatedCapabilities,
     diagnostics: DiagnosticCache,
@@ -150,21 +159,15 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
 
     endpoint.state = "initializing".to_owned();
     write_endpoint(&bootstrap.endpoint_path, &endpoint)?;
-    let mut lsp = match LspRuntime::start(&bootstrap, &settings).await {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            endpoint.state = "failed".to_owned();
-            endpoint.failure = Some(error.to_string());
-            let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
-            drop(owner_lock);
-            return Err(error);
-        }
-    };
-    endpoint.state = "ready".to_owned();
-    write_endpoint(&bootstrap.endpoint_path, &endpoint)?;
 
+    let started = Instant::now();
+    let mut last_connection_closed = Instant::now();
+    let mut idle_deadline =
+        last_connection_closed + Duration::from_millis(settings.idle_timeout_ms);
     let (requests_tx, mut requests_rx) = mpsc::channel(OWNER_QUEUE_LIMIT);
     let (controls_tx, mut controls_rx) = mpsc::channel(OWNER_QUEUE_LIMIT);
+    let (status_tx, status_rx) = watch::channel(initializing_status(&bootstrap));
+    let (connection_closed_tx, mut connection_closed_rx) = watch::channel(Instant::now());
     let draining = Arc::new(AtomicBool::new(false));
     let listener_task = spawn_owner_listener(
         listener,
@@ -172,16 +175,58 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         requests_tx,
         controls_tx,
         Arc::clone(&draining),
+        status_rx,
+        connection_closed_tx,
     );
-    let started = Instant::now();
-    let mut last_connection_closed = Instant::now();
-    let mut idle_deadline =
-        last_connection_closed + Duration::from_millis(settings.idle_timeout_ms);
+    let mut lsp = match LspRuntime::start(&bootstrap, &settings).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            endpoint.state = "failed".to_owned();
+            endpoint.failure = Some(error.contract.clone());
+            let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
+            status_tx.send_modify(|status| status["state"] = json!("failed"));
+            fail_queued_requests(
+                &bootstrap.owner_generation,
+                &mut requests_rx,
+                error.contract.clone(),
+            )
+            .await;
+            fail_queued_requests(
+                &bootstrap.owner_generation,
+                &mut controls_rx,
+                error.contract,
+            )
+            .await;
+            listener_task.abort();
+            drop(owner_lock);
+            return Err(error.source);
+        }
+    };
+    endpoint.state = "ready".to_owned();
+    write_endpoint(&bootstrap.endpoint_path, &endpoint)?;
     let mut should_stop = false;
     let mut active_queries = BTreeMap::new();
     let mut pending_stop: Option<PendingOwnerStop> = None;
+    status_tx.send_replace(status_result(
+        &bootstrap,
+        &lsp,
+        &endpoint.state,
+        started,
+        requests_rx.len(),
+        &active_queries,
+        idle_deadline,
+    ));
 
     while !should_stop {
+        status_tx.send_replace(status_result(
+            &bootstrap,
+            &lsp,
+            &endpoint.state,
+            started,
+            requests_rx.len(),
+            &active_queries,
+            idle_deadline,
+        ));
         if active_queries.is_empty()
             && let Some(pending) = pending_stop.take()
         {
@@ -203,28 +248,30 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
                 let _ = pending.dispatched.send(());
                 match pending.request {
-                    OwnerRequest::Status => {
-                        let response = OwnerResponse::success(
-                            &bootstrap.owner_generation,
-                            status_result(&bootstrap, &lsp, &endpoint.state, started, requests_rx.len(), &active_queries, idle_deadline),
-                        );
-                        let _ = pending.response.send(response);
-                    }
                     OwnerRequest::Stop { force } => {
                         draining.store(true, Ordering::Release);
                         endpoint.state = "draining".to_owned();
                         let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
+                        status_tx.send_replace(status_result(
+                            &bootstrap,
+                            &lsp,
+                            &endpoint.state,
+                            started,
+                            requests_rx.len(),
+                            &active_queries,
+                            idle_deadline,
+                        ));
                         fail_queued_requests(
                             &bootstrap.owner_generation,
                             &mut requests_rx,
                             owner_draining_failure(&bootstrap.session_identity),
-                        );
+                        ).await;
                         if force {
                             fail_active_queries(
                                 &bootstrap.owner_generation,
                                 &mut active_queries,
                                 request_cancelled("force_stop"),
-                            );
+                            ).await;
                             lsp.process.terminate_process_tree(Duration::ZERO).await;
                             let result = stop_result(&bootstrap.owner_generation, true);
                             if let Some(graceful) = pending_stop.take() {
@@ -248,7 +295,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             ));
                         }
                     }
-                    _ => unreachable!("only status and stop use the Owner control queue"),
+                    _ => unreachable!("only stop uses the Owner control queue"),
                 }
             }
             pending = requests_rx.recv(), if active_queries.is_empty() => {
@@ -258,13 +305,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
                 let _ = pending.dispatched.send(());
                 match pending.request {
-                    OwnerRequest::Status => {
-                        let response = OwnerResponse::success(
-                            &bootstrap.owner_generation,
-                            status_result(&bootstrap, &lsp, &endpoint.state, started, requests_rx.len(), &active_queries, idle_deadline),
-                        );
-                        let _ = pending.response.send(response);
-                    }
+                    OwnerRequest::Status => unreachable!("status is served by the Owner listener"),
                     OwnerRequest::Capabilities => {
                         let result = json!({
                             "protocolBaseline": "3.17",
@@ -351,13 +392,12 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             trace_protocol,
                             apply_edits,
                             pending.response,
+                            pending.delivered,
                             pending.cancelled,
                             &mut active_queries,
                         ).await;
                     }
                 }
-                last_connection_closed = Instant::now();
-                idle_deadline = last_connection_closed + Duration::from_millis(settings.idle_timeout_ms);
             }
             stderr = lsp.stderr.recv() => {
                 if let Some(stderr) = stderr {
@@ -377,7 +417,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                                 &bootstrap.owner_generation,
                                 &mut active_queries,
                                 protocol_failure(error),
-                            );
+                            ).await;
                             lsp.process.terminate_process_tree(Duration::ZERO).await;
                             should_stop = true;
                         }
@@ -385,10 +425,10 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     Ok(None) => {
                         let failure = server_exited_failure(
                             lsp.process.try_wait().ok().flatten(),
-                            &lsp.log.stderr_tail(),
+                            &lsp.server_stderr_tail(),
                         );
-                        fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure.clone());
-                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
+                        fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure.clone()).await;
+                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
                         should_stop = true;
                     }
                     Err(error) => {
@@ -397,8 +437,8 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             &bootstrap.owner_generation,
                             &mut active_queries,
                             failure.clone(),
-                        );
-                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
+                        ).await;
+                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
                         lsp.process.terminate_process_tree(Duration::ZERO).await;
                         should_stop = true;
                     }
@@ -418,14 +458,21 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
                 if let Some(status) = lsp.process.try_wait()? {
                     lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
-                    let failure = server_exited_failure(Some(status), &lsp.log.stderr_tail());
+                    let failure = server_exited_failure(Some(status), &lsp.server_stderr_tail());
                     fail_active_queries(
                         &bootstrap.owner_generation,
                         &mut active_queries,
                         failure.clone(),
-                    );
-                    fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
+                    ).await;
+                    fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure).await;
                     should_stop = true;
+                }
+            }
+            changed = connection_closed_rx.changed() => {
+                if changed.is_ok() {
+                    last_connection_closed = *connection_closed_rx.borrow_and_update();
+                    idle_deadline = last_connection_closed
+                        + Duration::from_millis(settings.idle_timeout_ms);
                 }
             }
         }
@@ -436,22 +483,34 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         &bootstrap.owner_generation,
         &mut active_queries,
         request_cancelled("owner_stopped"),
-    );
+    )
+    .await;
     fail_queued_requests(
         &bootstrap.owner_generation,
         &mut requests_rx,
         request_cancelled("owner_stopped"),
-    );
+    )
+    .await;
     let _ = fs::remove_file(&bootstrap.endpoint_path);
     drop(owner_lock);
     Ok(())
 }
 
 impl LspRuntime {
-    async fn start(bootstrap: &OwnerBootstrap, settings: &OwnerLaunchSettings) -> io::Result<Self> {
+    async fn start(
+        bootstrap: &OwnerBootstrap,
+        settings: &OwnerLaunchSettings,
+    ) -> Result<Self, OwnerStartupFailure> {
         let (process, stdin, stdout, mut stderr) =
-            SupervisedServerProcess::spawn(&bootstrap.executable, &settings.server_args)?;
+            SupervisedServerProcess::spawn(&bootstrap.executable, &settings.server_args).map_err(
+                |source| OwnerStartupFailure {
+                    contract: server_start_failure(bootstrap, &source),
+                    source,
+                },
+            )?;
         let (stderr_tx, stderr_rx) = mpsc::channel(64);
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
             let mut bytes = vec![0; 8192];
             loop {
@@ -459,15 +518,20 @@ impl LspRuntime {
                     Ok(0) | Err(_) => break,
                     Ok(length) => {
                         let message = String::from_utf8_lossy(&bytes[..length]).into_owned();
-                        if stderr_tx.send(message).await.is_err() {
-                            break;
+                        if let Ok(mut tail) = stderr_tail_writer.lock() {
+                            append_bounded_stderr_tail(&mut tail, &message);
                         }
+                        let _ = stderr_tx.try_send(message);
                     }
                 }
             }
         });
         let body_limit = NonZeroUsize::new(settings.max_message_bytes)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "message limit is zero"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "message limit is zero"))
+            .map_err(|source| OwnerStartupFailure {
+                contract: initialization_failure(bootstrap, &source, ""),
+                source,
+            })?;
         let root_name = bootstrap
             .workspace_path
             .file_name()
@@ -485,6 +549,7 @@ impl LspRuntime {
             reader: JsonRpcFrameReader::with_body_limit(stdout, body_limit),
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
             stderr: stderr_rx,
+            stderr_tail,
             next_request_id: 1,
             negotiated: placeholder,
             diagnostics: DiagnosticCache::new(
@@ -516,16 +581,30 @@ impl LspRuntime {
         runtime
             .log
             .push("lifecycle", "info", "Language server process started");
-        runtime
+        if let Err(source) = runtime
             .initialize(
                 settings.initialization_options.clone(),
                 Duration::from_millis(settings.initialization_timeout_ms),
             )
-            .await?;
+            .await
+        {
+            runtime.process.terminate_process_tree(Duration::ZERO).await;
+            return Err(OwnerStartupFailure {
+                contract: initialization_failure(bootstrap, &source, &runtime.server_stderr_tail()),
+                source,
+            });
+        }
         runtime
             .log
             .push("lifecycle", "info", "Language server initialized");
         Ok(runtime)
+    }
+
+    fn server_stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.clone())
+            .unwrap_or_default()
     }
 
     async fn initialize(
@@ -621,6 +700,7 @@ impl LspRuntime {
         trace_protocol: bool,
         apply_edits: bool,
         response: oneshot::Sender<OwnerResponse>,
+        delivered: oneshot::Receiver<()>,
         cancelled: watch::Receiver<bool>,
         active: &mut BTreeMap<i64, ActiveQuery>,
     ) {
@@ -687,6 +767,7 @@ impl LspRuntime {
                 params: request_params,
                 started_at: now_rfc3339(),
                 response: Some(response),
+                delivered: Some(delivered),
                 cancelled,
                 deadline: TokioInstant::now() + timeout,
                 timeout,
@@ -777,6 +858,9 @@ impl LspRuntime {
             };
             if let Some(sender) = query.response.take() {
                 let _ = sender.send(response);
+            }
+            if let Some(delivered) = query.delivered.take() {
+                wait_for_owner_response_flush(delivered).await;
             }
             return Ok(());
         }
@@ -1171,7 +1255,7 @@ impl LspRuntime {
                     "The server did not settle every cancelled request within the cancellation grace period"
                         .to_owned(),
                 ),
-            );
+            ).await;
         }
         cancellation_grace_expired
     }
@@ -1872,6 +1956,8 @@ fn spawn_owner_listener(
     requests: mpsc::Sender<PendingOwnerRequest>,
     controls: mpsc::Sender<PendingOwnerRequest>,
     draining: Arc<AtomicBool>,
+    status: watch::Receiver<Value>,
+    connection_closed: watch::Sender<Instant>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1882,9 +1968,13 @@ fn spawn_owner_listener(
             let requests = requests.clone();
             let controls = controls.clone();
             let draining = Arc::clone(&draining);
+            let status = status.clone();
+            let connection_closed = connection_closed.clone();
             tokio::spawn(async move {
                 let _ =
-                    handle_owner_connection(stream, endpoint, requests, controls, draining).await;
+                    handle_owner_connection(stream, endpoint, requests, controls, draining, status)
+                        .await;
+                connection_closed.send_replace(Instant::now());
             });
         }
     })
@@ -1896,6 +1986,7 @@ async fn handle_owner_connection(
     requests: mpsc::Sender<PendingOwnerRequest>,
     controls: mpsc::Sender<PendingOwnerRequest>,
     draining: Arc<AtomicBool>,
+    status: watch::Receiver<Value>,
 ) -> io::Result<()> {
     let request: AuthenticatedOwnerRequest = read_owner_message(&mut stream).await?;
     if request.owner_protocol_version != OWNER_PROTOCOL_VERSION
@@ -1918,15 +2009,17 @@ async fn handle_owner_connection(
         write_owner_message(&mut stream, &failure).await?;
         return Ok(());
     }
+    if matches!(&request.request, OwnerRequest::Status) {
+        let response = OwnerResponse::success(&endpoint.owner_generation, status.borrow().clone());
+        write_owner_message(&mut stream, &response).await?;
+        return Ok(());
+    }
     let (response_tx, response_rx) = oneshot::channel();
     let (dispatched_tx, dispatched_rx) = oneshot::channel();
     let (delivered_tx, delivered_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let queue_deadline = request.queue_deadline_ms.map(Duration::from_millis);
-    let control_request = matches!(
-        request.request,
-        OwnerRequest::Status | OwnerRequest::Stop { .. }
-    );
+    let control_request = matches!(request.request, OwnerRequest::Stop { .. });
     if draining.load(Ordering::Acquire) && !control_request {
         let failure = OwnerResponse::failure(
             &endpoint.owner_generation,
@@ -2036,6 +2129,22 @@ fn queue_deadline_failure(deadline: Duration) -> Value {
     })
 }
 
+fn initializing_status(bootstrap: &OwnerBootstrap) -> Value {
+    json!({
+        "sessionIdentity": bootstrap.session_identity,
+        "ownerGeneration": bootstrap.owner_generation,
+        "workspaceUri": bootstrap.workspace_uri,
+        "server": bootstrap.server,
+        "state": "initializing",
+        "uptimeMs": 0,
+        "idleDeadline": Value::Null,
+        "queueDepth": 0,
+        "activeQuery": Value::Null,
+        "capabilities": {},
+        "progress": []
+    })
+}
+
 fn status_result(
     bootstrap: &OwnerBootstrap,
     lsp: &LspRuntime,
@@ -2052,6 +2161,9 @@ fn status_result(
             "startedAt": query.started_at
         })
     });
+    let idle_deadline = active_query
+        .is_none()
+        .then(|| rfc3339_after(idle_deadline.saturating_duration_since(Instant::now())));
     json!({
         "sessionIdentity": bootstrap.session_identity,
         "ownerGeneration": bootstrap.owner_generation,
@@ -2060,7 +2172,7 @@ fn status_result(
         "state": state,
         "serverPid": lsp.process.pid(),
         "uptimeMs": started.elapsed().as_millis() as u64,
-        "idleDeadline": rfc3339_after(idle_deadline.saturating_duration_since(Instant::now())),
+        "idleDeadline": idle_deadline,
         "queueDepth": queue_depth.min(OWNER_QUEUE_LIMIT),
         "activeQuery": active_query,
         "capabilities": lsp.negotiated.providers_json(),
@@ -2124,6 +2236,7 @@ fn acquire_owner_lock(path: &Path) -> io::Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(path)?;
+    restrict_private_file(path)?;
     file.try_lock_exclusive()?;
     Ok(file)
 }
@@ -2230,32 +2343,53 @@ fn attach_trace(failure: &mut Value, trace: Option<ProtocolTrace>) {
     }
 }
 
-fn fail_active_queries(
+async fn fail_active_queries(
     owner_generation: &str,
     active: &mut BTreeMap<i64, ActiveQuery>,
     failure: Value,
 ) {
+    let mut deliveries = Vec::new();
     for (_, mut query) in std::mem::take(active) {
         let mut failure = failure.clone();
         attach_trace(&mut failure, query.trace.take());
         if let Some(response) = query.response.take() {
             let _ = response.send(OwnerResponse::failure(owner_generation, failure));
         }
+        if let Some(delivered) = query.delivered.take() {
+            deliveries.push(delivered);
+        }
     }
+    wait_for_owner_response_flushes(deliveries).await;
 }
 
-fn fail_queued_requests(
+async fn fail_queued_requests(
     owner_generation: &str,
     requests: &mut mpsc::Receiver<PendingOwnerRequest>,
     failure: Value,
 ) {
+    let mut deliveries = Vec::new();
     while let Ok(pending) = requests.try_recv() {
         if !*pending.cancelled.borrow() {
             let _ = pending
                 .response
                 .send(OwnerResponse::failure(owner_generation, failure.clone()));
+            deliveries.push(pending.delivered);
         }
     }
+    wait_for_owner_response_flushes(deliveries).await;
+}
+
+async fn wait_for_owner_response_flush(delivered: oneshot::Receiver<()>) {
+    let _ = tokio_time::timeout(OWNER_RESPONSE_FLUSH_TIMEOUT, delivered).await;
+}
+
+async fn wait_for_owner_response_flushes(deliveries: Vec<oneshot::Receiver<()>>) {
+    let _ = tokio_time::timeout(OWNER_RESPONSE_FLUSH_TIMEOUT, async {
+        for delivered in deliveries {
+            let _ = delivered.await;
+        }
+    })
+    .await;
 }
 
 fn stop_result(owner_generation: &str, force: bool) -> Value {
@@ -2276,6 +2410,54 @@ fn owner_draining_failure(session_identity: &str) -> Value {
         "retry": "safe",
         "data": {"sessionIdentity": session_identity, "reason": "draining"}
     })
+}
+
+fn server_start_failure(bootstrap: &OwnerBootstrap, error: &io::Error) -> Value {
+    json!({
+        "category": "query",
+        "code": "server_start_failed",
+        "message": "The language-server process could not start.",
+        "stage": "start_server",
+        "delivery": "not_sent",
+        "retry": "after_change",
+        "data": {
+            "server": bootstrap.server,
+            "executable": bootstrap.executable,
+            "osCode": error.raw_os_error()
+        }
+    })
+}
+
+fn initialization_failure(
+    bootstrap: &OwnerBootstrap,
+    error: &io::Error,
+    stderr_tail: &str,
+) -> Value {
+    let mut data = json!({"server": bootstrap.server, "reason": error.to_string()});
+    if !stderr_tail.is_empty() {
+        data["stderrTail"] = json!(stderr_tail);
+    }
+    json!({
+        "category": "query",
+        "code": "initialization_failed",
+        "message": "The language server failed to initialize.",
+        "stage": "initialize",
+        "delivery": "not_sent",
+        "retry": "after_change",
+        "data": data
+    })
+}
+
+fn append_bounded_stderr_tail(tail: &mut String, chunk: &str) {
+    tail.push_str(chunk);
+    if tail.len() <= SERVER_STDERR_TAIL_BYTES {
+        return;
+    }
+    let mut start = tail.len() - SERVER_STDERR_TAIL_BYTES;
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    tail.drain(..start);
 }
 
 fn transport_failure(error: io::Error) -> Value {
