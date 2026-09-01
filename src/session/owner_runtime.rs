@@ -4,6 +4,10 @@ use std::{
     io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -62,6 +66,11 @@ struct PendingOwnerRequest {
     dispatched: oneshot::Sender<()>,
     delivered: oneshot::Receiver<()>,
     cancelled: watch::Receiver<bool>,
+}
+
+struct PendingOwnerStop {
+    response: oneshot::Sender<OwnerResponse>,
+    delivered: oneshot::Receiver<()>,
 }
 
 struct ActiveQuery {
@@ -155,18 +164,93 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
     write_endpoint(&bootstrap.endpoint_path, &endpoint)?;
 
     let (requests_tx, mut requests_rx) = mpsc::channel(OWNER_QUEUE_LIMIT);
-    let listener_task = spawn_owner_listener(listener, endpoint.clone(), requests_tx);
+    let (controls_tx, mut controls_rx) = mpsc::channel(OWNER_QUEUE_LIMIT);
+    let draining = Arc::new(AtomicBool::new(false));
+    let listener_task = spawn_owner_listener(
+        listener,
+        endpoint.clone(),
+        requests_tx,
+        controls_tx,
+        Arc::clone(&draining),
+    );
     let started = Instant::now();
     let mut last_connection_closed = Instant::now();
     let mut idle_deadline =
         last_connection_closed + Duration::from_millis(settings.idle_timeout_ms);
     let mut should_stop = false;
     let mut active_queries = BTreeMap::new();
+    let mut pending_stop: Option<PendingOwnerStop> = None;
 
     while !should_stop {
+        if active_queries.is_empty()
+            && let Some(pending) = pending_stop.take()
+        {
+            lsp.graceful_shutdown().await;
+            let result = stop_result(&bootstrap.owner_generation, false);
+            let _ = pending
+                .response
+                .send(OwnerResponse::success(&bootstrap.owner_generation, result));
+            let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
+            break;
+        }
         let idle_sleep = tokio_time::sleep_until(TokioInstant::from_std(idle_deadline));
         tokio::pin!(idle_sleep);
         tokio::select! {
+            pending = controls_rx.recv() => {
+                let Some(pending) = pending else { break };
+                if *pending.cancelled.borrow() {
+                    continue;
+                }
+                let _ = pending.dispatched.send(());
+                match pending.request {
+                    OwnerRequest::Status => {
+                        let response = OwnerResponse::success(
+                            &bootstrap.owner_generation,
+                            status_result(&bootstrap, &lsp, &endpoint.state, started, requests_rx.len(), &active_queries, idle_deadline),
+                        );
+                        let _ = pending.response.send(response);
+                    }
+                    OwnerRequest::Stop { force } => {
+                        draining.store(true, Ordering::Release);
+                        endpoint.state = "draining".to_owned();
+                        let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
+                        fail_queued_requests(
+                            &bootstrap.owner_generation,
+                            &mut requests_rx,
+                            owner_draining_failure(&bootstrap.session_identity),
+                        );
+                        if force {
+                            fail_active_queries(
+                                &bootstrap.owner_generation,
+                                &mut active_queries,
+                                request_cancelled("force_stop"),
+                            );
+                            lsp.process.terminate_process_tree(Duration::ZERO).await;
+                            let result = stop_result(&bootstrap.owner_generation, true);
+                            if let Some(graceful) = pending_stop.take() {
+                                let _ = graceful.response.send(OwnerResponse::success(
+                                    &bootstrap.owner_generation,
+                                    result.clone(),
+                                ));
+                            }
+                            let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
+                            let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
+                            should_stop = true;
+                        } else if pending_stop.is_none() {
+                            pending_stop = Some(PendingOwnerStop {
+                                response: pending.response,
+                                delivered: pending.delivered,
+                            });
+                        } else {
+                            let _ = pending.response.send(OwnerResponse::failure(
+                                &bootstrap.owner_generation,
+                                owner_draining_failure(&bootstrap.session_identity),
+                            ));
+                        }
+                    }
+                    _ => unreachable!("only status and stop use the Owner control queue"),
+                }
+            }
             pending = requests_rx.recv(), if active_queries.is_empty() => {
                 let Some(pending) = pending else { break };
                 if *pending.cancelled.borrow() {
@@ -177,7 +261,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     OwnerRequest::Status => {
                         let response = OwnerResponse::success(
                             &bootstrap.owner_generation,
-                            status_result(&bootstrap, &lsp, started, requests_rx.len(), &active_queries, idle_deadline),
+                            status_result(&bootstrap, &lsp, &endpoint.state, started, requests_rx.len(), &active_queries, idle_deadline),
                         );
                         let _ = pending.response.send(response);
                     }
@@ -253,26 +337,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
                     }
                     OwnerRequest::Stop { force } => {
-                        endpoint.state = "draining".to_owned();
-                        let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
-                        fail_active_queries(
-                            &bootstrap.owner_generation,
-                            &mut active_queries,
-                            request_cancelled("owner_stop"),
-                        );
-                        if force {
-                            lsp.process.terminate_process_tree(Duration::ZERO).await;
-                        } else {
-                            lsp.graceful_shutdown().await;
-                        }
-                        let result = json!({
-                            "ownerGeneration": bootstrap.owner_generation,
-                            "outcome": if force { "force_stopped" } else { "stopped" },
-                            "recoveryRequired": false
-                        });
-                        let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
-                        let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
-                        should_stop = true;
+                        unreachable!("stop requests use the Owner control queue: force={force}");
                     }
                     OwnerRequest::Dispatch { method, params, documents, refresh_open_documents, raw_request, request_timeout_ms, trace_protocol, apply_edits } => {
                         lsp.start_dispatch(
@@ -322,15 +387,18 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             lsp.process.try_wait().ok().flatten(),
                             &lsp.log.stderr_tail(),
                         );
-                        fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure);
+                        fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure.clone());
+                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
                         should_stop = true;
                     }
                     Err(error) => {
+                        let failure = protocol_failure(error.to_string());
                         fail_active_queries(
                             &bootstrap.owner_generation,
                             &mut active_queries,
-                            protocol_failure(error.to_string()),
+                            failure.clone(),
                         );
+                        fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
                         lsp.process.terminate_process_tree(Duration::ZERO).await;
                         should_stop = true;
                     }
@@ -350,11 +418,13 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
                 if let Some(status) = lsp.process.try_wait()? {
                     lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
+                    let failure = server_exited_failure(Some(status), &lsp.log.stderr_tail());
                     fail_active_queries(
                         &bootstrap.owner_generation,
                         &mut active_queries,
-                        server_exited_failure(Some(status), &lsp.log.stderr_tail()),
+                        failure.clone(),
                     );
+                    fail_queued_requests(&bootstrap.owner_generation, &mut requests_rx, failure);
                     should_stop = true;
                 }
             }
@@ -365,6 +435,11 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
     fail_active_queries(
         &bootstrap.owner_generation,
         &mut active_queries,
+        request_cancelled("owner_stopped"),
+    );
+    fail_queued_requests(
+        &bootstrap.owner_generation,
+        &mut requests_rx,
         request_cancelled("owner_stopped"),
     );
     let _ = fs::remove_file(&bootstrap.endpoint_path);
@@ -1795,6 +1870,8 @@ fn spawn_owner_listener(
     listener: TcpListener,
     endpoint: OwnerEndpoint,
     requests: mpsc::Sender<PendingOwnerRequest>,
+    controls: mpsc::Sender<PendingOwnerRequest>,
+    draining: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1803,8 +1880,11 @@ fn spawn_owner_listener(
             };
             let endpoint = endpoint.clone();
             let requests = requests.clone();
+            let controls = controls.clone();
+            let draining = Arc::clone(&draining);
             tokio::spawn(async move {
-                let _ = handle_owner_connection(stream, endpoint, requests).await;
+                let _ =
+                    handle_owner_connection(stream, endpoint, requests, controls, draining).await;
             });
         }
     })
@@ -1814,6 +1894,8 @@ async fn handle_owner_connection(
     mut stream: TcpStream,
     endpoint: OwnerEndpoint,
     requests: mpsc::Sender<PendingOwnerRequest>,
+    controls: mpsc::Sender<PendingOwnerRequest>,
+    draining: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let request: AuthenticatedOwnerRequest = read_owner_message(&mut stream).await?;
     if request.owner_protocol_version != OWNER_PROTOCOL_VERSION
@@ -1841,6 +1923,18 @@ async fn handle_owner_connection(
     let (delivered_tx, delivered_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let queue_deadline = request.queue_deadline_ms.map(Duration::from_millis);
+    let control_request = matches!(
+        request.request,
+        OwnerRequest::Status | OwnerRequest::Stop { .. }
+    );
+    if draining.load(Ordering::Acquire) && !control_request {
+        let failure = OwnerResponse::failure(
+            &endpoint.owner_generation,
+            owner_draining_failure(&endpoint.session_identity),
+        );
+        write_owner_message(&mut stream, &failure).await?;
+        return Ok(());
+    }
     let pending = PendingOwnerRequest {
         request: request.request,
         response: response_tx,
@@ -1848,7 +1942,12 @@ async fn handle_owner_connection(
         delivered: delivered_rx,
         cancelled: cancel_rx,
     };
-    if requests.try_send(pending).is_err() {
+    let queued = if control_request {
+        controls.try_send(pending)
+    } else {
+        requests.try_send(pending)
+    };
+    if queued.is_err() {
         let failure = OwnerResponse::failure(
             &endpoint.owner_generation,
             json!({
@@ -1940,6 +2039,7 @@ fn queue_deadline_failure(deadline: Duration) -> Value {
 fn status_result(
     bootstrap: &OwnerBootstrap,
     lsp: &LspRuntime,
+    state: &str,
     started: Instant,
     queue_depth: usize,
     active_queries: &BTreeMap<i64, ActiveQuery>,
@@ -1957,7 +2057,7 @@ fn status_result(
         "ownerGeneration": bootstrap.owner_generation,
         "workspaceUri": bootstrap.workspace_uri,
         "server": bootstrap.server,
-        "state": "ready",
+        "state": state,
         "serverPid": lsp.process.pid(),
         "uptimeMs": started.elapsed().as_millis() as u64,
         "idleDeadline": rfc3339_after(idle_deadline.saturating_duration_since(Instant::now())),
@@ -2142,6 +2242,40 @@ fn fail_active_queries(
             let _ = response.send(OwnerResponse::failure(owner_generation, failure));
         }
     }
+}
+
+fn fail_queued_requests(
+    owner_generation: &str,
+    requests: &mut mpsc::Receiver<PendingOwnerRequest>,
+    failure: Value,
+) {
+    while let Ok(pending) = requests.try_recv() {
+        if !*pending.cancelled.borrow() {
+            let _ = pending
+                .response
+                .send(OwnerResponse::failure(owner_generation, failure.clone()));
+        }
+    }
+}
+
+fn stop_result(owner_generation: &str, force: bool) -> Value {
+    json!({
+        "ownerGeneration": owner_generation,
+        "outcome": if force { "force_stopped" } else { "stopped" },
+        "recoveryRequired": false
+    })
+}
+
+fn owner_draining_failure(session_identity: &str) -> Value {
+    json!({
+        "category": "unavailable",
+        "code": "owner_unavailable",
+        "message": "The Owner is draining and is not accepting new work.",
+        "stage": "discover_owner",
+        "delivery": "not_sent",
+        "retry": "safe",
+        "data": {"sessionIdentity": session_identity, "reason": "draining"}
+    })
 }
 
 fn transport_failure(error: io::Error) -> Value {

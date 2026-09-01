@@ -253,6 +253,149 @@ fn queued_operation_deadline_removes_work_before_dispatch() {
 }
 
 #[test]
+fn force_stop_cancels_an_active_query_without_waiting_for_it() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/start",
+    ]);
+
+    let marker = fixture.workspace.join("active-request-started");
+    std::thread::scope(|scope| {
+        let active = scope.spawn(|| {
+            fixture.output(&[
+                "raw",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+                "--method",
+                "test/await-file-change",
+                "--params-json",
+                &json!({"marker": marker, "sleepMs": 5_000}).to_string(),
+            ])
+        });
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < marker_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists());
+
+        let started = std::time::Instant::now();
+        let stopped = fixture.command(&[
+            "session",
+            "stop",
+            "--force",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+        ]);
+        assert_eq!(stopped["result"]["outcome"], "force_stopped");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "force stop waited for the active request"
+        );
+
+        let active = active.join().unwrap();
+        assert!(!active.status.success());
+        let failure: Value = serde_json::from_slice(&active.stdout).unwrap();
+        assert_eq!(failure["error"]["code"], "request_cancelled");
+        assert_eq!(failure["error"]["data"]["source"], "force_stop");
+    });
+}
+
+#[test]
+fn graceful_stop_drains_the_active_query_and_rejects_new_work() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/start",
+    ]);
+
+    let marker = fixture.workspace.join("active-request-started");
+    std::thread::scope(|scope| {
+        let active = scope.spawn(|| {
+            fixture.command(&[
+                "raw",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+                "--method",
+                "test/await-file-change",
+                "--params-json",
+                &json!({"marker": marker, "sleepMs": 500}).to_string(),
+            ])
+        });
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < marker_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists());
+
+        let stop_started = std::time::Instant::now();
+        let stop = scope.spawn(|| {
+            fixture.command(&[
+                "session",
+                "stop",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+            ])
+        });
+        let state_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let status = fixture.command(&[
+                "session",
+                "status",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+            ]);
+            if status["result"]["state"] == "draining" {
+                break;
+            }
+            assert!(std::time::Instant::now() < state_deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let rejected = fixture.output(&[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "fixture/rejected",
+        ]);
+        assert_eq!(rejected.status.code(), Some(4));
+        let failure: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(failure["error"]["code"], "owner_unavailable");
+        assert_eq!(failure["error"]["data"]["reason"], "draining");
+
+        assert_eq!(active.join().unwrap()["result"], json!({"fixture": true}));
+        let stopped = stop.join().unwrap();
+        assert_eq!(stopped["result"]["outcome"], "stopped");
+        assert!(stop_started.elapsed() >= std::time::Duration::from_millis(300));
+    });
+}
+
+#[test]
 fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
     let fixture = Fixture::new();
     let workspace = fixture.workspace.to_str().unwrap();
