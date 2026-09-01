@@ -631,7 +631,12 @@ struct OwnerStatePaths {
 impl OwnerStatePaths {
     fn new() -> Result<Self, ContractFailure> {
         let root = directories::ProjectDirs::from("", "", "lspc")
-            .and_then(|directories| directories.state_dir().map(Path::to_path_buf))
+            .map(|directories| {
+                directories
+                    .state_dir()
+                    .unwrap_or_else(|| directories.data_local_dir())
+                    .to_path_buf()
+            })
             .ok_or_else(|| {
                 owner_unavailable(
                     "sid_0000000000000000000000000000000000000000000000000000000000000000",
