@@ -56,6 +56,7 @@ pub(crate) struct OwnerBootstrap {
 struct PendingOwnerRequest {
     request: OwnerRequest,
     response: oneshot::Sender<OwnerResponse>,
+    delivered: oneshot::Receiver<()>,
     cancelled: watch::Receiver<bool>,
 }
 
@@ -173,6 +174,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                             "recoveryRequired": false
                         });
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
+                        let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
                         should_stop = true;
                     }
                     OwnerRequest::Dispatch { method, params, request_timeout_ms, trace_protocol } => {
@@ -457,21 +459,14 @@ impl LspRuntime {
                 }
             }
         };
-        let mut result = if let Some(error) = response.get("error") {
+        let result = if let Some(error) = response.get("error") {
             return OwnerResponse::failure(owner_generation, server_error_failure(error));
         } else {
             response.get("result").cloned().unwrap_or(Value::Null)
         };
-        if !partial_items.is_empty()
-            && let Some(items) = result.as_array_mut()
-        {
-            let mut combined = std::mem::take(&mut partial_items);
-            combined.append(items);
-            result = Value::Array(combined);
-        }
         let mut output = json!({
             "result": result,
-            "partialResult": if partial_items.is_empty() { Value::Null } else { json!({"items": partial_items, "complete": true}) },
+            "partialResults": partial_items,
             "positionEncoding": self.negotiated.position_encoding.name(),
             "textSynchronization": match self.negotiated.text_synchronization {
                 crate::workspace::TextSynchronization::None => "none",
@@ -890,10 +885,12 @@ async fn handle_owner_connection(
         return Ok(());
     }
     let (response_tx, response_rx) = oneshot::channel();
+    let (delivered_tx, delivered_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let pending = PendingOwnerRequest {
         request: request.request,
         response: response_tx,
+        delivered: delivered_rx,
         cancelled: cancel_rx,
     };
     if requests.try_send(pending).is_err() {
@@ -916,6 +913,7 @@ async fn handle_owner_connection(
         response = response_rx => {
             if let Ok(response) = response {
                 write_owner_message(&mut stream, &response).await?;
+                let _ = delivered_tx.send(());
             }
         }
         disconnected = stream.read_u8() => {

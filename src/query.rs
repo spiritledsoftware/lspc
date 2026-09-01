@@ -377,6 +377,7 @@ pub(crate) struct Page {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct PreviewProposal {
     pub(crate) command: QueryCommand,
     pub(crate) method: String,
@@ -1196,6 +1197,7 @@ fn query_envelope(
     Ok(envelope)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diagnostic_envelope(
     composed: &ComposedQuery,
     context: Value,

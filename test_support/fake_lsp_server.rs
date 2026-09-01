@@ -109,7 +109,80 @@ fn serve(scenario: Scenario) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 }
-                if result(&mut output, &message, json!({"capabilities":{}}), scenario).is_err() {
+                let capabilities = if scenario == Scenario::Standard {
+                    json!({
+                        "positionEncoding": "utf-16",
+                        "textDocumentSync": {"openClose": true},
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "hoverProvider": true,
+                        "documentSymbolProvider": true,
+                        "workspaceSymbolProvider": true,
+                        "documentFormattingProvider": true,
+                        "renameProvider": {"prepareProvider": true},
+                        "codeActionProvider": {"resolveProvider": true},
+                        "executeCommandProvider": {"commands": ["fixture.run"]},
+                        "diagnosticProvider": {"workspaceDiagnostics": true}
+                    })
+                } else {
+                    json!({})
+                };
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"capabilities": capabilities}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/definition")
+            | Some("textDocument/references")
+            | Some("textDocument/documentSymbol")
+            | Some("workspace/symbol")
+            | Some("textDocument/formatting")
+            | Some("textDocument/codeAction") => {
+                if result(&mut output, &message, json!([]), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/hover") | Some("textDocument/prepareRename") => {
+                if result(&mut output, &message, Value::Null, scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/diagnostic") => {
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"kind":"full", "resultId":"fixture", "items":[]}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("workspace/diagnostic") => {
+                if result(&mut output, &message, json!({"items":[]}), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/rename") => {
+                if result(&mut output, &message, json!({"changes":{}}), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("codeAction/resolve") => {
+                let action = message.get("params").cloned().unwrap_or_else(|| json!({}));
+                if result(&mut output, &message, action, scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("workspace/executeCommand") => {
+                if result(&mut output, &message, Value::Null, scenario).is_err() {
                     return ExitCode::from(1);
                 }
             }

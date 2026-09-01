@@ -144,7 +144,7 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
                 }
             }
         }
-        [command] if command == "raw" || command == "capabilities" => {
+        [_] if crate::query::QueryCommand::from_path(invocation.command_path()).is_some() => {
             match crate::session::dispatch_owner_query_command(&invocation) {
                 Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
                 Err(failure) => {

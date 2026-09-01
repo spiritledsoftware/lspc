@@ -62,7 +62,7 @@ impl Fixture {
         fs::write(
             config,
             format!(
-                "version = 1\ndefault_server = \"fake\"\n[servers.fake]\nexecutable = {:?}\n",
+                "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\n",
                 env!("CARGO_BIN_EXE_lspc-fake-server")
             ),
         )
@@ -126,6 +126,32 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
         "fixture/second",
     ]);
     assert_eq!(second["context"]["ownerGeneration"], generation);
+
+    let file = fixture.workspace.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let definition = fixture.command(&[
+        "definition",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--file",
+        file.to_str().unwrap(),
+        "--line",
+        "0",
+        "--column",
+        "3",
+    ]);
+    assert_eq!(definition["result"], json!([]));
+    assert_eq!(definition["context"]["ownerGeneration"], generation);
+
+    let capabilities =
+        fixture.command(&["capabilities", "--workspace", workspace, "--server", "fake"]);
+    assert_eq!(capabilities["result"]["protocolBaseline"], "3.17");
+    assert_eq!(
+        capabilities["result"]["providers"]["definition"]["state"],
+        "supported"
+    );
 
     let listed = fixture.command(&["session", "list", "--workspace", workspace]);
     assert_eq!(listed["result"].as_array().unwrap().len(), 1);

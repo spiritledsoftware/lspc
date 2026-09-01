@@ -31,7 +31,14 @@ use crate::{
         select_named_server, select_server,
     },
     contract::ContractFailure,
-    workspace::{select_workspace, workspace_from_path},
+    query::{
+        Capabilities, DispatchRequest, DispatchResponse, PreviewCreator, PreviewProposal, Provider,
+        ProviderState, QueryContext, SessionDispatcher, compose, execute,
+    },
+    workspace::{
+        DiagnosticCache, DocumentStore, PositionEncoding, TextSynchronization, select_workspace,
+        validate_document_scope, workspace_from_path,
+    },
 };
 use owner_protocol::{
     AuthenticatedOwnerRequest, OWNER_PROTOCOL_VERSION, OwnerEndpoint, OwnerLaunchSettings,
@@ -77,7 +84,7 @@ pub(crate) fn dispatch_session_command(
     })
 }
 
-/// Runs raw dispatch and Capability inspection through the persistent Owner transport.
+/// Runs every Query through the persistent Owner transport.
 pub(crate) fn dispatch_owner_query_command(
     invocation: &ParsedInvocation,
 ) -> Result<Value, ContractFailure> {
@@ -88,10 +95,10 @@ pub(crate) fn dispatch_owner_query_command(
                 &error.to_string(),
             )
         })?;
-        let targets = invocation
-            .option_path("--sync-file")
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut targets = invocation.option_paths("--sync-file");
+        if let Some(file) = invocation.option_path("--file") {
+            targets.push(file);
+        }
         let workspace = select_workspace(
             invocation.option_path("--workspace").as_deref(),
             &targets,
@@ -106,80 +113,181 @@ pub(crate) fn dispatch_owner_query_command(
         let authorized = authorize_server(&configuration, server)?;
         let trace_protocol = invocation.has_option("--trace-protocol");
         let endpoint = connect_or_start_owner(&configuration, &authorized, trace_protocol).await?;
-        if invocation.command_path() == ["capabilities"] {
-            let mut capabilities =
-                send_owner_request(&endpoint, OwnerRequest::Capabilities).await?;
-            let position_encoding = capabilities
-                .get("positionEncoding")
-                .cloned()
-                .unwrap_or_else(|| json!("utf-16"));
-            if let Some(object) = capabilities.as_object_mut() {
-                object.remove("positionEncoding");
-                object.remove("textSynchronization");
-                if !invocation.has_option("--raw") {
-                    object.remove("initializeResult");
-                }
-            }
-            return Ok(json!({
-                "schemaVersion": 1,
-                "ok": true,
-                "command": invocation.command_path(),
-                "context": query_context(&configuration, &authorized, &endpoint, position_encoding, "none"),
-                "result": capabilities
-            }));
-        }
+        let owner_capabilities = send_owner_request(&endpoint, OwnerRequest::Capabilities).await?;
+        let capabilities = capabilities_from_owner(&owner_capabilities);
+        let position_encoding = match owner_capabilities["positionEncoding"].as_str() {
+            Some("utf-8") => PositionEncoding::Utf8,
+            _ => PositionEncoding::Utf16,
+        };
+        let text_synchronization = match owner_capabilities["textSynchronization"].as_str() {
+            Some("open_close") => TextSynchronization::OpenClose,
+            _ => TextSynchronization::None,
+        };
 
-        let method = invocation.option_string("--method").unwrap();
-        if matches!(
-            method.as_str(),
-            "initialize" | "initialized" | "shutdown" | "exit" | "$/cancelRequest"
-        ) {
-            return Err(ContractFailure {
-                exit_code: 3,
-                category: "blocked",
-                code: "raw_method_forbidden",
-                message: "Raw requests cannot control the Owner lifecycle.".to_owned(),
-                stage: "dispatch",
-                delivery: "not_sent",
-                retry: "never",
-                data: json!({"method": method}),
-            });
-        }
-        let params = read_raw_params(invocation)?;
-        let mut response = dispatch_owner_request(
-            &endpoint,
-            method.clone(),
-            params,
+        let document = if let Some(path) = invocation.option_path("--file") {
+            let path = validate_document_scope(
+                &workspace,
+                &path,
+                invocation.has_option("--server"),
+                false,
+            )?;
+            let language_id = crate::configuration::document_language_id(
+                &configuration,
+                &authorized.server.name,
+                &path,
+                invocation.option_string("--language-id").as_deref(),
+            )?;
+            let mut documents = DocumentStore::new(
+                configuration.synchronization.max_open_documents,
+                configuration.synchronization.max_document_bytes,
+                configuration.synchronization.max_total_text_bytes,
+            );
+            Some(
+                documents
+                    .refresh(&path, &language_id, text_synchronization)?
+                    .snapshot,
+            )
+        } else {
+            None
+        };
+        let mut diagnostics = DiagnosticCache::new(
+            configuration.synchronization.max_diagnostic_snapshots,
+            configuration.synchronization.max_diagnostic_bytes,
+        );
+        let composed = compose(
+            invocation,
+            document.as_ref(),
+            position_encoding,
+            &capabilities,
+            Some(&diagnostics),
+        )?;
+        let context = QueryContext {
+            workspace_uri: configuration.workspace_uri.clone(),
+            server: authorized.server.name.clone(),
+            session_identity: authorized.session_identity.clone(),
+            owner_generation: endpoint.owner_generation.clone(),
+            result_position_encoding: position_encoding,
+            synchronization: json!({
+                "mode": match text_synchronization {
+                    TextSynchronization::None => "none",
+                    TextSynchronization::OpenClose => "open_close",
+                },
+                "bestEffort": false,
+                "before": [],
+                "failures": [],
+                "postResponseChanged": []
+            }),
+            recovery: json!({"required": false}),
+        };
+        let mut dispatcher = OwnerQueryDispatcher {
+            endpoint: &endpoint,
             request_timeout,
-            trace_protocol,
+        };
+        execute(
+            &mut dispatcher,
+            composed,
+            context,
+            &mut diagnostics,
+            &mut PendingPreviewCreator,
         )
-        .await?;
-        let result = response.get("result").cloned().unwrap_or(Value::Null);
-        let position_encoding = response
-            .get("positionEncoding")
-            .cloned()
-            .unwrap_or_else(|| json!("utf-16"));
-        let synchronization = response
-            .get("textSynchronization")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        let mut envelope = json!({
-            "schemaVersion": 1,
-            "ok": true,
-            "command": invocation.command_path(),
-            "method": method,
-            "context": query_context(&configuration, &authorized, &endpoint, position_encoding, synchronization),
-            "result": result,
-            "raw": true
-        });
-        if let Some(trace) = response
-            .as_object_mut()
-            .and_then(|object| object.remove("trace"))
-        {
-            envelope["trace"] = trace;
-        }
-        Ok(envelope)
     })
+}
+
+fn capabilities_from_owner(value: &Value) -> Capabilities {
+    let providers = value["providers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, provider)| {
+            let state = match provider["state"].as_str() {
+                Some("supported") => ProviderState::Supported,
+                Some("invalid") => ProviderState::Invalid,
+                _ => ProviderState::Unsupported,
+            };
+            (
+                name.clone(),
+                Provider {
+                    state,
+                    capability_path: provider["capabilityPath"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    options: provider.get("options").cloned(),
+                    selector: provider.get("documentSelector").cloned(),
+                    problems: provider["problems"].as_array().cloned().unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    Capabilities {
+        providers,
+        initialize_result: value.get("initializeResult").cloned(),
+    }
+}
+
+struct OwnerQueryDispatcher<'a> {
+    endpoint: &'a OwnerEndpoint,
+    request_timeout: Duration,
+}
+
+impl SessionDispatcher for OwnerQueryDispatcher<'_> {
+    fn dispatch(
+        &mut self,
+        mut request: DispatchRequest,
+    ) -> Result<DispatchResponse, ContractFailure> {
+        if let Some(params) = request.params.as_mut() {
+            if request.partial_results && params.is_object() {
+                params["partialResultToken"] = json!(format!("lspc-partial-{}", random_hex(16)?));
+            }
+            if request.work_done_progress && params.is_object() {
+                params["workDoneToken"] = json!(format!("lspc-work-{}", random_hex(16)?));
+            }
+        }
+        let mut response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(dispatch_owner_request(
+                self.endpoint,
+                request.method,
+                request.params,
+                self.request_timeout,
+                request.trace_protocol,
+            ))
+        })?;
+        let result = response
+            .as_object_mut()
+            .and_then(|object| object.remove("result"))
+            .unwrap_or(Value::Null);
+        let trace = response
+            .as_object_mut()
+            .and_then(|object| object.remove("trace"));
+        let partial_results = response
+            .as_object_mut()
+            .and_then(|object| object.remove("partialResults"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        Ok(DispatchResponse {
+            result,
+            partial_results,
+            trace,
+            apply_edit_ledger: Vec::new(),
+        })
+    }
+}
+
+struct PendingPreviewCreator;
+
+impl PreviewCreator for PendingPreviewCreator {
+    fn create_preview(&mut self, _proposal: PreviewProposal) -> Result<Value, ContractFailure> {
+        Err(ContractFailure {
+            exit_code: 70,
+            category: "internal",
+            code: "implementation_pending",
+            message: "Mutation Preview integration is not available.".to_owned(),
+            stage: "create_preview",
+            delivery: "sent",
+            retry: "after_change",
+            data: json!({}),
+        })
+    }
 }
 
 /// Connects to an authenticated Owner or starts the sole lock-winning generation.
@@ -752,84 +860,6 @@ fn random_hex(bytes: usize) -> Result<String, ContractFailure> {
 
 fn duration_millis(value: &str) -> u64 {
     parse_duration(value).as_millis() as u64
-}
-
-fn read_raw_params(invocation: &ParsedInvocation) -> Result<Option<Value>, ContractFailure> {
-    let source = if let Some(value) = invocation.option_string("--params-json") {
-        Some(("--params-json".to_owned(), value.into_bytes()))
-    } else if let Some(path) = invocation.option_path("--params-file") {
-        let bytes = if path == Path::new("-") {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)
-                .map_err(|error| input_read_failure("stdin", None, error))?;
-            bytes
-        } else {
-            fs::read(&path)
-                .map_err(|error| input_read_failure("--params-file", Some(path.as_path()), error))?
-        };
-        Some((path.to_string_lossy().into_owned(), bytes))
-    } else {
-        None
-    };
-    source
-        .map(|(source, bytes)| {
-            serde_json::from_slice(&bytes).map_err(|error| ContractFailure {
-                exit_code: 2,
-                category: "input",
-                code: "invalid_json_input",
-                message: "Raw request parameters are not valid JSON.".to_owned(),
-                stage: "read_input",
-                delivery: "not_applicable",
-                retry: "never",
-                data: json!({
-                    "source": source,
-                    "line": error.line().saturating_sub(1),
-                    "column": error.column().saturating_sub(1)
-                }),
-            })
-        })
-        .transpose()
-}
-
-fn input_read_failure(source: &str, path: Option<&Path>, error: io::Error) -> ContractFailure {
-    let mut data = json!({"source": source, "osCode": error.raw_os_error()});
-    if let Some(path) = path {
-        data["path"] = json!(path);
-    }
-    ContractFailure {
-        exit_code: 2,
-        category: "input",
-        code: "input_read_failed",
-        message: "Raw request parameters could not be read.".to_owned(),
-        stage: "read_input",
-        delivery: "not_applicable",
-        retry: "after_change",
-        data,
-    }
-}
-
-fn query_context(
-    configuration: &LoadedConfiguration,
-    authorized: &AuthorizedServer,
-    endpoint: &OwnerEndpoint,
-    position_encoding: Value,
-    synchronization: &str,
-) -> Value {
-    json!({
-        "workspaceUri": configuration.workspace_uri,
-        "server": authorized.server.name,
-        "sessionIdentity": authorized.session_identity,
-        "ownerGeneration": endpoint.owner_generation,
-        "resultPositionEncoding": position_encoding,
-        "synchronization": {
-            "mode": if synchronization == "open_close" { "explicit" } else { "none" },
-            "bestEffort": false,
-            "before": [],
-            "failures": [],
-            "postResponseChanged": []
-        },
-        "recovery": {"required": false}
-    })
 }
 
 fn success_envelope(command: &[String], result: Value) -> Value {

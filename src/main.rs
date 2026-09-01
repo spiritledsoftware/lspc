@@ -4,7 +4,6 @@ mod cli;
 #[allow(dead_code, unused_imports)]
 mod configuration;
 mod contract;
-#[allow(dead_code)]
 mod query;
 mod session;
 mod skill_install;
