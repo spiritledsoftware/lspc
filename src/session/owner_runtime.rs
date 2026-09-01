@@ -59,6 +59,7 @@ pub(crate) struct OwnerBootstrap {
 struct PendingOwnerRequest {
     request: OwnerRequest,
     response: oneshot::Sender<OwnerResponse>,
+    dispatched: oneshot::Sender<()>,
     delivered: oneshot::Receiver<()>,
     cancelled: watch::Receiver<bool>,
 }
@@ -170,6 +171,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 if *pending.cancelled.borrow() {
                     continue;
                 }
+                let _ = pending.dispatched.send(());
                 match pending.request {
                     OwnerRequest::Status => {
                         let response = OwnerResponse::success(
@@ -871,59 +873,64 @@ impl LspRuntime {
             };
         }
 
-        let query = active.get_mut(&candidate.unwrap()).unwrap();
-        if query.apply_edit_ledger.len() as u64
+        let candidate = candidate.unwrap();
+        if active[&candidate].apply_edit_ledger.len() as u64
             >= self.mutation_settings.max_preauthorized_callbacks
         {
-            query.apply_edit_ledger.push(json!({
-                "ordinal": ordinal,
-                "label": label,
-                "applied": false,
-                "outcome": "rejected",
-                "failureReason": "resource_limit_exceeded"
-            }));
+            active
+                .get_mut(&candidate)
+                .unwrap()
+                .apply_edit_ledger
+                .push(json!({
+                    "ordinal": ordinal,
+                    "label": label,
+                    "applied": false,
+                    "outcome": "rejected",
+                    "failureReason": "resource_limit_exceeded"
+                }));
             return json!({
                 "jsonrpc": "2.0",
                 "id": callback_id,
                 "result": {"applied": false, "failureReason": "resource_limit_exceeded"}
             });
         }
+
+        // Application calls this hook after the filesystem commit and before
+        // releasing the Workspace lock. Clone the immutable launch settings
+        // so the hook can exclusively borrow the live runtime.
+        let workspace_path = self.workspace_path.clone();
+        let workspace_uri = self.workspace_uri.clone();
+        let server = self.server.clone();
+        let session_identity = self.session_identity.clone();
+        let position_encoding = self.negotiated.position_encoding;
+        let previews = self.preview_settings.clone();
+        let receipts = self.receipt_settings.clone();
+        let mutation = self.mutation_settings.clone();
+        let mut synchronize = || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.synchronize_documents_after_commit())
+            })
+        };
         match crate::mutation::apply_preauthorized_workspace_edit(
-            &self.workspace_path,
-            &self.workspace_uri,
-            &self.server,
-            &self.session_identity,
-            self.negotiated.position_encoding,
+            &workspace_path,
+            &workspace_uri,
+            &server,
+            &session_identity,
+            position_encoding,
             label,
             edit,
-            &self.preview_settings,
-            &self.receipt_settings,
-            &self.mutation_settings,
+            &previews,
+            &receipts,
+            &mutation,
+            &mut synchronize,
         ) {
             Ok(application) => {
                 let result = &application["result"];
-                let receipt_id = result.get("receiptId").and_then(Value::as_str);
-                let (outcomes, failures) = self
-                    .documents
-                    .refresh_open_documents(self.negotiated.text_synchronization);
-                let mut synchronized = failures.is_empty();
-                for outcome in outcomes {
-                    synchronized &= self
-                        .send_synchronization_events(outcome.events)
-                        .await
-                        .is_ok();
-                }
-                let pending_events = self.documents.drain_pending_events();
-                synchronized &= self
-                    .send_synchronization_events(pending_events)
-                    .await
-                    .is_ok();
+                let synchronized = result["sessionSynchronized"].as_bool() == Some(true);
                 if synchronized {
-                    query.validated_documents = self.open_document_inputs();
-                }
-                if synchronized && let Some(receipt_id) = receipt_id {
-                    synchronized =
-                        crate::mutation::mark_receipt_session_synchronized(receipt_id).is_ok();
+                    let documents = self.open_document_inputs();
+                    active.get_mut(&candidate).unwrap().validated_documents = documents;
                 }
                 let mut ledger = json!({
                     "ordinal": ordinal,
@@ -936,7 +943,11 @@ impl LspRuntime {
                     "failureReason": (!synchronized).then_some("session_synchronization_failed")
                 });
                 compact_json_object(&mut ledger);
-                query.apply_edit_ledger.push(ledger);
+                active
+                    .get_mut(&candidate)
+                    .unwrap()
+                    .apply_edit_ledger
+                    .push(ledger);
                 json!({"jsonrpc": "2.0", "id": callback_id, "result": {"applied": true}})
             }
             Err(failure) => {
@@ -956,7 +967,11 @@ impl LspRuntime {
                     "failedChange": failure.data.get("failedChange")
                 });
                 compact_json_object(&mut ledger);
-                query.apply_edit_ledger.push(ledger);
+                active
+                    .get_mut(&candidate)
+                    .unwrap()
+                    .apply_edit_ledger
+                    .push(ledger);
                 json!({
                     "jsonrpc": "2.0",
                     "id": callback_id,
@@ -964,6 +979,25 @@ impl LspRuntime {
                 })
             }
         }
+    }
+
+    async fn synchronize_documents_after_commit(&mut self) -> bool {
+        let (outcomes, failures) = self
+            .documents
+            .refresh_open_documents(self.negotiated.text_synchronization);
+        let mut synchronized = failures.is_empty();
+        for outcome in outcomes {
+            synchronized &= self
+                .send_synchronization_events(outcome.events)
+                .await
+                .is_ok();
+        }
+        let pending_events = self.documents.drain_pending_events();
+        synchronized
+            && self
+                .send_synchronization_events(pending_events)
+                .await
+                .is_ok()
     }
 
     async fn maintain_active_queries(
@@ -1419,6 +1453,26 @@ impl LspRuntime {
         if self.process.try_wait().ok().flatten().is_some() {
             return;
         }
+
+        // LSP requires clients to close every open text document before the
+        // shutdown request. These notifications are best effort: a broken
+        // transport must not prevent process-tree cleanup below.
+        let mut close_events = self.documents.drain_pending_events();
+        close_events.extend(
+            self.documents
+                .close_all(self.negotiated.text_synchronization),
+        );
+        if let Err(failure) = self.send_synchronization_events(close_events).await {
+            self.log.push(
+                "lifecycle",
+                "warning",
+                format!(
+                    "Could not close every Document before shutdown: {}",
+                    failure.message
+                ),
+            );
+        }
+
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         if self
@@ -1622,11 +1676,14 @@ async fn handle_owner_connection(
         return Ok(());
     }
     let (response_tx, response_rx) = oneshot::channel();
+    let (dispatched_tx, dispatched_rx) = oneshot::channel();
     let (delivered_tx, delivered_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let queue_deadline = request.queue_deadline_ms.map(Duration::from_millis);
     let pending = PendingOwnerRequest {
         request: request.request,
         response: response_tx,
+        dispatched: dispatched_tx,
         delivered: delivered_rx,
         cancelled: cancel_rx,
     };
@@ -1646,10 +1703,53 @@ async fn handle_owner_connection(
         write_owner_message(&mut stream, &failure).await?;
         return Ok(());
     }
+    if let Some(queue_deadline) = queue_deadline {
+        let mut response_rx = response_rx;
+        let mut dispatched_rx = dispatched_rx;
+        tokio::select! {
+            response = &mut response_rx => {
+                if let Ok(response) = response {
+                    write_owner_message(&mut stream, &response).await?;
+                    let _ = delivered_tx.send(());
+                }
+            }
+            _ = &mut dispatched_rx => {
+                await_owner_response(
+                    &mut stream,
+                    response_rx,
+                    delivered_tx,
+                    cancel_tx,
+                ).await?;
+            }
+            _ = tokio_time::sleep(queue_deadline) => {
+                let _ = cancel_tx.send(true);
+                let failure = OwnerResponse::failure(
+                    &endpoint.owner_generation,
+                    queue_deadline_failure(queue_deadline),
+                );
+                write_owner_message(&mut stream, &failure).await?;
+            }
+            disconnected = stream.read_u8() => {
+                let _ = disconnected;
+                let _ = cancel_tx.send(true);
+            }
+        }
+    } else {
+        await_owner_response(&mut stream, response_rx, delivered_tx, cancel_tx).await?;
+    }
+    Ok(())
+}
+
+async fn await_owner_response(
+    stream: &mut TcpStream,
+    response_rx: oneshot::Receiver<OwnerResponse>,
+    delivered_tx: oneshot::Sender<()>,
+    cancel_tx: watch::Sender<bool>,
+) -> io::Result<()> {
     tokio::select! {
         response = response_rx => {
             if let Ok(response) = response {
-                write_owner_message(&mut stream, &response).await?;
+                write_owner_message(stream, &response).await?;
                 let _ = delivered_tx.send(());
             }
         }
@@ -1659,6 +1759,21 @@ async fn handle_owner_connection(
         }
     }
     Ok(())
+}
+
+fn queue_deadline_failure(deadline: Duration) -> Value {
+    json!({
+        "category": "unavailable",
+        "code": "queue_deadline_exceeded",
+        "message": "The invocation deadline expired before the operation was dispatched.",
+        "stage": "queue",
+        "delivery": "not_sent",
+        "retry": "safe",
+        "data": {
+            "deadline": format_duration(deadline),
+            "waitedMs": deadline.as_millis() as u64
+        }
+    })
 }
 
 fn status_result(

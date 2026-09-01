@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -439,14 +440,7 @@ impl MutationStateStore {
 
     pub(crate) fn list_receipts(&self) -> Result<Vec<StoredReceipt>, ContractFailure> {
         self.prune_expired_records()?;
-        let mut records = self
-            .receipt_files()?
-            .into_iter()
-            .map(|path| {
-                let id = file_stem(&path);
-                self.read_receipt(&id)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut records = self.read_all_receipts()?;
         records.sort_by_key(|record| std::cmp::Reverse(record.completed_unix_seconds));
         Ok(records)
     }
@@ -573,7 +567,8 @@ impl MutationStateStore {
         if requested_ids.is_empty() {
             return self.prune_expired_records();
         }
-        let mut paths = Vec::new();
+        let receipts = self.read_all_receipts()?;
+        let mut paths = BTreeMap::new();
         let mut problems = Vec::new();
         for id in requested_ids {
             let path = if id.starts_with("prv_") && self.preview_path(id).exists() {
@@ -588,10 +583,24 @@ impl MutationStateStore {
                         continue;
                     }
                 }
-            } else if (id.starts_with("prv_") || id.starts_with("rcp_"))
-                && self.receipt_path(id).exists()
-            {
-                self.receipt_path(id)
+            } else if id.starts_with("prv_") || id.starts_with("rcp_") {
+                let Some(_) = receipts
+                    .iter()
+                    .find(|record| record.receipt.receipt_id == *id)
+                else {
+                    problems.push(json!({"id": id, "code": "unknown", "message": "The state identifier is unknown."}));
+                    continue;
+                };
+                let chain = receipt_chain(&receipts, id);
+                if receipt_chain_protected(&chain) {
+                    problems.push(json!({"id": id, "code": "protected", "message": "A nonterminal or cleanup-pending Receipt chain is protected."}));
+                    continue;
+                }
+                for receipt in chain {
+                    let receipt_id = receipt.receipt.receipt_id.clone();
+                    paths.insert(receipt_id.clone(), self.receipt_path(&receipt_id));
+                }
+                continue;
             } else if id.starts_with("txn_") && self.transaction_path(id).exists() {
                 problems.push(json!({"id": id, "code": "protected", "message": "Recovery transaction evidence is protected."}));
                 continue;
@@ -599,7 +608,7 @@ impl MutationStateStore {
                 problems.push(json!({"id": id, "code": "unknown", "message": "The state identifier is unknown."}));
                 continue;
             };
-            paths.push((id.clone(), path));
+            paths.insert(id.clone(), path);
         }
         if !problems.is_empty() {
             return Err(ContractFailure {
@@ -613,7 +622,7 @@ impl MutationStateStore {
                 data: json!({"problems": problems}),
             });
         }
-        for (_, path) in &paths {
+        for path in paths.values() {
             fs::remove_file(path).map_err(|error| {
                 state_failure(
                     "mutation",
@@ -623,7 +632,7 @@ impl MutationStateStore {
                 )
             })?;
         }
-        Ok(paths.into_iter().map(|(id, _)| id).collect())
+        Ok(paths.into_keys().collect())
     }
 
     fn prune_expired_records(&self) -> Result<Vec<String>, ContractFailure> {
@@ -653,28 +662,32 @@ impl MutationStateStore {
                 removed.push(record.preview.preview_id);
             }
         }
-        for path in self.receipt_files()? {
-            let bytes = fs::read(&path).map_err(|error| {
-                state_failure(
-                    "receipt",
-                    &path,
-                    "A Receipt cannot be inspected for pruning.",
-                    error.raw_os_error(),
-                )
-            })?;
-            let record: StoredReceipt = serde_json::from_slice(&bytes)
-                .map_err(|_| stored_version_failure("receipt", &path, 0))?;
-            validate_record_version(record.format_version, "receipt", &path)?;
-            if record.expires_unix_seconds <= now && !record.receipt.cleanup_pending {
-                fs::remove_file(&path).map_err(|error| {
-                    state_failure(
-                        "receipt",
-                        &path,
-                        "An expired Receipt cannot be pruned.",
-                        error.raw_os_error(),
-                    )
-                })?;
-                removed.push(record.receipt.receipt_id);
+        let receipts = self.read_all_receipts()?;
+        let mut visited = BTreeSet::new();
+        for record in &receipts {
+            if visited.contains(&record.receipt.receipt_id) {
+                continue;
+            }
+            let chain = receipt_chain(&receipts, &record.receipt.receipt_id);
+            visited.extend(chain.iter().map(|record| record.receipt.receipt_id.clone()));
+            if chain
+                .iter()
+                .all(|record| record.expires_unix_seconds <= now)
+                && !receipt_chain_protected(&chain)
+            {
+                for record in chain {
+                    let id = &record.receipt.receipt_id;
+                    let path = self.receipt_path(id);
+                    fs::remove_file(&path).map_err(|error| {
+                        state_failure(
+                            "receipt",
+                            &path,
+                            "An expired Receipt chain cannot be pruned.",
+                            error.raw_os_error(),
+                        )
+                    })?;
+                    removed.push(id.clone());
+                }
             }
         }
         Ok(removed)
@@ -692,12 +705,34 @@ impl MutationStateStore {
 
     fn expired_receipt_ids(&self) -> Result<Vec<String>, ContractFailure> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        Ok(self
-            .list_receipts()?
+        let receipts = self.read_all_receipts()?;
+        let mut expired = Vec::new();
+        let mut visited = BTreeSet::new();
+        for record in &receipts {
+            if visited.contains(&record.receipt.receipt_id) {
+                continue;
+            }
+            let chain = receipt_chain(&receipts, &record.receipt.receipt_id);
+            visited.extend(chain.iter().map(|record| record.receipt.receipt_id.clone()));
+            if chain
+                .iter()
+                .all(|record| record.expires_unix_seconds <= now)
+                && !receipt_chain_protected(&chain)
+            {
+                expired.extend(chain.iter().map(|record| record.receipt.receipt_id.clone()));
+            }
+        }
+        Ok(expired)
+    }
+
+    fn read_all_receipts(&self) -> Result<Vec<StoredReceipt>, ContractFailure> {
+        self.receipt_files()?
             .into_iter()
-            .filter(|record| record.expires_unix_seconds <= now && !record.receipt.cleanup_pending)
-            .map(|record| record.receipt.receipt_id)
-            .collect())
+            .map(|path| {
+                let id = file_stem(&path);
+                self.read_receipt(&id)
+            })
+            .collect()
     }
 
     fn preview_path(&self, id: &str) -> PathBuf {
@@ -718,6 +753,43 @@ impl MutationStateStore {
     fn transaction_files(&self) -> Result<Vec<PathBuf>, ContractFailure> {
         record_files(&self.root.join("transactions"), "transaction")
     }
+}
+
+fn receipt_chain<'a>(receipts: &'a [StoredReceipt], start: &str) -> Vec<&'a StoredReceipt> {
+    let mut identifiers = BTreeSet::from([start.to_owned()]);
+    loop {
+        let before = identifiers.len();
+        for record in receipts {
+            let id = &record.receipt.receipt_id;
+            let linked = record.receipt.linked_receipt_id.as_ref();
+            if identifiers.contains(id) || linked.is_some_and(|linked| identifiers.contains(linked))
+            {
+                identifiers.insert(id.clone());
+                if let Some(linked) = linked {
+                    identifiers.insert(linked.clone());
+                }
+            }
+        }
+        if identifiers.len() == before {
+            break;
+        }
+    }
+    receipts
+        .iter()
+        .filter(|record| identifiers.contains(&record.receipt.receipt_id))
+        .collect()
+}
+
+fn receipt_chain_protected(chain: &[&StoredReceipt]) -> bool {
+    let terminal_recovery = chain.iter().any(|record| {
+        record.receipt.kind == "recovery_receipt"
+            && matches!(
+                record.receipt.outcome.as_str(),
+                "restored" | "accepted_current"
+            )
+            && !record.receipt.cleanup_pending
+    });
+    !terminal_recovery && chain.iter().any(|record| record.receipt.cleanup_pending)
 }
 
 pub(crate) fn now_rfc3339() -> String {
@@ -1094,5 +1166,51 @@ mod tests {
                 assert_eq!(failure.code, "state_capacity_exceeded");
             }
         }
+    }
+
+    #[test]
+    fn explicit_prune_selects_the_complete_terminal_recovery_chain() {
+        let directory = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+        let limits = ReceiptSettings { max_count: 4 };
+        let original_id = format!("prv_{}", "1".repeat(32));
+        let recovery_id = format!("rcp_{}", "2".repeat(32));
+
+        let mut original = receipt_record(original_id.clone());
+        original.outcome = "recovery_required".to_owned();
+        original.cleanup_pending = true;
+        store.write_receipt(original, &limits).unwrap();
+
+        let mut recovery = receipt_record(recovery_id.clone());
+        recovery.kind = "recovery_receipt".to_owned();
+        recovery.outcome = "restored".to_owned();
+        recovery.linked_receipt_id = Some(original_id.clone());
+        store.write_receipt(recovery, &limits).unwrap();
+
+        let removed = store
+            .prune_state(std::slice::from_ref(&original_id))
+            .unwrap();
+        assert_eq!(removed, vec![original_id.clone(), recovery_id.clone()]);
+        assert!(store.read_receipt(&original_id).is_err());
+        assert!(store.read_receipt(&recovery_id).is_err());
+    }
+
+    #[test]
+    fn prune_protects_a_nonterminal_recovery_chain() {
+        let directory = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+        let limits = ReceiptSettings { max_count: 2 };
+        let original_id = format!("prv_{}", "3".repeat(32));
+        let mut original = receipt_record(original_id.clone());
+        original.outcome = "recovery_required".to_owned();
+        original.cleanup_pending = true;
+        store.write_receipt(original, &limits).unwrap();
+
+        let failure = store
+            .prune_state(std::slice::from_ref(&original_id))
+            .unwrap_err();
+        assert_eq!(failure.code, "state_prune_rejected");
+        assert_eq!(failure.data["problems"][0]["code"], "protected");
+        assert!(store.read_receipt(&original_id).is_ok());
     }
 }

@@ -32,7 +32,7 @@ use super::{
 };
 
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
-type PostCommit<'a> = dyn Fn(&ReceiptRecord) -> bool + 'a;
+type PostCommit<'a> = dyn FnMut(&ReceiptRecord) -> bool + 'a;
 
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
@@ -40,13 +40,13 @@ pub(crate) struct ApplicationContext<'a> {
     pub(crate) receipt_limits: &'a ReceiptSettings,
     pub(crate) mutation_limits: &'a MutationSettings,
     pub(crate) reauthorize: Option<&'a ReauthorizePreview<'a>>,
-    pub(crate) post_commit: Option<&'a PostCommit<'a>>,
+    pub(crate) post_commit: Option<&'a mut PostCommit<'a>>,
     pub(crate) preauthorized: bool,
 }
 
 /// Applies one exact Preview under the Workspace lock and records at-most-once completion.
 pub(crate) fn apply_preview(
-    context: &ApplicationContext<'_>,
+    context: &mut ApplicationContext<'_>,
     preview_id: &str,
 ) -> Result<Value, ContractFailure> {
     if let Some(receipt) = context.store.already_applied(preview_id)?
@@ -246,6 +246,7 @@ pub(crate) fn apply_preview(
         }
         if context
             .post_commit
+            .as_deref_mut()
             .is_some_and(|post_commit| post_commit(&receipt))
         {
             context
@@ -1320,7 +1321,7 @@ mod tests {
                 &preview_limits,
             )
             .unwrap();
-        let context = ApplicationContext {
+        let mut context = ApplicationContext {
             store: &store,
             preview_limits: &preview_limits,
             receipt_limits: &receipt_limits,
@@ -1329,8 +1330,8 @@ mod tests {
             post_commit: None,
             preauthorized: false,
         };
-        let first = apply_preview(&context, &id).unwrap();
-        let second = apply_preview(&context, &id).unwrap();
+        let first = apply_preview(&mut context, &id).unwrap();
+        let second = apply_preview(&mut context, &id).unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "new\n");
         assert_eq!(first["outcome"], "applied");
         assert_eq!(second["outcome"], "already_applied");

@@ -186,6 +186,73 @@ fn owner_serializes_simultaneous_agent_operations_in_fifo_order() {
 }
 
 #[test]
+fn queued_operation_deadline_removes_work_before_dispatch() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/start",
+    ]);
+
+    let marker = fixture.workspace.join("active-request-started");
+    std::thread::scope(|scope| {
+        let active = scope.spawn(|| {
+            fixture.command(&[
+                "raw",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+                "--method",
+                "test/await-file-change",
+                "--params-json",
+                &json!({"marker": marker, "sleepMs": 500}).to_string(),
+            ])
+        });
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < marker_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists());
+        let expired = fixture.output(&[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "fixture/never-dispatched",
+            "--deadline",
+            "10ms",
+        ]);
+        assert_eq!(
+            expired.status.code(),
+            Some(4),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&expired.stdout)
+        );
+        let failure: Value = serde_json::from_slice(&expired.stdout).unwrap();
+        assert_eq!(failure["error"]["code"], "queue_deadline_exceeded");
+        assert_eq!(failure["error"]["delivery"], "not_sent");
+        assert_eq!(active.join().unwrap()["result"], json!({"fixture": true}));
+    });
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+}
+
+#[test]
 fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
     let fixture = Fixture::new();
     let workspace = fixture.workspace.to_str().unwrap();
@@ -342,4 +409,42 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
 
     let listed = fixture.command(&["session", "list", "--workspace", workspace]);
     assert_eq!(listed["result"], json!([]));
+}
+
+#[test]
+fn graceful_stop_closes_open_documents_before_shutdown() {
+    let root = TempDir::new().unwrap();
+    let event_log = root.path().join("events.log");
+    let event_argument = format!("--event-log={}", event_log.display());
+    let fixture = Fixture::with_server_arguments(&[&event_argument]);
+    let workspace = fixture.workspace.to_str().unwrap();
+    let document = fixture.workspace.join("open.rs");
+    fs::write(&document, "fn main() {}\n").unwrap();
+
+    fixture.command(&[
+        "definition",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--file",
+        document.to_str().unwrap(),
+        "--line",
+        "0",
+        "--column",
+        "3",
+    ]);
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+
+    let events = fs::read_to_string(event_log).unwrap();
+    let close = events.find("textDocument/didClose").unwrap();
+    let shutdown = events.find("shutdown").unwrap();
+    assert!(close < shutdown, "events were out of order:\n{events}");
 }

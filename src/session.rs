@@ -88,22 +88,13 @@ pub(crate) fn dispatch_session_command(
 pub(crate) fn dispatch_owner_query_command(
     invocation: &ParsedInvocation,
 ) -> Result<Value, ContractFailure> {
-    let deadline = invocation
-        .option_string("--deadline")
-        .map(|value| parse_duration(&value));
-    run_async(async {
-        if let Some(deadline) = deadline {
-            match tokio::time::timeout(deadline, dispatch_owner_query(invocation)).await {
-                Ok(result) => result,
-                Err(_) => Err(queue_deadline_failure(&format_duration(deadline))),
-            }
-        } else {
-            dispatch_owner_query(invocation).await
-        }
-    })
+    run_async(dispatch_owner_query(invocation))
 }
 
 async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
+    let queue_deadline = invocation
+        .option_string("--deadline")
+        .map(|value| QueueDeadline::new(parse_duration(&value)));
     let current_directory = std::env::current_dir().map_err(|error| {
         owner_unavailable(
             "sid_0000000000000000000000000000000000000000000000000000000000000000",
@@ -128,7 +119,12 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
     let authorized = authorize_server(&configuration, server)?;
     let trace_protocol = invocation.has_option("--trace-protocol");
     let endpoint = connect_or_start_owner(&configuration, &authorized, trace_protocol).await?;
-    let owner_capabilities = send_owner_request(&endpoint, OwnerRequest::Capabilities).await?;
+    let owner_capabilities = send_owner_request_with_queue_deadline(
+        &endpoint,
+        OwnerRequest::Capabilities,
+        queue_deadline_remaining(queue_deadline)?,
+    )
+    .await?;
     let capabilities = capabilities_from_owner(&owner_capabilities);
     let position_encoding = match owner_capabilities["positionEncoding"].as_str() {
         Some("utf-8") => PositionEncoding::Utf8,
@@ -180,11 +176,12 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
             })
             .into_iter()
             .collect();
-        let first_state = send_owner_request(
+        let first_state = send_owner_request_with_queue_deadline(
             &endpoint,
             OwnerRequest::Diagnostics {
                 documents: synchronized,
             },
+            queue_deadline_remaining(queue_deadline)?,
         )
         .await?;
         let document_versions = first_state["documentVersions"].clone();
@@ -214,11 +211,12 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
                         .min(Duration::from_millis(25)),
                 )
                 .await;
-                let state = send_owner_request(
+                let state = send_owner_request_with_queue_deadline(
                     &endpoint,
                     OwnerRequest::Diagnostics {
                         documents: Vec::new(),
                     },
+                    queue_deadline_remaining(queue_deadline)?,
                 )
                 .await?;
                 diagnostics.import_state(&state["state"]);
@@ -261,6 +259,7 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
     let mut dispatcher = OwnerQueryDispatcher {
         endpoint: &endpoint,
         request_timeout,
+        queue_deadline,
         configuration: &configuration,
         workspace: &workspace,
         server: &authorized.server.name,
@@ -319,17 +318,45 @@ fn capabilities_from_owner(value: &Value) -> Capabilities {
     }
 }
 
-fn queue_deadline_failure(deadline: &str) -> ContractFailure {
-    ContractFailure {
-        exit_code: 4,
-        category: "unavailable",
-        code: "queue_deadline_exceeded",
-        message: "The invocation deadline expired before the operation completed.".to_owned(),
-        stage: "queue",
-        delivery: "not_sent",
-        retry: "safe",
-        data: json!({"deadline": deadline, "waitedMs": duration_millis(deadline)}),
+#[derive(Clone, Copy)]
+struct QueueDeadline {
+    started: Instant,
+    duration: Duration,
+}
+
+impl QueueDeadline {
+    fn new(duration: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            duration,
+        }
     }
+}
+
+fn queue_deadline_remaining(
+    deadline: Option<QueueDeadline>,
+) -> Result<Option<Duration>, ContractFailure> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    let elapsed = deadline.started.elapsed();
+    let Some(remaining) = deadline.duration.checked_sub(elapsed) else {
+        return Err(ContractFailure {
+            exit_code: 4,
+            category: "unavailable",
+            code: "queue_deadline_exceeded",
+            message: "The invocation deadline expired before the operation was dispatched."
+                .to_owned(),
+            stage: "queue",
+            delivery: "not_sent",
+            retry: "safe",
+            data: json!({
+                "deadline": format_duration(deadline.duration),
+                "waitedMs": elapsed.as_millis() as u64
+            }),
+        });
+    };
+    Ok(Some(remaining))
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -343,6 +370,7 @@ fn format_duration(duration: Duration) -> String {
 struct OwnerQueryDispatcher<'a> {
     endpoint: &'a OwnerEndpoint,
     request_timeout: Duration,
+    queue_deadline: Option<QueueDeadline>,
     configuration: &'a LoadedConfiguration,
     workspace: &'a crate::workspace::Workspace,
     server: &'a str,
@@ -385,8 +413,9 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
                 params["workDoneToken"] = json!(format!("lspc-work-{}", random_hex(16)?));
             }
         }
+        let queue_deadline = queue_deadline_remaining(self.queue_deadline)?;
         let mut response = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(send_owner_request(
+            tokio::runtime::Handle::current().block_on(send_owner_request_with_queue_deadline(
                 self.endpoint,
                 OwnerRequest::Dispatch {
                     method: request.method,
@@ -398,6 +427,7 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
                     trace_protocol: request.trace_protocol,
                     apply_edits: request.apply_edits,
                 },
+                queue_deadline,
             ))
         })?;
         let result = response
@@ -807,6 +837,14 @@ async fn send_owner_request(
     endpoint: &OwnerEndpoint,
     request: OwnerRequest,
 ) -> Result<Value, ContractFailure> {
+    send_owner_request_with_queue_deadline(endpoint, request, None).await
+}
+
+async fn send_owner_request_with_queue_deadline(
+    endpoint: &OwnerEndpoint,
+    request: OwnerRequest,
+    queue_deadline: Option<Duration>,
+) -> Result<Value, ContractFailure> {
     if endpoint.owner_protocol_version != OWNER_PROTOCOL_VERSION {
         return Err(ContractFailure {
             exit_code: 4,
@@ -831,6 +869,7 @@ async fn send_owner_request(
         session_identity: endpoint.session_identity.clone(),
         owner_generation: endpoint.owner_generation.clone(),
         token: endpoint.token.clone(),
+        queue_deadline_ms: queue_deadline.map(|deadline| deadline.as_millis() as u64),
         request,
     };
     write_owner_message(&mut stream, &authenticated)

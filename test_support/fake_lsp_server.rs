@@ -3,7 +3,9 @@
 use std::{
     collections::BTreeSet,
     env,
+    fs::File,
     io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
     process::ExitCode,
     thread,
     time::Duration,
@@ -49,6 +51,8 @@ impl Scenario {
 }
 
 fn main() -> ExitCode {
+    let event_log =
+        env::args().find_map(|argument| argument.strip_prefix("--event-log=").map(PathBuf::from));
     match Scenario::from_arguments() {
         Ok(Scenario::Crash) => ExitCode::from(42),
         Ok(Scenario::Hang) => {
@@ -59,7 +63,7 @@ fn main() -> ExitCode {
         Ok(Scenario::MalformedJson) => raw(b"Content-Length: 9\r\n\r\n{not json"),
         Ok(Scenario::ConflictingLength) => raw(b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"),
         Ok(Scenario::OversizedFrame) => raw(b"Content-Length: 67108865\r\n\r\n"),
-        Ok(scenario) => serve(scenario),
+        Ok(scenario) => serve(scenario, event_log),
         Err(error) => {
             eprintln!("lspc fake server: {error}");
             ExitCode::from(2)
@@ -80,9 +84,13 @@ fn raw(bytes: &[u8]) -> ExitCode {
     }
 }
 
-fn serve(scenario: Scenario) -> ExitCode {
+fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = io::stdout().lock();
+    let mut event_log = match event_log.map(File::create).transpose() {
+        Ok(log) => log,
+        Err(_) => return ExitCode::from(1),
+    };
     let mut delayed = None;
     let mut open_documents = BTreeSet::new();
     loop {
@@ -98,6 +106,15 @@ fn serve(scenario: Scenario) -> ExitCode {
                 return ExitCode::from(65);
             }
         };
+        if let (Some(log), Some(method)) = (
+            event_log.as_mut(),
+            message.get("method").and_then(Value::as_str),
+        ) && writeln!(log, "{method}")
+            .and_then(|()| log.flush())
+            .is_err()
+        {
+            return ExitCode::from(1);
+        }
         match message.get("method").and_then(Value::as_str) {
             Some("exit") => return ExitCode::SUCCESS,
             Some("initialize") => {
@@ -227,13 +244,13 @@ fn serve(scenario: Scenario) -> ExitCode {
                         if write_frame(&mut output, &callback, scenario).is_err() {
                             return false;
                         }
-                        read_frame(&mut input)
-                            .ok()
-                            .flatten()
-                            .and_then(|response| {
-                                response.pointer("/result/applied").and_then(Value::as_bool)
-                            })
-                            .unwrap_or(false)
+                        read_callback_result(
+                            &mut input,
+                            &mut open_documents,
+                            &json!("fixture-apply-edit"),
+                        )
+                        .and_then(|result| result.get("applied").and_then(Value::as_bool))
+                        .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 if result(
@@ -270,11 +287,12 @@ fn serve(scenario: Scenario) -> ExitCode {
                 if write_frame(&mut output, &callback, scenario).is_err() {
                     return ExitCode::from(1);
                 }
-                let callback_response = read_frame(&mut input)
-                    .ok()
-                    .flatten()
-                    .and_then(|response| response.get("result").cloned())
-                    .unwrap_or(Value::Null);
+                let callback_response = read_callback_result(
+                    &mut input,
+                    &mut open_documents,
+                    &json!("fixture-preview-edit"),
+                )
+                .unwrap_or(Value::Null);
                 if result(
                     &mut output,
                     &message,
@@ -349,7 +367,12 @@ fn serve(scenario: Scenario) -> ExitCode {
                 if marker.is_none_or(|marker| std::fs::write(marker, b"ready\n").is_err()) {
                     return ExitCode::from(1);
                 }
-                thread::sleep(Duration::from_millis(100));
+                let sleep_ms = message
+                    .pointer("/params/sleepMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100)
+                    .min(5_000);
+                thread::sleep(Duration::from_millis(sleep_ms));
                 if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
                     return ExitCode::from(1);
                 }
@@ -377,6 +400,38 @@ fn serve(scenario: Scenario) -> ExitCode {
                         .is_err() =>
             {
                 return ExitCode::from(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_callback_result<R: BufRead>(
+    input: &mut R,
+    open_documents: &mut BTreeSet<String>,
+    callback_id: &Value,
+) -> Option<Value> {
+    loop {
+        let message = read_frame(input).ok().flatten()?;
+        if message.get("method").is_none() && message.get("id") == Some(callback_id) {
+            return message.get("result").cloned();
+        }
+        match message.get("method").and_then(Value::as_str) {
+            Some("textDocument/didOpen") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.insert(uri.to_owned());
+                }
+            }
+            Some("textDocument/didClose") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.remove(uri);
+                }
             }
             _ => {}
         }

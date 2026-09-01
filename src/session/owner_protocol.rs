@@ -33,6 +33,8 @@ pub(crate) struct AuthenticatedOwnerRequest {
     pub(crate) session_identity: String,
     pub(crate) owner_generation: String,
     pub(crate) token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queue_deadline_ms: Option<u64>,
     pub(crate) request: OwnerRequest,
 }
 

@@ -66,10 +66,6 @@ pub(crate) fn acquire_workspace_application_lock(
     Ok(lock)
 }
 
-pub(crate) fn mark_receipt_session_synchronized(receipt_id: &str) -> Result<(), ContractFailure> {
-    MutationStateStore::open()?.mark_receipt_session_synchronized(receipt_id)
-}
-
 fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let workspace = invocation.option_path("--workspace").unwrap();
     let server_name = invocation.option_string("--server").unwrap();
@@ -159,7 +155,7 @@ pub(crate) fn create_query_preview(
 /// Plans and immediately applies one Workspace Edit preauthorized by an
 /// `execute-command --apply-edits` invocation.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_preauthorized_workspace_edit(
+pub(crate) fn apply_preauthorized_workspace_edit<F>(
     workspace_path: &std::path::Path,
     workspace_uri: &str,
     server: &str,
@@ -170,7 +166,11 @@ pub(crate) fn apply_preauthorized_workspace_edit(
     previews: &PreviewSettings,
     receipts: &ReceiptSettings,
     mutation: &MutationSettings,
-) -> Result<Value, ContractFailure> {
+    post_commit: &mut F,
+) -> Result<Value, ContractFailure>
+where
+    F: FnMut() -> bool,
+{
     let planner = WorkspaceEditPlanner::open(
         workspace_path,
         workspace_uri,
@@ -248,16 +248,17 @@ pub(crate) fn apply_preauthorized_workspace_edit(
         recovery_manifest_digest,
         previews,
     )?;
-    let context = ApplicationContext {
+    let mut synchronize = |_: &state::ReceiptRecord| post_commit();
+    let mut context = ApplicationContext {
         store: &store,
         preview_limits: previews,
         receipt_limits: receipts,
         mutation_limits: mutation,
         reauthorize: None,
-        post_commit: None,
+        post_commit: Some(&mut synchronize),
         preauthorized: true,
     };
-    apply_preview(&context, &preview_id)
+    apply_preview(&mut context, &preview_id)
 }
 
 /// Validates and persists a server-initiated edit that was not preauthorized.
@@ -506,7 +507,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
         && receipt.receipt.outcome == "applied"
     {
         let (previews, receipts, mutation) = default_mutation_settings();
-        let context = ApplicationContext {
+        let mut context = ApplicationContext {
             store: &store,
             preview_limits: &previews,
             receipt_limits: &receipts,
@@ -515,7 +516,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             post_commit: None,
             preauthorized: false,
         };
-        apply_preview(&context, &id)?
+        apply_preview(&mut context, &id)?
     } else {
         let preview = store.read_preview(&id)?;
         let configuration = load_configuration(
@@ -523,23 +524,23 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             invocation.has_option("--ignore-project-config"),
         )?;
         let reauthorize = |stored: &StoredPreview| reauthorize_preview(invocation, &store, stored);
-        let synchronize = |receipt: &state::ReceiptRecord| {
+        let mut synchronize = |receipt: &state::ReceiptRecord| {
             let (_, failures) = crate::session::refresh_workspace_owners(
                 &receipt.workspace_uri,
                 receipt.server.as_deref(),
             );
             failures.is_empty()
         };
-        let context = ApplicationContext {
+        let mut context = ApplicationContext {
             store: &store,
             preview_limits: &configuration.previews,
             receipt_limits: &configuration.receipts,
             mutation_limits: &configuration.mutation,
             reauthorize: Some(&reauthorize),
-            post_commit: Some(&synchronize),
+            post_commit: Some(&mut synchronize),
             preauthorized: false,
         };
-        apply_preview(&context, &id)?
+        apply_preview(&mut context, &id)?
     };
     synchronize_application_receipt(&store, application)
 }
