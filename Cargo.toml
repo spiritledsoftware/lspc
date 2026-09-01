@@ -8,6 +8,9 @@ repository = "https://github.com/spiritledsoftware/lspc"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[features]
+fake-server = []
+
 [dependencies]
 atomic-write-file = "0.3"
 clap = { version = "4.5", features = ["string"] }
@@ -38,3 +41,8 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "lspc-fake-server"
+path = "test_support/fake_lsp_server.rs"
+required-features = ["fake-server"]

@@ -1,0 +1,219 @@
+//! Independently framed deterministic LSP fixture for acceptance tests.
+
+use std::{
+    env,
+    io::{self, BufRead, BufReader, Write},
+    process::ExitCode,
+    thread,
+    time::Duration,
+};
+
+use serde_json::{Value, json};
+
+const BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Standard,
+    Fragmented,
+    Delayed,
+    OutOfOrder,
+    MalformedHeader,
+    MalformedJson,
+    ConflictingLength,
+    OversizedFrame,
+    Crash,
+    Hang,
+}
+
+impl Scenario {
+    fn from_arguments() -> Result<Self, String> {
+        let value = env::args()
+            .find_map(|argument| argument.strip_prefix("--scenario=").map(str::to_owned))
+            .unwrap_or_else(|| "standard".to_owned());
+        match value.as_str() {
+            "standard" => Ok(Self::Standard),
+            "fragmented" => Ok(Self::Fragmented),
+            "delayed" => Ok(Self::Delayed),
+            "out-of-order" => Ok(Self::OutOfOrder),
+            "malformed-header" => Ok(Self::MalformedHeader),
+            "malformed-json" => Ok(Self::MalformedJson),
+            "conflicting-length" => Ok(Self::ConflictingLength),
+            "oversized-frame" => Ok(Self::OversizedFrame),
+            "crash" => Ok(Self::Crash),
+            "hang" => Ok(Self::Hang),
+            _ => Err(format!("unknown scenario: {value}")),
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match Scenario::from_arguments() {
+        Ok(Scenario::Crash) => ExitCode::from(42),
+        Ok(Scenario::Hang) => {
+            thread::sleep(Duration::from_secs(30));
+            ExitCode::SUCCESS
+        }
+        Ok(Scenario::MalformedHeader) => raw(b"Content-Length nope\r\n\r\n"),
+        Ok(Scenario::MalformedJson) => raw(b"Content-Length: 9\r\n\r\n{not json"),
+        Ok(Scenario::ConflictingLength) => raw(b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"),
+        Ok(Scenario::OversizedFrame) => raw(b"Content-Length: 67108865\r\n\r\n"),
+        Ok(scenario) => serve(scenario),
+        Err(error) => {
+            eprintln!("lspc fake server: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn raw(bytes: &[u8]) -> ExitCode {
+    let mut output = io::stdout().lock();
+    if output
+        .write_all(bytes)
+        .and_then(|()| output.flush())
+        .is_ok()
+    {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn serve(scenario: Scenario) -> ExitCode {
+    let mut input = BufReader::new(io::stdin().lock());
+    let mut output = io::stdout().lock();
+    let mut delayed = None;
+    loop {
+        let message = match read_frame(&mut input) {
+            Ok(Some(message)) => message,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = write_frame(
+                    &mut output,
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error}}),
+                    scenario,
+                );
+                return ExitCode::from(65);
+            }
+        };
+        match message.get("method").and_then(Value::as_str) {
+            Some("exit") => return ExitCode::SUCCESS,
+            Some("initialize") => {
+                for response in [
+                    json!({"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"fixture initialized"}}),
+                    json!({"jsonrpc":"2.0","method":"$/progress","params":{"token":"fixture-progress","value":{"kind":"begin","title":"fixture"}}}),
+                    json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///fixture.rs","diagnostics":[]}}),
+                    json!({"jsonrpc":"2.0","id":"fixture-callback","method":"client/registerCapability","params":{"registrations":[]}}),
+                ] {
+                    if write_frame(&mut output, &response, scenario).is_err() {
+                        return ExitCode::from(1);
+                    }
+                }
+                if result(&mut output, &message, json!({"capabilities":{}}), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/slow") => delayed = Some(message),
+            Some("test/fast") => {
+                if result(&mut output, &message, json!("fast"), scenario).is_err()
+                    || delayed.take().is_some_and(|request| {
+                        result(&mut output, &request, json!("slow"), scenario).is_err()
+                    })
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("shutdown") => {
+                return if result(&mut output, &message, Value::Null, scenario).is_ok() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Some(_)
+                if message.get("id").is_some()
+                    && result(&mut output, &message, json!({"fixture":true}), scenario)
+                        .is_err() =>
+            {
+                return ExitCode::from(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn result(
+    output: &mut impl Write,
+    request: &Value,
+    result: Value,
+    scenario: Scenario,
+) -> Result<(), ()> {
+    let Some(id) = request.get("id") else {
+        return Ok(());
+    };
+    if scenario == Scenario::Delayed {
+        thread::sleep(Duration::from_millis(40));
+    }
+    write_frame(
+        output,
+        &json!({"jsonrpc":"2.0","id":id,"result":result}),
+        scenario,
+    )
+}
+
+fn read_frame(input: &mut impl BufRead) -> Result<Option<Value>, String> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        if input
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            return if content_length.is_none() {
+                Ok(None)
+            } else {
+                Err("truncated header".to_owned())
+            };
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:")
+            && content_length
+                .replace(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| "invalid Content-Length")?,
+                )
+                .is_some()
+        {
+            return Err("duplicate Content-Length".to_owned());
+        }
+    }
+    let length = content_length.ok_or_else(|| "missing Content-Length".to_owned())?;
+    if length > BODY_LIMIT {
+        return Err("body too large".to_owned());
+    }
+    let mut body = vec![0; length];
+    input
+        .read_exact(&mut body)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|error| error.to_string())
+}
+
+fn write_frame(output: &mut impl Write, message: &Value, scenario: Scenario) -> Result<(), ()> {
+    let body = serde_json::to_vec(message).map_err(|_| ())?;
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend(body);
+    for chunk in frame.chunks(if scenario == Scenario::Fragmented {
+        3
+    } else {
+        frame.len().max(1)
+    }) {
+        output.write_all(chunk).map_err(|_| ())?;
+        output.flush().map_err(|_| ())?;
+    }
+    Ok(())
+}
