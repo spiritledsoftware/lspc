@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -112,7 +112,8 @@ pub(crate) struct ProtocolSettings {
     pub(crate) max_partial_result_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PreviewSettings {
     pub(crate) max_count: u64,
     pub(crate) max_total_bytes: u64,
@@ -120,12 +121,14 @@ pub(crate) struct PreviewSettings {
     pub(crate) max_text_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReceiptSettings {
     pub(crate) max_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MutationSettings {
     pub(crate) application_lock_timeout: String,
     pub(crate) max_entries: u64,

@@ -61,6 +61,70 @@ impl DiagnosticCache {
         }
     }
 
+    /// Exports the bounded Owner cache for one short-lived CLI Query process.
+    pub(crate) fn export_state(&mut self) -> Value {
+        self.clock = self.clock.saturating_add(1);
+        let clock = self.clock;
+        Value::Array(
+            self.snapshots
+                .iter_mut()
+                .map(|(key, snapshot)| {
+                    snapshot.last_used = clock;
+                    json!({
+                        "kind": if key.starts_with("push\0") { "push" } else { "pull" },
+                        "uri": snapshot.uri,
+                        "version": snapshot.version,
+                        "diagnostics": snapshot.diagnostics,
+                        "rawReport": snapshot.raw_report,
+                        "receivedForVersion": snapshot.received_for_version,
+                        "closed": snapshot.closed
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Imports a trusted Owner cache snapshot into a short-lived Query cache.
+    pub(crate) fn import_state(&mut self, state: &Value) {
+        let Some(records) = state.as_array() else {
+            return;
+        };
+        for record in records {
+            let Some(uri) = record.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            if record.get("kind").and_then(Value::as_str) == Some("pull") {
+                self.apply_pull_report(
+                    uri,
+                    record.get("rawReport").cloned().unwrap_or(Value::Null),
+                );
+            } else {
+                let version = record.get("version").and_then(Value::as_i64);
+                let current_version = record
+                    .get("receivedForVersion")
+                    .and_then(Value::as_i64)
+                    .or(version);
+                self.publish(
+                    uri,
+                    version,
+                    record
+                        .get("diagnostics")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new())),
+                    current_version,
+                    current_version.is_some(),
+                );
+            }
+            if record
+                .get("closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                self.mark_closed(uri);
+            }
+        }
+    }
+
     pub(crate) fn publish(
         &mut self,
         uri: &str,

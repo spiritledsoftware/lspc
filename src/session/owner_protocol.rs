@@ -44,6 +44,10 @@ pub(crate) enum OwnerRequest {
     Logs {
         tail: usize,
     },
+    Diagnostics {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        documents: Vec<OwnerDocumentInput>,
+    },
     Stop {
         force: bool,
     },
@@ -51,9 +55,20 @@ pub(crate) enum OwnerRequest {
         method: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        documents: Vec<OwnerDocumentInput>,
         request_timeout_ms: u64,
         trace_protocol: bool,
+        apply_edits: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OwnerDocumentInput {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) language_id: String,
+    pub(crate) expected_digest: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +124,12 @@ pub(crate) struct OwnerLaunchSettings {
     pub(crate) max_partial_result_bytes: usize,
     pub(crate) max_diagnostic_snapshots: u64,
     pub(crate) max_diagnostic_bytes: u64,
+    pub(crate) max_open_documents: u64,
+    pub(crate) max_document_bytes: u64,
+    pub(crate) max_total_text_bytes: u64,
+    pub(crate) previews: crate::configuration::PreviewSettings,
+    pub(crate) receipts: crate::configuration::ReceiptSettings,
+    pub(crate) mutation: crate::configuration::MutationSettings,
     pub(crate) trace_initialization: bool,
 }
 

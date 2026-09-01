@@ -39,6 +39,7 @@ pub(crate) struct ApplicationContext<'a> {
     pub(crate) receipt_limits: &'a ReceiptSettings,
     pub(crate) mutation_limits: &'a MutationSettings,
     pub(crate) reauthorize: Option<&'a ReauthorizePreview<'a>>,
+    pub(crate) preauthorized: bool,
 }
 
 /// Applies one exact Preview under the Workspace lock and records at-most-once completion.
@@ -201,7 +202,7 @@ pub(crate) fn apply_preview(
             session_identity: Some(stored.preview.session_identity.clone()),
             preview_id: Some(preview_id.to_owned()),
             linked_receipt_id: None,
-            preauthorized: false,
+            preauthorized: context.preauthorized,
             started_at,
             completed_at: now_rfc3339(),
             outcome: "applied".to_owned(),
@@ -243,7 +244,7 @@ pub(crate) fn apply_preview(
                 session_identity: Some(stored.preview.session_identity.clone()),
                 preview_id: Some(preview_id.to_owned()),
                 linked_receipt_id: None,
-                preauthorized: false,
+                preauthorized: context.preauthorized,
                 started_at,
                 completed_at: now_rfc3339(),
                 outcome: "rolled_back".to_owned(),
@@ -302,7 +303,7 @@ pub(crate) fn apply_preview(
                 session_identity: Some(stored.preview.session_identity.clone()),
                 preview_id: Some(preview_id.to_owned()),
                 linked_receipt_id: None,
-                preauthorized: false,
+                preauthorized: context.preauthorized,
                 started_at,
                 completed_at: now_rfc3339(),
                 outcome: "recovery_required".to_owned(),
@@ -1082,7 +1083,7 @@ fn application_success(receipt: &ReceiptRecord, outcome: &str) -> Value {
     })
 }
 
-fn lock_workspace(
+pub(crate) fn lock_workspace(
     file: &File,
     workspace_uri: &str,
     timeout_text: &str,
@@ -1300,6 +1301,7 @@ mod tests {
             receipt_limits: &receipt_limits,
             mutation_limits: &mutation_limits,
             reauthorize: None,
+            preauthorized: false,
         };
         let first = apply_preview(&context, &id).unwrap();
         let second = apply_preview(&context, &id).unwrap();

@@ -17,6 +17,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_server_arguments(&[])
+    }
+
+    fn with_server_arguments(arguments: &[&str]) -> Self {
         let root = TempDir::new().unwrap();
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -59,11 +63,12 @@ impl Fixture {
         };
 
         fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let arguments = serde_json::to_string(arguments).unwrap();
         fs::write(
             config,
             format!(
-                "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\n",
-                env!("CARGO_BIN_EXE_lspc-fake-server")
+                "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\nargs = {}\n",
+                env!("CARGO_BIN_EXE_lspc-fake-server"), arguments
             ),
         )
         .unwrap();
@@ -93,6 +98,56 @@ impl Fixture {
         }
         command.output().unwrap()
     }
+}
+
+#[test]
+fn owner_correlates_simultaneous_requests_that_complete_out_of_order() {
+    let fixture = Fixture::with_server_arguments(&["--scenario=out-of-order"]);
+    let workspace = fixture.workspace.to_str().unwrap();
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/start",
+    ]);
+
+    std::thread::scope(|scope| {
+        let slow = scope.spawn(|| {
+            fixture.command(&[
+                "raw",
+                "--workspace",
+                workspace,
+                "--server",
+                "fake",
+                "--method",
+                "test/slow",
+            ])
+        });
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        let fast = fixture.command(&[
+            "raw",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+            "--method",
+            "test/fast",
+        ]);
+        assert_eq!(fast["result"], "fast");
+        assert_eq!(slow.join().unwrap()["result"], "slow");
+    });
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
 }
 
 #[test]
@@ -152,6 +207,26 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
         capabilities["result"]["providers"]["definition"]["state"],
         "supported"
     );
+
+    let edited = fixture.workspace.join("edited.rs");
+    fs::write(&edited, "old\n").unwrap();
+    let edited_uri = url::Url::from_file_path(&edited).unwrap().to_string();
+    let executed = fixture.command(&[
+        "execute-command",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--command",
+        "fixture.run",
+        "--arguments-json",
+        &serde_json::to_string(&vec![edited_uri]).unwrap(),
+        "--apply-edits",
+    ]);
+    assert_eq!(executed["result"]["callbackApplied"], true);
+    assert_eq!(executed["applyEditLedger"][0]["applied"], true);
+    assert_eq!(executed["applyEditLedger"][0]["outcome"], "applied");
+    assert_eq!(fs::read_to_string(edited).unwrap(), "new\n");
 
     let listed = fixture.command(&["session", "list", "--workspace", workspace]);
     assert_eq!(listed["result"].as_array().unwrap().len(), 1);

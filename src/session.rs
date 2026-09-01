@@ -124,7 +124,7 @@ pub(crate) fn dispatch_owner_query_command(
             _ => TextSynchronization::None,
         };
 
-        let document = if let Some(path) = invocation.option_path("--file") {
+        let mut document = if let Some(path) = invocation.option_path("--file") {
             let path = validate_document_scope(
                 &workspace,
                 &path,
@@ -154,6 +154,35 @@ pub(crate) fn dispatch_owner_query_command(
             configuration.synchronization.max_diagnostic_snapshots,
             configuration.synchronization.max_diagnostic_bytes,
         );
+        if invocation.command_path().first().is_some_and(|command| {
+            matches!(
+                command.as_str(),
+                "document-diagnostics" | "workspace-diagnostics" | "published-diagnostics"
+            )
+        }) {
+            let synchronized = document
+                .as_ref()
+                .map(|snapshot| owner_protocol::OwnerDocumentInput {
+                    path: snapshot.path.clone(),
+                    language_id: snapshot.language_id.clone(),
+                    expected_digest: snapshot.digest.clone(),
+                })
+                .into_iter()
+                .collect();
+            let state = send_owner_request(
+                &endpoint,
+                OwnerRequest::Diagnostics {
+                    documents: synchronized,
+                },
+            )
+            .await?;
+            diagnostics.import_state(&state["state"]);
+            if let Some(document) = &mut document
+                && let Some(version) = state["documentVersions"][&document.uri].as_i64()
+            {
+                document.version = version;
+            }
+        }
         let composed = compose(
             invocation,
             document.as_ref(),
@@ -168,12 +197,20 @@ pub(crate) fn dispatch_owner_query_command(
             owner_generation: endpoint.owner_generation.clone(),
             result_position_encoding: position_encoding,
             synchronization: json!({
-                "mode": match text_synchronization {
-                    TextSynchronization::None => "none",
-                    TextSynchronization::OpenClose => "open_close",
+                "mode": if invocation.command_path().first().is_some_and(|command| command == "workspace-diagnostics") {
+                    "workspace"
+                } else if document.is_some() {
+                    "document"
+                } else {
+                    "none"
                 },
                 "bestEffort": false,
-                "before": [],
+                "before": document.as_ref().map(|snapshot| json!({
+                    "uri": snapshot.uri,
+                    "digest": snapshot.digest,
+                    "version": snapshot.version,
+                    "languageId": snapshot.language_id
+                })).into_iter().collect::<Vec<_>>(),
                 "failures": [],
                 "postResponseChanged": []
             }),
@@ -182,6 +219,17 @@ pub(crate) fn dispatch_owner_query_command(
         let mut dispatcher = OwnerQueryDispatcher {
             endpoint: &endpoint,
             request_timeout,
+            configuration: &configuration,
+            workspace: &workspace,
+            server: &authorized.server.name,
+            explicit_language_id: invocation.option_string("--language-id"),
+            explicit_workspace: invocation.has_option("--workspace"),
+            documents: DocumentStore::new(
+                configuration.synchronization.max_open_documents,
+                configuration.synchronization.max_document_bytes,
+                configuration.synchronization.max_total_text_bytes,
+            ),
+            text_synchronization,
         };
         let mut previews = MutationPreviewCreator {
             configuration: &configuration,
@@ -233,6 +281,13 @@ fn capabilities_from_owner(value: &Value) -> Capabilities {
 struct OwnerQueryDispatcher<'a> {
     endpoint: &'a OwnerEndpoint,
     request_timeout: Duration,
+    configuration: &'a LoadedConfiguration,
+    workspace: &'a crate::workspace::Workspace,
+    server: &'a str,
+    explicit_language_id: Option<String>,
+    explicit_workspace: bool,
+    documents: DocumentStore,
+    text_synchronization: TextSynchronization,
 }
 
 impl SessionDispatcher for OwnerQueryDispatcher<'_> {
@@ -240,6 +295,26 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
         &mut self,
         mut request: DispatchRequest,
     ) -> Result<DispatchResponse, ContractFailure> {
+        let mut synchronized = Vec::new();
+        for path in &request.synchronized_files {
+            let path =
+                validate_document_scope(self.workspace, path, self.explicit_workspace, false)?;
+            let language_id = crate::configuration::document_language_id(
+                self.configuration,
+                self.server,
+                &path,
+                self.explicit_language_id.as_deref(),
+            )?;
+            let snapshot = self
+                .documents
+                .refresh(&path, &language_id, self.text_synchronization)?
+                .snapshot;
+            synchronized.push(owner_protocol::OwnerDocumentInput {
+                path: snapshot.path,
+                language_id: snapshot.language_id,
+                expected_digest: snapshot.digest,
+            });
+        }
         if let Some(params) = request.params.as_mut() {
             if request.partial_results && params.is_object() {
                 params["partialResultToken"] = json!(format!("lspc-partial-{}", random_hex(16)?));
@@ -253,8 +328,10 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
                 self.endpoint,
                 request.method,
                 request.params,
+                synchronized,
                 self.request_timeout,
                 request.trace_protocol,
+                request.apply_edits,
             ))
         })?;
         let result = response
@@ -269,11 +346,20 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
             .and_then(|object| object.remove("partialResults"))
             .and_then(|value| value.as_array().cloned())
             .unwrap_or_default();
+        let apply_edit_ledger = response
+            .as_object_mut()
+            .and_then(|object| object.remove("applyEditLedger"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        let synchronization = response
+            .as_object_mut()
+            .and_then(|object| object.remove("synchronization"));
         Ok(DispatchResponse {
             result,
             partial_results,
             trace,
-            apply_edit_ledger: Vec::new(),
+            apply_edit_ledger,
+            synchronization,
         })
     }
 }
@@ -343,6 +429,12 @@ pub(crate) async fn connect_or_start_owner(
         max_partial_result_bytes: configuration.protocol.max_partial_result_bytes as usize,
         max_diagnostic_snapshots: configuration.synchronization.max_diagnostic_snapshots,
         max_diagnostic_bytes: configuration.synchronization.max_diagnostic_bytes,
+        max_open_documents: configuration.synchronization.max_open_documents,
+        max_document_bytes: configuration.synchronization.max_document_bytes,
+        max_total_text_bytes: configuration.synchronization.max_total_text_bytes,
+        previews: configuration.previews.clone(),
+        receipts: configuration.receipts.clone(),
+        mutation: configuration.mutation.clone(),
         trace_initialization,
     };
     write_private_json(&launch_path, &launch).map_err(|error| {
@@ -426,16 +518,20 @@ pub(crate) async fn dispatch_owner_request(
     endpoint: &OwnerEndpoint,
     method: String,
     params: Option<Value>,
+    documents: Vec<owner_protocol::OwnerDocumentInput>,
     request_timeout: Duration,
     trace_protocol: bool,
+    apply_edits: bool,
 ) -> Result<Value, ContractFailure> {
     send_owner_request(
         endpoint,
         OwnerRequest::Dispatch {
             method,
             params,
+            documents,
             request_timeout_ms: request_timeout.as_millis() as u64,
             trace_protocol,
+            apply_edits,
         },
     )
     .await
@@ -589,6 +685,33 @@ async fn live_endpoints() -> Result<Vec<OwnerEndpoint>, ContractFailure> {
         }
     }
     Ok(endpoints)
+}
+
+/// Drains live Owners whose authorization may have changed.
+pub(crate) fn signal_workspace_owners(
+    workspace_uri: &str,
+    servers: &[String],
+) -> (Vec<String>, Vec<String>) {
+    run_async(async {
+        let Ok(endpoints) = live_endpoints().await else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut signalled = Vec::new();
+        let mut failures = Vec::new();
+        for endpoint in endpoints.into_iter().filter(|endpoint| {
+            endpoint.workspace_uri == workspace_uri
+                && servers.iter().any(|server| server == &endpoint.server)
+        }) {
+            let generation = endpoint.owner_generation.clone();
+            match send_owner_request(&endpoint, OwnerRequest::Stop { force: false }).await {
+                Ok(_) => signalled.push(generation),
+                Err(_) => failures.push(generation),
+            }
+        }
+        signalled.sort();
+        failures.sort();
+        (signalled, failures)
+    })
 }
 
 async fn probe_endpoint(endpoint: &OwnerEndpoint) -> Result<(), ContractFailure> {

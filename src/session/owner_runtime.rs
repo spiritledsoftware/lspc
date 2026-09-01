@@ -27,16 +27,19 @@ use super::{
         CAPABILITY_PROFILE_VERSION, NegotiatedCapabilities, fixed_initialize_capabilities,
         normalize_initialize_result,
     },
-    json_rpc_transport::{JsonRpcFrameReader, JsonRpcFrameWriter},
+    json_rpc_transport::{JsonRpcFrame, JsonRpcFrameReader, JsonRpcFrameWriter},
     owner_protocol::{
-        AuthenticatedOwnerRequest, OWNER_PROTOCOL_VERSION, OWNER_QUEUE_LIMIT, OwnerEndpoint,
-        OwnerLaunchSettings, OwnerRequest, OwnerResponse, constant_time_token_matches,
-        read_owner_message, write_owner_message,
+        AuthenticatedOwnerRequest, OWNER_PROTOCOL_VERSION, OWNER_QUEUE_LIMIT, OwnerDocumentInput,
+        OwnerEndpoint, OwnerLaunchSettings, OwnerRequest, OwnerResponse,
+        constant_time_token_matches, read_owner_message, write_owner_message,
     },
     process_supervision::SupervisedServerProcess,
     session_log::SessionLog,
 };
-use crate::workspace::DiagnosticCache;
+use crate::{
+    contract::ContractFailure,
+    workspace::{DiagnosticCache, DocumentStore, SynchronizationEvent},
+};
 
 const TRACE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -60,6 +63,30 @@ struct PendingOwnerRequest {
     cancelled: watch::Receiver<bool>,
 }
 
+struct ActiveQuery {
+    method: String,
+    params: Option<Value>,
+    started_at: String,
+    response: Option<oneshot::Sender<OwnerResponse>>,
+    cancelled: watch::Receiver<bool>,
+    deadline: TokioInstant,
+    timeout: Duration,
+    cancellation: Option<QueryCancellation>,
+    partial_token: Option<Value>,
+    partial_items: Vec<Value>,
+    partial_bytes: usize,
+    trace: Option<ProtocolTrace>,
+    documents: Vec<OwnerDocumentInput>,
+    apply_edits: bool,
+    apply_edit_ledger: Vec<Value>,
+    synchronization: Value,
+}
+
+struct QueryCancellation {
+    deadline: TokioInstant,
+    failure: Value,
+}
+
 struct LspRuntime {
     process: SupervisedServerProcess,
     reader: JsonRpcFrameReader<tokio::process::ChildStdout>,
@@ -68,16 +95,22 @@ struct LspRuntime {
     next_request_id: i64,
     negotiated: NegotiatedCapabilities,
     diagnostics: DiagnosticCache,
+    documents: DocumentStore,
     progress: BTreeMap<String, Value>,
     settings: Value,
     workspace_uri: String,
     workspace_path: PathBuf,
+    server: String,
+    session_identity: String,
     workspace_folder: Value,
     cancellation_grace: Duration,
     shutdown_timeout: Duration,
     max_partial_result_bytes: usize,
     log: SessionLog,
     startup_trace: Option<ProtocolTrace>,
+    preview_settings: crate::configuration::PreviewSettings,
+    receipt_settings: crate::configuration::ReceiptSettings,
+    mutation_settings: crate::configuration::MutationSettings,
 }
 
 pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
@@ -124,13 +157,14 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
     let mut idle_deadline =
         last_connection_closed + Duration::from_millis(settings.idle_timeout_ms);
     let mut should_stop = false;
+    let mut active_queries = BTreeMap::new();
 
     while !should_stop {
         let idle_sleep = tokio_time::sleep_until(TokioInstant::from_std(idle_deadline));
         tokio::pin!(idle_sleep);
         tokio::select! {
             pending = requests_rx.recv() => {
-                let Some(mut pending) = pending else { break };
+                let Some(pending) = pending else { break };
                 if *pending.cancelled.borrow() {
                     continue;
                 }
@@ -138,7 +172,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     OwnerRequest::Status => {
                         let response = OwnerResponse::success(
                             &bootstrap.owner_generation,
-                            status_result(&bootstrap, &lsp, started, requests_rx.len(), idle_deadline),
+                            status_result(&bootstrap, &lsp, started, requests_rx.len(), &active_queries, idle_deadline),
                         );
                         let _ = pending.response.send(response);
                     }
@@ -160,9 +194,34 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let result = lsp.log.render(&bootstrap.owner_generation, tail);
                         let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
                     }
+                    OwnerRequest::Diagnostics { documents } => {
+                        let response = match lsp.synchronize_documents(&documents).await {
+                            Ok(()) => {
+                                let versions = documents.iter().filter_map(|document| {
+                                    let uri = Url::from_file_path(&document.path).ok()?.to_string();
+                                    let version = lsp.documents.get(&uri)?.version;
+                                    Some((uri, json!(version)))
+                                }).collect::<serde_json::Map<_, _>>();
+                                OwnerResponse::success(&bootstrap.owner_generation, json!({
+                                    "state": lsp.diagnostics.export_state(),
+                                    "documentVersions": versions
+                                }))
+                            }
+                            Err(failure) => OwnerResponse::failure(
+                                &bootstrap.owner_generation,
+                                contract_failure_value(failure),
+                            ),
+                        };
+                        let _ = pending.response.send(response);
+                    }
                     OwnerRequest::Stop { force } => {
                         endpoint.state = "draining".to_owned();
                         let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
+                        fail_active_queries(
+                            &bootstrap.owner_generation,
+                            &mut active_queries,
+                            request_cancelled("owner_stop"),
+                        );
                         if force {
                             lsp.process.terminate_process_tree(Duration::ZERO).await;
                         } else {
@@ -177,18 +236,19 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
                         should_stop = true;
                     }
-                    OwnerRequest::Dispatch { method, params, request_timeout_ms, trace_protocol } => {
-                        let response = lsp
-                            .dispatch_request(
-                                &bootstrap.owner_generation,
-                                method,
-                                params,
-                                Duration::from_millis(request_timeout_ms),
-                                trace_protocol,
-                                &mut pending.cancelled,
-                            )
-                            .await;
-                        let _ = pending.response.send(response);
+                    OwnerRequest::Dispatch { method, params, documents, request_timeout_ms, trace_protocol, apply_edits } => {
+                        lsp.start_dispatch(
+                            &bootstrap.owner_generation,
+                            method,
+                            params,
+                            documents,
+                            Duration::from_millis(request_timeout_ms),
+                            trace_protocol,
+                            apply_edits,
+                            pending.response,
+                            pending.cancelled,
+                            &mut active_queries,
+                        ).await;
                     }
                 }
                 last_connection_closed = Instant::now();
@@ -199,14 +259,59 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     lsp.log.push("server_stderr", "error", stderr);
                 }
             }
-            _ = &mut idle_sleep => {
+            frame = lsp.reader.read_json_rpc_frame_with_bytes() => {
+                match frame {
+                    Ok(Some(frame)) => {
+                        if let Err(error) = lsp.handle_concurrent_frame(
+                            &bootstrap.owner_generation,
+                            frame,
+                            &mut active_queries,
+                        ).await {
+                            lsp.log.push("protocol_violation", "error", &error);
+                            fail_active_queries(
+                                &bootstrap.owner_generation,
+                                &mut active_queries,
+                                protocol_failure(error),
+                            );
+                            lsp.process.terminate_process_tree(Duration::ZERO).await;
+                            should_stop = true;
+                        }
+                    }
+                    Ok(None) => {
+                        let failure = server_exited_failure(lsp.process.try_wait().ok().flatten());
+                        fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure);
+                        should_stop = true;
+                    }
+                    Err(error) => {
+                        fail_active_queries(
+                            &bootstrap.owner_generation,
+                            &mut active_queries,
+                            protocol_failure(error.to_string()),
+                        );
+                        lsp.process.terminate_process_tree(Duration::ZERO).await;
+                        should_stop = true;
+                    }
+                }
+            }
+            _ = &mut idle_sleep, if active_queries.is_empty() => {
                 lsp.log.push("lifecycle", "info", "Owner idle timeout reached");
                 lsp.graceful_shutdown().await;
                 should_stop = true;
             }
-            _ = tokio_time::sleep(Duration::from_millis(100)) => {
+            _ = tokio_time::sleep(Duration::from_millis(25)) => {
+                if lsp.maintain_active_queries(
+                    &bootstrap.owner_generation,
+                    &mut active_queries,
+                ).await {
+                    should_stop = true;
+                }
                 if let Some(status) = lsp.process.try_wait()? {
                     lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
+                    fail_active_queries(
+                        &bootstrap.owner_generation,
+                        &mut active_queries,
+                        server_exited_failure(Some(status)),
+                    );
                     should_stop = true;
                 }
             }
@@ -214,6 +319,11 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
     }
 
     listener_task.abort();
+    fail_active_queries(
+        &bootstrap.owner_generation,
+        &mut active_queries,
+        request_cancelled("owner_stopped"),
+    );
     let _ = fs::remove_file(&bootstrap.endpoint_path);
     drop(owner_lock);
     Ok(())
@@ -263,16 +373,26 @@ impl LspRuntime {
                 settings.max_diagnostic_snapshots,
                 settings.max_diagnostic_bytes,
             ),
+            documents: DocumentStore::new(
+                settings.max_open_documents,
+                settings.max_document_bytes,
+                settings.max_total_text_bytes,
+            ),
             progress: BTreeMap::new(),
             settings: settings.settings.clone(),
             workspace_uri: bootstrap.workspace_uri.clone(),
             workspace_path: bootstrap.workspace_path.clone(),
+            server: bootstrap.server.clone(),
+            session_identity: bootstrap.session_identity.clone(),
             workspace_folder,
             cancellation_grace: Duration::from_millis(settings.cancellation_grace_ms),
             shutdown_timeout: Duration::from_millis(settings.shutdown_timeout_ms),
             max_partial_result_bytes: settings.max_partial_result_bytes,
             log: SessionLog::new(),
             startup_trace: settings.trace_initialization.then(ProtocolTrace::new),
+            preview_settings: settings.previews.clone(),
+            receipt_settings: settings.receipts.clone(),
+            mutation_settings: settings.mutation.clone(),
         };
         runtime
             .log
@@ -369,79 +489,202 @@ impl LspRuntime {
         Ok(())
     }
 
-    async fn dispatch_request(
+    #[allow(clippy::too_many_arguments)]
+    async fn start_dispatch(
         &mut self,
         owner_generation: &str,
         method: String,
         params: Option<Value>,
+        documents: Vec<OwnerDocumentInput>,
         timeout: Duration,
         trace_protocol: bool,
-        cancelled: &mut watch::Receiver<bool>,
-    ) -> OwnerResponse {
+        apply_edits: bool,
+        response: oneshot::Sender<OwnerResponse>,
+        cancelled: watch::Receiver<bool>,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) {
+        if active.len() >= OWNER_QUEUE_LIMIT {
+            let _ = response.send(OwnerResponse::failure(
+                owner_generation,
+                json!({
+                    "category": "unavailable",
+                    "code": "owner_queue_full",
+                    "message": "The Owner has reached its active request limit.",
+                    "stage": "queue",
+                    "delivery": "not_sent",
+                    "retry": "safe",
+                    "data": {"limit": OWNER_QUEUE_LIMIT, "depth": active.len()}
+                }),
+            ));
+            return;
+        }
+        if let Err(failure) = self.synchronize_documents(&documents).await {
+            let _ = response.send(OwnerResponse::failure(
+                owner_generation,
+                contract_failure_value(failure),
+            ));
+            return;
+        }
+        let synchronization = self.synchronization_result(&method, &documents);
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
+        let request_params = params.clone();
         let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method});
         if let Some(params) = params {
             request["params"] = params;
         }
         let partial_token = request.pointer("/params/partialResultToken").cloned();
-        let mut partial_items = Vec::new();
-        let mut partial_bytes = 0usize;
         let mut trace = trace_protocol.then(|| self.startup_trace.take().unwrap_or_default());
         if let Err(error) = self
             .write_lsp_message_traced(&request, trace.as_mut())
             .await
         {
-            return OwnerResponse::failure(owner_generation, transport_failure(error));
+            let _ = response.send(OwnerResponse::failure(
+                owner_generation,
+                transport_failure(error),
+            ));
+            return;
         }
-        let deadline = TokioInstant::now() + timeout;
-        let response = loop {
-            tokio::select! {
-                _ = tokio_time::sleep_until(deadline) => {
-                    let _ = self.write_lsp_message(
-                        &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
-                        false,
-                    ).await;
-                    return self.finish_timed_out_request(owner_generation, id, timeout, trace).await;
-                }
-                changed = cancelled.changed() => {
-                    if changed.is_ok() && *cancelled.borrow() {
-                        let _ = self.write_lsp_message(
-                            &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
-                            false,
-                        ).await;
-                        return OwnerResponse::failure(owner_generation, request_cancelled("caller_disconnected"));
+        active.insert(
+            id,
+            ActiveQuery {
+                method,
+                params: request_params,
+                started_at: now_rfc3339(),
+                response: Some(response),
+                cancelled,
+                deadline: TokioInstant::now() + timeout,
+                timeout,
+                cancellation: None,
+                partial_token,
+                partial_items: Vec::new(),
+                partial_bytes: 0,
+                trace,
+                documents,
+                apply_edits,
+                apply_edit_ledger: Vec::new(),
+                synchronization,
+            },
+        );
+    }
+
+    async fn handle_concurrent_frame(
+        &mut self,
+        owner_generation: &str,
+        frame: JsonRpcFrame,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        for query in active.values_mut() {
+            if let Some(trace) = &mut query.trace {
+                trace.push(
+                    "server_to_client",
+                    &frame.header,
+                    &frame.body,
+                    &frame.message,
+                );
+            }
+        }
+        let message = frame.message;
+        if message.get("method").is_none() && message.get("id").is_some() {
+            let id = message.get("id").and_then(Value::as_i64).ok_or_else(|| {
+                "The server returned a response with a non-integer identifier".to_owned()
+            })?;
+            let Some(mut query) = active.remove(&id) else {
+                return Err(
+                    "The server returned an unknown or duplicate response identifier".to_owned(),
+                );
+            };
+            let response = if let Some(cancellation) = query.cancellation.take() {
+                let mut failure = cancellation.failure;
+                attach_trace(&mut failure, query.trace);
+                OwnerResponse::failure(owner_generation, failure)
+            } else if let Some(error) = message.get("error") {
+                let mut failure = server_error_failure(error);
+                attach_trace(&mut failure, query.trace);
+                OwnerResponse::failure(owner_generation, failure)
+            } else if message.get("result").is_some() {
+                let result = message.get("result").cloned().unwrap_or(Value::Null);
+                self.record_pull_diagnostics(&query.method, query.params.as_ref(), &result);
+                match self
+                    .validate_documents_after_query(&query.documents, &result)
+                    .await
+                {
+                    Ok(()) => {
+                        let mut output = json!({
+                            "result": result,
+                            "partialResults": query.partial_items,
+                            "applyEditLedger": query.apply_edit_ledger,
+                            "synchronization": query.synchronization,
+                            "positionEncoding": self.negotiated.position_encoding.name(),
+                            "textSynchronization": match self.negotiated.text_synchronization {
+                                crate::workspace::TextSynchronization::None => "none",
+                                crate::workspace::TextSynchronization::OpenClose => "open_close",
+                            }
+                        });
+                        if let Some(trace) = query.trace {
+                            output["trace"] = trace.render();
+                        }
+                        OwnerResponse::success(owner_generation, output)
+                    }
+                    Err(failure) => {
+                        OwnerResponse::failure(owner_generation, contract_failure_value(failure))
                     }
                 }
-                stderr = self.stderr.recv() => {
-                    if let Some(stderr) = stderr {
-                        self.log.push("server_stderr", "error", stderr);
-                    }
+            } else {
+                return Err("A JSON-RPC response omitted both result and error".to_owned());
+            };
+            if let Some(sender) = query.response.take() {
+                let _ = sender.send(response);
+            }
+            return Ok(());
+        }
+
+        if message.get("id").is_some() && message.get("method").is_some() {
+            let response = if message["method"] == "workspace/applyEdit" {
+                self.handle_apply_edit_callback(&message, active)
+            } else {
+                self.route_server_request(message).await
+            };
+            let (header, body) = self
+                .writer
+                .write_json_rpc_frame_with_bytes(&response)
+                .await
+                .map_err(|error| error.to_string())?;
+            for query in active.values_mut() {
+                if let Some(trace) = &mut query.trace {
+                    trace.push("client_to_server", &header, &body, &response);
                 }
-                frame = self.reader.read_json_rpc_frame_with_bytes() => {
-                    let frame = match frame {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) => return OwnerResponse::failure(owner_generation, server_exited_failure(self.process.try_wait().ok().flatten())),
-                        Err(error) => return OwnerResponse::failure(owner_generation, protocol_failure(error.to_string())),
-                    };
-                    if let Some(trace) = &mut trace {
-                        trace.push("server_to_client", &frame.header, &frame.body, &frame.message);
+            }
+            return Ok(());
+        }
+
+        if message.get("method").is_some() && message.get("id").is_none() {
+            let method = message["method"].as_str().unwrap_or_default();
+            let token = message.pointer("/params/token");
+            let mut matched_partial = false;
+            if method == "$/progress" {
+                for (id, query) in active.iter_mut() {
+                    if token != query.partial_token.as_ref() {
+                        continue;
                     }
-                    if is_response_for(&frame.message, &json!(id)) {
-                        break frame.message;
+                    matched_partial = true;
+                    let value = message
+                        .pointer("/params/value")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    query.partial_bytes = query.partial_bytes.saturating_add(
+                        serde_json::to_vec(&value)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX),
+                    );
+                    match value {
+                        Value::Array(items) => query.partial_items.extend(items),
+                        value => query.partial_items.push(value),
                     }
-                    if frame.message.get("id").is_some() && frame.message.get("method").is_none() {
-                        return OwnerResponse::failure(owner_generation, protocol_failure("Unknown or duplicate response identifier".to_owned()));
-                    }
-                    if let Err(error) = self.handle_server_message(frame.message, partial_token.as_ref(), &mut partial_items, &mut partial_bytes, trace.as_mut()).await {
-                        return OwnerResponse::failure(owner_generation, protocol_failure(error.to_string()));
-                    }
-                    if partial_bytes > self.max_partial_result_bytes {
-                        let _ = self.write_lsp_message(
-                            &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
-                            false,
-                        ).await;
-                        return OwnerResponse::failure(owner_generation, json!({
+                    if query.partial_bytes > self.max_partial_result_bytes
+                        && query.cancellation.is_none()
+                    {
+                        let failure = json!({
                             "category": "query",
                             "code": "partial_result_too_large",
                             "message": "Partial result data exceeded the configured byte limit.",
@@ -450,76 +693,374 @@ impl LspRuntime {
                             "retry": "unsafe",
                             "data": {
                                 "limit": self.max_partial_result_bytes,
-                                "collectedBytes": partial_bytes,
-                                "partialItemCount": partial_items.len()
+                                "collectedBytes": query.partial_bytes,
+                                "partialItemCount": query.partial_items.len()
                             },
-                            "partialResult": {"items": partial_items, "complete": false}
-                        }));
+                            "partialResult": {"items": query.partial_items.clone(), "complete": false}
+                        });
+                        query.cancellation = Some(QueryCancellation {
+                            deadline: TokioInstant::now() + self.cancellation_grace,
+                            failure,
+                        });
+                        let cancel = json!({
+                            "jsonrpc": "2.0",
+                            "method": "$/cancelRequest",
+                            "params": {"id": id}
+                        });
+                        self.write_lsp_message(&cancel, false)
+                            .await
+                            .map_err(|error| error.to_string())?;
                     }
                 }
             }
-        };
-        let result = if let Some(error) = response.get("error") {
-            return OwnerResponse::failure(owner_generation, server_error_failure(error));
-        } else {
-            response.get("result").cloned().unwrap_or(Value::Null)
-        };
-        let mut output = json!({
-            "result": result,
-            "partialResults": partial_items,
-            "positionEncoding": self.negotiated.position_encoding.name(),
-            "textSynchronization": match self.negotiated.text_synchronization {
-                crate::workspace::TextSynchronization::None => "none",
-                crate::workspace::TextSynchronization::OpenClose => "open_close",
+            if !matched_partial {
+                self.handle_notification(&message, None);
             }
-        });
-        if let Some(trace) = trace {
-            output["trace"] = trace.render();
+            return Ok(());
         }
-        OwnerResponse::success(owner_generation, output)
+        Err("Malformed JSON-RPC routing".to_owned())
     }
 
-    async fn finish_timed_out_request(
+    fn handle_apply_edit_callback(
+        &self,
+        message: &Value,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Value {
+        let callback_id = message.get("id").cloned().unwrap_or(Value::Null);
+        let candidates = active
+            .iter()
+            .filter(|(_, query)| query.method == "workspace/executeCommand")
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": callback_id,
+                "result": {"applied": false, "failureReason": "no_unique_preauthorized_request"}
+            });
+        }
+        let query = active.get_mut(&candidates[0]).unwrap();
+        let ordinal = query.apply_edit_ledger.len() as u64;
+        let label = message.pointer("/params/label").and_then(Value::as_str);
+        if !query.apply_edits {
+            query.apply_edit_ledger.push(json!({
+                "ordinal": ordinal,
+                "label": label,
+                "applied": false,
+                "outcome": "rejected",
+                "failureReason": "preview_required"
+            }));
+            return json!({
+                "jsonrpc": "2.0",
+                "id": callback_id,
+                "result": {"applied": false, "failureReason": "preview_required"}
+            });
+        }
+        if query.apply_edit_ledger.len() as u64
+            >= self.mutation_settings.max_preauthorized_callbacks
+        {
+            query.apply_edit_ledger.push(json!({
+                "ordinal": ordinal,
+                "label": label,
+                "applied": false,
+                "outcome": "rejected",
+                "failureReason": "callback_limit_exceeded"
+            }));
+            return json!({
+                "jsonrpc": "2.0",
+                "id": callback_id,
+                "result": {"applied": false, "failureReason": "callback_limit_exceeded"}
+            });
+        }
+        let Some(edit) = message.pointer("/params/edit").cloned() else {
+            query.apply_edit_ledger.push(json!({
+                "ordinal": ordinal,
+                "label": label,
+                "applied": false,
+                "outcome": "rejected",
+                "failureReason": "invalid_workspace_edit"
+            }));
+            return json_rpc_error(
+                callback_id,
+                -32602,
+                "workspace/applyEdit requires params.edit",
+                None,
+            );
+        };
+        match crate::mutation::apply_preauthorized_workspace_edit(
+            &self.workspace_path,
+            &self.workspace_uri,
+            &self.server,
+            &self.session_identity,
+            self.negotiated.position_encoding,
+            label,
+            edit,
+            &self.preview_settings,
+            &self.receipt_settings,
+            &self.mutation_settings,
+        ) {
+            Ok(application) => {
+                let result = &application["result"];
+                let mut ledger = json!({
+                    "ordinal": ordinal,
+                    "label": label,
+                    "applied": true,
+                    "outcome": "applied",
+                    "previewId": result.get("previewId"),
+                    "receiptId": result.get("receiptId"),
+                    "filesystemState": result.get("filesystemState")
+                });
+                compact_json_object(&mut ledger);
+                query.apply_edit_ledger.push(ledger);
+                json!({"jsonrpc": "2.0", "id": callback_id, "result": {"applied": true}})
+            }
+            Err(failure) => {
+                let outcome = match failure.code {
+                    "proposal_stale" | "preview_stale" => "stale",
+                    "workspace_lock_timeout" => "busy",
+                    "rolled_back" => "rolled_back",
+                    "recovery_required" | "recovery_evidence_invalid" => "recovery_required",
+                    _ => "rejected",
+                };
+                let mut ledger = json!({
+                    "ordinal": ordinal,
+                    "label": label,
+                    "applied": false,
+                    "outcome": outcome,
+                    "failureReason": failure.code,
+                    "failedChange": failure.data.get("failedChange")
+                });
+                compact_json_object(&mut ledger);
+                query.apply_edit_ledger.push(ledger);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": callback_id,
+                    "result": {"applied": false, "failureReason": failure.code}
+                })
+            }
+        }
+    }
+
+    async fn maintain_active_queries(
         &mut self,
         owner_generation: &str,
-        id: i64,
-        timeout: Duration,
-        mut trace: Option<ProtocolTrace>,
-    ) -> OwnerResponse {
-        let deadline = TokioInstant::now() + self.cancellation_grace;
-        loop {
-            tokio::select! {
-                _ = tokio_time::sleep_until(deadline) => {
-                    self.process.terminate_process_tree(Duration::ZERO).await;
-                    return OwnerResponse::failure(owner_generation, protocol_failure("The server did not terminate a cancelled request".to_owned()));
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> bool {
+        let now = TokioInstant::now();
+        let mut cancel = Vec::new();
+        let mut cancellation_grace_expired = false;
+        for (id, query) in active.iter_mut() {
+            if let Some(cancellation) = &query.cancellation {
+                cancellation_grace_expired |= now >= cancellation.deadline;
+                continue;
+            }
+            let caller_cancelled = *query.cancelled.borrow();
+            if caller_cancelled || now >= query.deadline {
+                let failure = if caller_cancelled {
+                    request_cancelled("caller_disconnected")
+                } else {
+                    let mut failure = json!({
+                        "category": "query",
+                        "code": "request_timeout",
+                        "message": "The language-server request timed out.",
+                        "stage": "await_response",
+                        "delivery": "uncertain",
+                        "retry": "unsafe",
+                        "data": {"timeout": format_duration(query.timeout)}
+                    });
+                    attach_trace(&mut failure, query.trace.take());
+                    failure
+                };
+                query.cancellation = Some(QueryCancellation {
+                    deadline: now + self.cancellation_grace,
+                    failure,
+                });
+                cancel.push(*id);
+            }
+        }
+        for id in cancel {
+            if self
+                .write_lsp_message(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/cancelRequest",
+                        "params": {"id": id}
+                    }),
+                    false,
+                )
+                .await
+                .is_err()
+            {
+                cancellation_grace_expired = true;
+            }
+        }
+        if cancellation_grace_expired {
+            self.process.terminate_process_tree(Duration::ZERO).await;
+            fail_active_queries(
+                owner_generation,
+                active,
+                protocol_failure(
+                    "The server did not settle every cancelled request within the cancellation grace period"
+                        .to_owned(),
+                ),
+            );
+        }
+        cancellation_grace_expired
+    }
+
+    async fn synchronize_documents(
+        &mut self,
+        documents: &[OwnerDocumentInput],
+    ) -> Result<(), ContractFailure> {
+        for document in documents {
+            let outcome = self.documents.refresh(
+                &document.path,
+                &document.language_id,
+                self.negotiated.text_synchronization,
+            )?;
+            if outcome.snapshot.digest != document.expected_digest {
+                return Err(ContractFailure {
+                    exit_code: 5,
+                    category: "query",
+                    code: "document_changed_while_reading",
+                    message: "A synchronized Document changed before dispatch.".to_owned(),
+                    stage: "synchronize",
+                    delivery: "not_sent",
+                    retry: "safe",
+                    data: json!({
+                        "uri": outcome.snapshot.uri,
+                        "before": {"digest": document.expected_digest},
+                        "after": {"digest": outcome.snapshot.digest}
+                    }),
+                });
+            }
+            self.send_synchronization_events(outcome.events).await?;
+        }
+        Ok(())
+    }
+
+    fn synchronization_result(&self, method: &str, documents: &[OwnerDocumentInput]) -> Value {
+        let before = documents
+            .iter()
+            .filter_map(|document| {
+                let uri = Url::from_file_path(&document.path).ok()?.to_string();
+                let snapshot = self.documents.get(&uri)?;
+                Some(json!({
+                    "uri": snapshot.uri,
+                    "digest": snapshot.digest,
+                    "version": snapshot.version,
+                    "languageId": snapshot.language_id
+                }))
+            })
+            .collect::<Vec<_>>();
+        let mode = if method == "workspace/diagnostic" {
+            "workspace"
+        } else if documents.is_empty() {
+            "none"
+        } else if documents.len() == 1 {
+            "document"
+        } else {
+            "explicit"
+        };
+        json!({
+            "mode": mode,
+            "bestEffort": false,
+            "before": before,
+            "failures": [],
+            "postResponseChanged": []
+        })
+    }
+
+    async fn validate_documents_after_query(
+        &mut self,
+        documents: &[OwnerDocumentInput],
+        server_result: &Value,
+    ) -> Result<(), ContractFailure> {
+        for document in documents {
+            let outcome = self.documents.refresh(
+                &document.path,
+                &document.language_id,
+                self.negotiated.text_synchronization,
+            )?;
+            if outcome.snapshot.digest != document.expected_digest {
+                self.send_synchronization_events(outcome.events).await?;
+                return Err(ContractFailure {
+                    exit_code: 5,
+                    category: "query",
+                    code: "document_changed_during_query",
+                    message:
+                        "A synchronized Document changed while the server request was running."
+                            .to_owned(),
+                    stage: "validate_result",
+                    delivery: "sent",
+                    retry: "after_change",
+                    data: json!({
+                        "uri": outcome.snapshot.uri,
+                        "beforeDigest": document.expected_digest,
+                        "afterDigest": outcome.snapshot.digest,
+                        "serverResult": server_result
+                    }),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_synchronization_events(
+        &mut self,
+        events: Vec<SynchronizationEvent>,
+    ) -> Result<(), ContractFailure> {
+        for event in events {
+            let notification = match event {
+                SynchronizationEvent::DidOpen(snapshot) => json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {"textDocument": {
+                        "uri": snapshot.uri,
+                        "languageId": snapshot.language_id,
+                        "version": snapshot.version,
+                        "text": snapshot.text
+                    }}
+                }),
+                SynchronizationEvent::DidClose { uri } => {
+                    self.diagnostics.mark_closed(&uri);
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/didClose",
+                        "params": {"textDocument": {"uri": uri}}
+                    })
                 }
-                frame = self.reader.read_json_rpc_frame_with_bytes() => {
-                    match frame {
-                        Ok(Some(frame)) => {
-                            if let Some(trace) = &mut trace {
-                                trace.push("server_to_client", &frame.header, &frame.body, &frame.message);
-                            }
-                            if is_response_for(&frame.message, &json!(id)) {
-                                let mut failure = json!({
-                                    "category": "query",
-                                    "code": "request_timeout",
-                                    "message": "The language-server request timed out.",
-                                    "stage": "await_response",
-                                    "delivery": "uncertain",
-                                    "retry": "unsafe",
-                                    "data": {"timeout": format_duration(timeout)}
-                                });
-                                if let Some(trace) = trace {
-                                    failure["trace"] = trace.render();
-                                }
-                                return OwnerResponse::failure(owner_generation, failure);
-                            }
-                            let _ = self.handle_server_message(frame.message, None, &mut Vec::new(), &mut 0, trace.as_mut()).await;
-                        }
-                        _ => return OwnerResponse::failure(owner_generation, protocol_failure("Transport failed during cancellation".to_owned())),
-                    }
+            };
+            self.write_lsp_message(&notification, false)
+                .await
+                .map_err(|error| ContractFailure {
+                    exit_code: 4,
+                    category: "unavailable",
+                    code: "owner_unavailable",
+                    message: "Document synchronization could not be delivered.".to_owned(),
+                    stage: "synchronize",
+                    delivery: "uncertain",
+                    retry: "unsafe",
+                    data: json!({"reason": error.to_string()}),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn record_pull_diagnostics(&mut self, method: &str, params: Option<&Value>, result: &Value) {
+        match method {
+            "textDocument/diagnostic" => {
+                if let Some(uri) = params
+                    .and_then(|params| params.pointer("/textDocument/uri"))
+                    .and_then(Value::as_str)
+                {
+                    self.diagnostics.apply_pull_report(uri, result.clone());
                 }
             }
+            "workspace/diagnostic" => {
+                self.diagnostics.apply_workspace_pull_report(result.clone());
+            }
+            _ => {}
         }
     }
 
@@ -929,8 +1470,16 @@ fn status_result(
     lsp: &LspRuntime,
     started: Instant,
     queue_depth: usize,
+    active_queries: &BTreeMap<i64, ActiveQuery>,
     idle_deadline: Instant,
 ) -> Value {
+    let active_query = active_queries.values().next().map(|query| {
+        json!({
+            "command": ["raw"],
+            "method": query.method,
+            "startedAt": query.started_at
+        })
+    });
     json!({
         "sessionIdentity": bootstrap.session_identity,
         "ownerGeneration": bootstrap.owner_generation,
@@ -940,8 +1489,8 @@ fn status_result(
         "serverPid": lsp.process.pid(),
         "uptimeMs": started.elapsed().as_millis() as u64,
         "idleDeadline": rfc3339_after(idle_deadline.saturating_duration_since(Instant::now())),
-        "queueDepth": queue_depth.min(OWNER_QUEUE_LIMIT),
-        "activeQuery": Value::Null,
+        "queueDepth": queue_depth.saturating_add(active_queries.len()).min(OWNER_QUEUE_LIMIT),
+        "activeQuery": active_query,
         "capabilities": lsp.negotiated.providers_json(),
         "progress": lsp.progress.values().collect::<Vec<_>>()
     })
@@ -1036,6 +1585,12 @@ fn json_rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> V
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
+fn compact_json_object(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+}
+
 fn lsp_log_level(value: Option<&Value>) -> &'static str {
     match value.and_then(Value::as_u64) {
         Some(1) => "error",
@@ -1071,6 +1626,38 @@ fn server_error_failure(error: &Value) -> Value {
         failure["data"] = json!({"source": "server"});
     }
     failure
+}
+
+fn contract_failure_value(failure: ContractFailure) -> Value {
+    json!({
+        "category": failure.category,
+        "code": failure.code,
+        "message": failure.message,
+        "stage": failure.stage,
+        "delivery": failure.delivery,
+        "retry": failure.retry,
+        "data": failure.data
+    })
+}
+
+fn attach_trace(failure: &mut Value, trace: Option<ProtocolTrace>) {
+    if let Some(trace) = trace {
+        failure["trace"] = trace.render();
+    }
+}
+
+fn fail_active_queries(
+    owner_generation: &str,
+    active: &mut BTreeMap<i64, ActiveQuery>,
+    failure: Value,
+) {
+    for (_, mut query) in std::mem::take(active) {
+        let mut failure = failure.clone();
+        attach_trace(&mut failure, query.trace.take());
+        if let Some(response) = query.response.take() {
+            let _ = response.send(OwnerResponse::failure(owner_generation, failure));
+        }
+    }
 }
 
 fn transport_failure(error: io::Error) -> Value {

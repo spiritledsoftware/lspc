@@ -344,6 +344,7 @@ pub(crate) struct DispatchResponse {
     pub(crate) partial_results: Vec<Value>,
     pub(crate) trace: Option<Value>,
     pub(crate) apply_edit_ledger: Vec<Value>,
+    pub(crate) synchronization: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -546,26 +547,30 @@ pub(crate) fn compose(
 pub(crate) fn execute(
     dispatcher: &mut impl SessionDispatcher,
     composed: ComposedQuery,
-    context: QueryContext,
+    mut context: QueryContext,
     diagnostics: &mut DiagnosticCache,
     previews: &mut impl PreviewCreator,
 ) -> Result<Value, ContractFailure> {
-    let context = context.json(has_source_position(composed.command));
     match composed.command {
         QueryCommand::Capabilities => {
             return Ok(capabilities_envelope(
-                context,
+                context.json(has_source_position(composed.command)),
                 composed.capabilities.as_ref().unwrap(),
                 composed.capabilities_raw,
             ));
         }
         QueryCommand::PublishedDiagnostics => {
-            return published_envelope(composed, context, diagnostics);
+            let has_position = has_source_position(composed.command);
+            return published_envelope(composed, context.json(has_position), diagnostics);
         }
         _ => {}
     }
 
     let response = dispatcher.dispatch(composed.request.clone().unwrap())?;
+    if let Some(synchronization) = response.synchronization.clone() {
+        context.synchronization = synchronization;
+    }
+    let context = context.json(has_source_position(composed.command));
     if composed.command == QueryCommand::Raw {
         return query_envelope(
             &composed,
@@ -639,7 +644,9 @@ fn document_request(
 ) -> DispatchRequest {
     let mut params = extra.unwrap_or_else(|| json!({}));
     params["textDocument"] = json!({"uri": document.uri});
-    request(method, params, vec![document.uri.clone()])
+    let mut request = request(method, params, vec![document.uri.clone()]);
+    request.synchronized_files.push(document.path.clone());
+    request
 }
 
 fn raw_request(invocation: &ParsedInvocation) -> Result<DispatchRequest, ContractFailure> {
@@ -1773,6 +1780,7 @@ mod tests {
             partial_results: Vec::new(),
             trace: None,
             apply_edit_ledger: Vec::new(),
+            synchronization: None,
         });
         let mut diagnostics = DiagnosticCache::new(4, 4096);
         let output = execute(

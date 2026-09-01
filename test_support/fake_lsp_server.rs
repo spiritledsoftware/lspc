@@ -182,7 +182,45 @@ fn serve(scenario: Scenario) -> ExitCode {
                 }
             }
             Some("workspace/executeCommand") => {
-                if result(&mut output, &message, Value::Null, scenario).is_err() {
+                let callback_applied = message
+                    .pointer("/params/arguments/0")
+                    .and_then(Value::as_str)
+                    .map(|uri| {
+                        let callback = json!({
+                            "jsonrpc": "2.0",
+                            "id": "fixture-apply-edit",
+                            "method": "workspace/applyEdit",
+                            "params": {
+                                "label": "fixture edit",
+                                "edit": {"changes": {(uri): [{
+                                    "range": {
+                                        "start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 3}
+                                    },
+                                    "newText": "new"
+                                }]}}
+                            }
+                        });
+                        if write_frame(&mut output, &callback, scenario).is_err() {
+                            return false;
+                        }
+                        read_frame(&mut input)
+                            .ok()
+                            .flatten()
+                            .and_then(|response| {
+                                response.pointer("/result/applied").and_then(Value::as_bool)
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"callbackApplied": callback_applied}),
+                    scenario,
+                )
+                .is_err()
+                {
                     return ExitCode::from(1);
                 }
             }

@@ -194,6 +194,14 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
     };
     let replace_denial =
         invocation.has_option("--replace-denial") || invocation.has_option("--replace-denials");
+    let affected_servers = selected
+        .iter()
+        .map(|declaration| declaration.server.clone())
+        .collect::<Vec<_>>();
+    let _application_lock = crate::mutation::acquire_workspace_application_lock(
+        &configuration.workspace_uri,
+        &configuration.mutation.application_lock_timeout,
+    )?;
 
     update_trust_state(|state| {
         let denied = selected
@@ -241,6 +249,8 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
     })?;
 
     let state = read_trust_state()?;
+    let (owners_signalled, owner_signal_failures) =
+        crate::session::signal_workspace_owners(&configuration.workspace_uri, &affected_servers);
     Ok(trust_change_envelope(
         invocation,
         &configuration,
@@ -255,6 +265,8 @@ fn grant_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> 
             })
             .map(|record| render_record(record, declarations.get(&record.server)))
             .collect(),
+        owners_signalled,
+        owner_signal_failures,
     ))
 }
 
@@ -276,15 +288,25 @@ fn deny_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
         source_path: Some(configuration.project_path.to_string_lossy().into_owned()),
         updated_at: now_rfc3339(),
     };
+    let _application_lock = crate::mutation::acquire_workspace_application_lock(
+        &configuration.workspace_uri,
+        &configuration.mutation.application_lock_timeout,
+    )?;
     update_trust_state(|state| {
         upsert_record(state, record.clone());
         Ok(())
     })?;
+    let (owners_signalled, owner_signal_failures) = crate::session::signal_workspace_owners(
+        &configuration.workspace_uri,
+        std::slice::from_ref(&server),
+    );
     Ok(trust_change_envelope(
         invocation,
         &configuration,
         None,
         vec![render_record(&record, None)],
+        owners_signalled,
+        owner_signal_failures,
     ))
 }
 
@@ -292,6 +314,10 @@ fn revoke_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure>
     let configuration = command_configuration(invocation)?;
     let declarations = current_declarations(&configuration)?;
     let server = invocation.option_string("--server").unwrap();
+    let _application_lock = crate::mutation::acquire_workspace_application_lock(
+        &configuration.workspace_uri,
+        &configuration.mutation.application_lock_timeout,
+    )?;
     update_trust_state(|state| {
         state.records.retain(|record| {
             record.workspace_uri != configuration.workspace_uri || record.server != server
@@ -307,11 +333,17 @@ fn revoke_trust(invocation: &ParsedInvocation) -> Result<Value, ContractFailure>
         "updatedAt": now_rfc3339(),
         "requiredCommand": ["trust", "grant"]
     });
+    let (owners_signalled, owner_signal_failures) = crate::session::signal_workspace_owners(
+        &configuration.workspace_uri,
+        std::slice::from_ref(&server),
+    );
     Ok(trust_change_envelope(
         invocation,
         &configuration,
         Some(aggregate_digest(&declarations)),
         vec![record],
+        owners_signalled,
+        owner_signal_failures,
     ))
 }
 
@@ -564,13 +596,15 @@ fn trust_change_envelope(
     configuration: &LoadedConfiguration,
     aggregate_digest: Option<String>,
     records: Vec<Value>,
+    owners_signalled: Vec<String>,
+    owner_signal_failures: Vec<String>,
 ) -> Value {
     let mut result = json!({
         "workspaceUri": configuration.workspace_uri,
         "aggregateDigest": aggregate_digest,
         "records": records,
-        "ownersSignalled": [],
-        "ownerSignalFailures": []
+        "ownersSignalled": owners_signalled,
+        "ownerSignalFailures": owner_signal_failures
     });
     remove_null_members(&mut result);
     json!({

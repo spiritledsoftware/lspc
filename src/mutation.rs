@@ -22,7 +22,7 @@ use crate::{
 };
 
 use application::{
-    ApplicationContext, apply_preview, manifest_mismatches, recover_accept_current,
+    ApplicationContext, apply_preview, lock_workspace, manifest_mismatches, recover_accept_current,
     recover_rollback,
 };
 use planner::{CanonicalOperation, PlannedWorkspaceEdit, WorkspaceEditPlanner};
@@ -53,6 +53,17 @@ pub(crate) fn dispatch_mutation_command(
         [group, command] if group == "state" && command == "prune" => state_prune(invocation),
         _ => unreachable!("the CLI catalog limits Mutation command paths"),
     }
+}
+
+/// Holds the same Workspace serialization lock used by Mutation Application.
+pub(crate) fn acquire_workspace_application_lock(
+    workspace_uri: &str,
+    timeout: &str,
+) -> Result<std::fs::File, ContractFailure> {
+    let store = MutationStateStore::open()?;
+    let lock = store.open_application_lock(workspace_uri)?;
+    lock_workspace(&lock, workspace_uri, timeout)?;
+    Ok(lock)
 }
 
 fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
@@ -139,6 +150,109 @@ pub(crate) fn create_query_preview(
         proposal.edit,
         proposal.command_payload,
     )
+}
+
+/// Plans and immediately applies one Workspace Edit preauthorized by an
+/// `execute-command --apply-edits` invocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_preauthorized_workspace_edit(
+    workspace_path: &std::path::Path,
+    workspace_uri: &str,
+    server: &str,
+    session_identity: &str,
+    position_encoding: PositionEncoding,
+    label: Option<&str>,
+    edit: Value,
+    previews: &PreviewSettings,
+    receipts: &ReceiptSettings,
+    mutation: &MutationSettings,
+) -> Result<Value, ContractFailure> {
+    let planner = WorkspaceEditPlanner::open(
+        workspace_path,
+        workspace_uri,
+        position_encoding,
+        previews,
+        mutation,
+    )
+    .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
+    let planned = planner
+        .plan_workspace_edit(&edit)
+        .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
+    if planned.plan.operations.is_empty() {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "ok": true,
+            "command": ["apply"],
+            "outcome": "applied",
+            "result": {
+                "state": "terminal",
+                "outcome": "applied",
+                "filesystemState": "unchanged",
+                "sessionSynchronized": true,
+                "cleanupPending": false,
+                "manifest": []
+            }
+        }));
+    }
+    let current = planner
+        .inspect_manifest_paths(
+            &planned
+                .plan
+                .before_manifest
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|problems| unsupported_filesystem(workspace_uri, &problems))?;
+    let stale_reasons = manifest_mismatches(&planned.plan.before_manifest, &current);
+    if !stale_reasons.is_empty() {
+        return Err(ContractFailure {
+            exit_code: 6,
+            category: "mutation",
+            code: "proposal_stale",
+            message: "The Workspace changed while the callback was being planned.".to_owned(),
+            stage: "validate_mutation",
+            delivery: "not_applicable",
+            retry: "after_change",
+            data: json!({
+                "proposal": edit,
+                "reasons": stale_reasons,
+                "preconditions": planned.plan.before_manifest
+            }),
+        });
+    }
+    let store = MutationStateStore::open()?;
+    let preview_id = store.new_preview_id()?;
+    let recovery_manifest_digest = current_recovery_manifest(&store, workspace_uri)?;
+    let record = create_preview_record(
+        PreviewRecordContext {
+            preview_id: &preview_id,
+            workspace_uri,
+            server: Some(server.to_owned()),
+            session_identity,
+            position_encoding: position_encoding.name(),
+            source: json!({"kind": "workspace_apply_edit", "label": label}),
+            edit,
+            command: None,
+        },
+        planned,
+    );
+    store.create_preview(
+        record,
+        workspace_path.to_path_buf(),
+        authorization_digest(session_identity, None),
+        recovery_manifest_digest,
+        previews,
+    )?;
+    let context = ApplicationContext {
+        store: &store,
+        preview_limits: previews,
+        receipt_limits: receipts,
+        mutation_limits: mutation,
+        reauthorize: None,
+        preauthorized: true,
+    };
+    apply_preview(&context, &preview_id)
 }
 
 fn persist_preview(
@@ -302,6 +416,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             receipt_limits: &receipts,
             mutation_limits: &mutation,
             reauthorize: None,
+            preauthorized: false,
         };
         return apply_preview(&context, &id);
     }
@@ -317,6 +432,7 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
         receipt_limits: &configuration.receipts,
         mutation_limits: &configuration.mutation,
         reauthorize: Some(&reauthorize),
+        preauthorized: false,
     };
     apply_preview(&context, &id)
 }
