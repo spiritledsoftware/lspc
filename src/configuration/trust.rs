@@ -852,6 +852,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_release_trust_state_fixture_remains_readable() {
+        let state: TrustStateFile = serde_json::from_str(include_str!(
+            "../../tests/fixtures/stored-state/v1/trust.json"
+        ))
+        .unwrap();
+        assert_eq!(state.format_version, TRUST_STATE_FORMAT_VERSION);
+        assert_eq!(state.records.len(), 2);
+    }
+
+    #[test]
     fn changed_fields_reports_added_removed_and_changed_fields() {
         let recorded = BTreeMap::from([
             ("args".to_owned(), "a".to_owned()),

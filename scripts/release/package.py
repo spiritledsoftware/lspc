@@ -43,11 +43,12 @@ def main() -> None:
         extension = "zip" if "windows" in arguments.target else "tar.gz"
         archive = arguments.output_dir / f"lspc-v{package['version']}-{arguments.target}.{extension}"
         subprocess.run([sys.executable, str(ROOT / "scripts/release/verify_archive.py"), str(archive), "--target", arguments.target, "--version", package["version"]], cwd=ROOT, check=True)
-    schema = subprocess.run([str(binary), "schema", "--full"], check=True, capture_output=True).stdout
-    with tempfile.TemporaryDirectory(prefix="lspc-skill-schema-") as temporary:
-        schema_path = Path(temporary) / "schema.json"
-        schema_path.write_bytes(schema)
-        subprocess.run([sys.executable, str(ROOT / "scripts/release/build_skill_archive.py"), "--version", package["version"], "--schema-json", str(schema_path), "--output-dir", str(arguments.output_dir)], cwd=ROOT, check=True)
+    if arguments.skill_only:
+        schema = subprocess.run([str(binary), "schema", "--full"], check=True, capture_output=True).stdout
+        with tempfile.TemporaryDirectory(prefix="lspc-skill-schema-") as temporary:
+            schema_path = Path(temporary) / "schema.json"
+            schema_path.write_bytes(schema)
+            subprocess.run([sys.executable, str(ROOT / "scripts/release/build_skill_archive.py"), "--version", package["version"], "--schema-json", str(schema_path), "--output-dir", str(arguments.output_dir)], cwd=ROOT, check=True)
 
 
 if __name__ == "__main__":

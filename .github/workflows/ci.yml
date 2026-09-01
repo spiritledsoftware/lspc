@@ -34,6 +34,8 @@ jobs:
         run: python scripts/release/check_schema.py
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      - name: Check stored-state compatibility fixtures
+        run: python scripts/release/check_stored_state.py
       - name: Test release archive scaffolding
         run: python tests/release_scripts.py
       - name: Validate release-gate registry

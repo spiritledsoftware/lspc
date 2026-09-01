@@ -88,162 +88,203 @@ pub(crate) fn dispatch_session_command(
 pub(crate) fn dispatch_owner_query_command(
     invocation: &ParsedInvocation,
 ) -> Result<Value, ContractFailure> {
+    let deadline = invocation
+        .option_string("--deadline")
+        .map(|value| parse_duration(&value));
     run_async(async {
-        let current_directory = std::env::current_dir().map_err(|error| {
-            owner_unavailable(
-                "sid_0000000000000000000000000000000000000000000000000000000000000000",
-                &error.to_string(),
-            )
-        })?;
-        let mut targets = invocation.option_paths("--sync-file");
-        if let Some(file) = invocation.option_path("--file") {
-            targets.push(file);
-        }
-        let workspace = select_workspace(
-            invocation.option_path("--workspace").as_deref(),
-            &targets,
-            &current_directory,
-        )?;
-        let configuration = load_configuration(
-            &workspace.root,
-            invocation.has_option("--ignore-project-config"),
-        )?;
-        let server = select_server(&configuration, invocation)?;
-        let request_timeout = parse_duration(&server.request_timeout);
-        let authorized = authorize_server(&configuration, server)?;
-        let trace_protocol = invocation.has_option("--trace-protocol");
-        let endpoint = connect_or_start_owner(&configuration, &authorized, trace_protocol).await?;
-        let owner_capabilities = send_owner_request(&endpoint, OwnerRequest::Capabilities).await?;
-        let capabilities = capabilities_from_owner(&owner_capabilities);
-        let position_encoding = match owner_capabilities["positionEncoding"].as_str() {
-            Some("utf-8") => PositionEncoding::Utf8,
-            _ => PositionEncoding::Utf16,
-        };
-        let text_synchronization = match owner_capabilities["textSynchronization"].as_str() {
-            Some("open_close") => TextSynchronization::OpenClose,
-            _ => TextSynchronization::None,
-        };
-
-        let mut document = if let Some(path) = invocation.option_path("--file") {
-            let path = validate_document_scope(
-                &workspace,
-                &path,
-                invocation.has_option("--server"),
-                false,
-            )?;
-            let language_id = crate::configuration::document_language_id(
-                &configuration,
-                &authorized.server.name,
-                &path,
-                invocation.option_string("--language-id").as_deref(),
-            )?;
-            let mut documents = DocumentStore::new(
-                configuration.synchronization.max_open_documents,
-                configuration.synchronization.max_document_bytes,
-                configuration.synchronization.max_total_text_bytes,
-            );
-            Some(
-                documents
-                    .refresh(&path, &language_id, text_synchronization)?
-                    .snapshot,
-            )
+        if let Some(deadline) = deadline {
+            match tokio::time::timeout(deadline, dispatch_owner_query(invocation)).await {
+                Ok(result) => result,
+                Err(_) => Err(queue_deadline_failure(&format_duration(deadline))),
+            }
         } else {
-            None
-        };
-        let mut diagnostics = DiagnosticCache::new(
-            configuration.synchronization.max_diagnostic_snapshots,
-            configuration.synchronization.max_diagnostic_bytes,
+            dispatch_owner_query(invocation).await
+        }
+    })
+}
+
+async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
+    let current_directory = std::env::current_dir().map_err(|error| {
+        owner_unavailable(
+            "sid_0000000000000000000000000000000000000000000000000000000000000000",
+            &error.to_string(),
+        )
+    })?;
+    let mut targets = invocation.option_paths("--sync-file");
+    if let Some(file) = invocation.option_path("--file") {
+        targets.push(file);
+    }
+    let workspace = select_workspace(
+        invocation.option_path("--workspace").as_deref(),
+        &targets,
+        &current_directory,
+    )?;
+    let configuration = load_configuration(
+        &workspace.root,
+        invocation.has_option("--ignore-project-config"),
+    )?;
+    let server = select_server(&configuration, invocation)?;
+    let request_timeout = parse_duration(&server.request_timeout);
+    let authorized = authorize_server(&configuration, server)?;
+    let trace_protocol = invocation.has_option("--trace-protocol");
+    let endpoint = connect_or_start_owner(&configuration, &authorized, trace_protocol).await?;
+    let owner_capabilities = send_owner_request(&endpoint, OwnerRequest::Capabilities).await?;
+    let capabilities = capabilities_from_owner(&owner_capabilities);
+    let position_encoding = match owner_capabilities["positionEncoding"].as_str() {
+        Some("utf-8") => PositionEncoding::Utf8,
+        _ => PositionEncoding::Utf16,
+    };
+    let text_synchronization = match owner_capabilities["textSynchronization"].as_str() {
+        Some("open_close") => TextSynchronization::OpenClose,
+        _ => TextSynchronization::None,
+    };
+
+    let mut document = if let Some(path) = invocation.option_path("--file") {
+        let path =
+            validate_document_scope(&workspace, &path, invocation.has_option("--server"), false)?;
+        let language_id = crate::configuration::document_language_id(
+            &configuration,
+            &authorized.server.name,
+            &path,
+            invocation.option_string("--language-id").as_deref(),
+        )?;
+        let mut documents = DocumentStore::new(
+            configuration.synchronization.max_open_documents,
+            configuration.synchronization.max_document_bytes,
+            configuration.synchronization.max_total_text_bytes,
         );
-        if invocation.command_path().first().is_some_and(|command| {
-            matches!(
-                command.as_str(),
-                "document-diagnostics" | "workspace-diagnostics" | "published-diagnostics"
-            )
-        }) {
-            let synchronized = document
-                .as_ref()
-                .map(|snapshot| owner_protocol::OwnerDocumentInput {
-                    path: snapshot.path.clone(),
-                    language_id: snapshot.language_id.clone(),
-                    expected_digest: snapshot.digest.clone(),
-                })
-                .into_iter()
-                .collect();
-            let state = send_owner_request(
-                &endpoint,
-                OwnerRequest::Diagnostics {
-                    documents: synchronized,
-                },
-            )
-            .await?;
-            diagnostics.import_state(&state["state"]);
-            if let Some(document) = &mut document
-                && let Some(version) = state["documentVersions"][&document.uri].as_i64()
+        Some(
+            documents
+                .refresh(&path, &language_id, text_synchronization)?
+                .snapshot,
+        )
+    } else {
+        None
+    };
+    let mut diagnostics = DiagnosticCache::new(
+        configuration.synchronization.max_diagnostic_snapshots,
+        configuration.synchronization.max_diagnostic_bytes,
+    );
+    if invocation.command_path().first().is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "document-diagnostics" | "workspace-diagnostics" | "published-diagnostics"
+        )
+    }) {
+        let synchronized = document
+            .as_ref()
+            .map(|snapshot| owner_protocol::OwnerDocumentInput {
+                path: snapshot.path.clone(),
+                language_id: snapshot.language_id.clone(),
+                expected_digest: snapshot.digest.clone(),
+            })
+            .into_iter()
+            .collect();
+        let first_state = send_owner_request(
+            &endpoint,
+            OwnerRequest::Diagnostics {
+                documents: synchronized,
+            },
+        )
+        .await?;
+        let document_versions = first_state["documentVersions"].clone();
+        diagnostics.import_state(&first_state["state"]);
+        if let Some(document) = &mut document
+            && let Some(version) = document_versions[&document.uri].as_i64()
+        {
+            document.version = version;
+        }
+        if invocation
+            .command_path()
+            .first()
+            .is_some_and(|command| command == "published-diagnostics")
+            && invocation.has_option("--file")
+        {
+            let document = document.as_ref().unwrap();
+            let deadline =
+                Instant::now() + parse_duration(&authorized.server.published_diagnostics_wait);
+            while !diagnostics
+                .published(&document.uri, Some(document.version), false)
+                .complete
+                && Instant::now() < deadline
             {
-                document.version = version;
+                tokio::time::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(25)),
+                )
+                .await;
+                let state = send_owner_request(
+                    &endpoint,
+                    OwnerRequest::Diagnostics {
+                        documents: Vec::new(),
+                    },
+                )
+                .await?;
+                diagnostics.import_state(&state["state"]);
             }
         }
-        let composed = compose(
-            invocation,
-            document.as_ref(),
-            position_encoding,
-            &capabilities,
-            Some(&diagnostics),
-        )?;
-        let context = QueryContext {
-            workspace_uri: configuration.workspace_uri.clone(),
-            server: authorized.server.name.clone(),
-            session_identity: authorized.session_identity.clone(),
-            owner_generation: endpoint.owner_generation.clone(),
-            result_position_encoding: position_encoding,
-            synchronization: json!({
-                "mode": if invocation.command_path().first().is_some_and(|command| command == "workspace-diagnostics") {
-                    "workspace"
-                } else if document.is_some() {
-                    "document"
-                } else {
-                    "none"
-                },
-                "bestEffort": false,
-                "before": document.as_ref().map(|snapshot| json!({
-                    "uri": snapshot.uri,
-                    "digest": snapshot.digest,
-                    "version": snapshot.version,
-                    "languageId": snapshot.language_id
-                })).into_iter().collect::<Vec<_>>(),
-                "failures": [],
-                "postResponseChanged": []
-            }),
-            recovery: json!({"required": false}),
-        };
-        let mut dispatcher = OwnerQueryDispatcher {
-            endpoint: &endpoint,
-            request_timeout,
-            configuration: &configuration,
-            workspace: &workspace,
-            server: &authorized.server.name,
-            explicit_language_id: invocation.option_string("--language-id"),
-            explicit_workspace: invocation.has_option("--workspace"),
-            documents: DocumentStore::new(
-                configuration.synchronization.max_open_documents,
-                configuration.synchronization.max_document_bytes,
-                configuration.synchronization.max_total_text_bytes,
-            ),
-            text_synchronization,
-        };
-        let mut previews = MutationPreviewCreator {
-            configuration: &configuration,
-            authorized: &authorized,
-            position_encoding,
-        };
-        execute(
-            &mut dispatcher,
-            composed,
-            context,
-            &mut diagnostics,
-            &mut previews,
-        )
-    })
+    }
+    let composed = compose(
+        invocation,
+        document.as_ref(),
+        position_encoding,
+        &capabilities,
+        Some(&diagnostics),
+    )?;
+    let context = QueryContext {
+        workspace_uri: configuration.workspace_uri.clone(),
+        server: authorized.server.name.clone(),
+        session_identity: authorized.session_identity.clone(),
+        owner_generation: endpoint.owner_generation.clone(),
+        result_position_encoding: position_encoding,
+        synchronization: json!({
+            "mode": if invocation.command_path().first().is_some_and(|command| command == "workspace-diagnostics") {
+                "workspace"
+            } else if document.is_some() {
+                "document"
+            } else {
+                "none"
+            },
+            "bestEffort": false,
+            "before": document.as_ref().map(|snapshot| json!({
+                "uri": snapshot.uri,
+                "digest": snapshot.digest,
+                "version": snapshot.version,
+                "languageId": snapshot.language_id
+            })).into_iter().collect::<Vec<_>>(),
+            "failures": [],
+            "postResponseChanged": []
+        }),
+        recovery: json!({"required": false}),
+    };
+    let mut dispatcher = OwnerQueryDispatcher {
+        endpoint: &endpoint,
+        request_timeout,
+        configuration: &configuration,
+        workspace: &workspace,
+        server: &authorized.server.name,
+        explicit_language_id: invocation.option_string("--language-id"),
+        explicit_workspace: invocation.has_option("--workspace"),
+        documents: DocumentStore::new(
+            configuration.synchronization.max_open_documents,
+            configuration.synchronization.max_document_bytes,
+            configuration.synchronization.max_total_text_bytes,
+        ),
+        text_synchronization,
+    };
+    let mut previews = MutationPreviewCreator {
+        configuration: &configuration,
+        authorized: &authorized,
+        position_encoding,
+    };
+    execute(
+        &mut dispatcher,
+        composed,
+        context,
+        &mut diagnostics,
+        &mut previews,
+    )
 }
 
 fn capabilities_from_owner(value: &Value) -> Capabilities {
@@ -275,6 +316,27 @@ fn capabilities_from_owner(value: &Value) -> Capabilities {
     Capabilities {
         providers,
         initialize_result: value.get("initializeResult").cloned(),
+    }
+}
+
+fn queue_deadline_failure(deadline: &str) -> ContractFailure {
+    ContractFailure {
+        exit_code: 4,
+        category: "unavailable",
+        code: "queue_deadline_exceeded",
+        message: "The invocation deadline expired before the operation completed.".to_owned(),
+        stage: "queue",
+        delivery: "not_sent",
+        retry: "safe",
+        data: json!({"deadline": deadline, "waitedMs": duration_millis(deadline)}),
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
     }
 }
 
@@ -324,14 +386,18 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
             }
         }
         let mut response = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(dispatch_owner_request(
+            tokio::runtime::Handle::current().block_on(send_owner_request(
                 self.endpoint,
-                request.method,
-                request.params,
-                synchronized,
-                self.request_timeout,
-                request.trace_protocol,
-                request.apply_edits,
+                OwnerRequest::Dispatch {
+                    method: request.method,
+                    params: request.params,
+                    documents: synchronized,
+                    refresh_open_documents: request.refresh_open_documents,
+                    raw_request: request.raw_request,
+                    request_timeout_ms: self.request_timeout.as_millis() as u64,
+                    trace_protocol: request.trace_protocol,
+                    apply_edits: request.apply_edits,
+                },
             ))
         })?;
         let result = response
@@ -414,6 +480,7 @@ pub(crate) async fn connect_or_start_owner(
         token,
         workspace_uri: configuration.workspace_uri.clone(),
         server: authorized.server.name.clone(),
+        declaration_digest: authorized.declaration_digest.clone(),
         server_args: authorized.server.args.value.clone(),
         initialization_options: authorized
             .server
@@ -511,30 +578,6 @@ fn reauthorize_project_launch(
         });
     }
     Ok(())
-}
-
-/// Sends one operation after authenticating endpoint identity and generation.
-pub(crate) async fn dispatch_owner_request(
-    endpoint: &OwnerEndpoint,
-    method: String,
-    params: Option<Value>,
-    documents: Vec<owner_protocol::OwnerDocumentInput>,
-    request_timeout: Duration,
-    trace_protocol: bool,
-    apply_edits: bool,
-) -> Result<Value, ContractFailure> {
-    send_owner_request(
-        endpoint,
-        OwnerRequest::Dispatch {
-            method,
-            params,
-            documents,
-            request_timeout_ms: request_timeout.as_millis() as u64,
-            trace_protocol,
-            apply_edits,
-        },
-    )
-    .await
 }
 
 pub(crate) fn run_hidden_owner(arguments: &[OsString]) -> ExitCode {
@@ -711,6 +754,35 @@ pub(crate) fn signal_workspace_owners(
         signalled.sort();
         failures.sort();
         (signalled, failures)
+    })
+}
+
+/// Refreshes open Documents after a committed external Workspace mutation.
+pub(crate) fn refresh_workspace_owners(
+    workspace_uri: &str,
+    server: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    run_async(async {
+        let Ok(endpoints) = live_endpoints().await else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut refreshed = Vec::new();
+        let mut failures = Vec::new();
+        for endpoint in endpoints.into_iter().filter(|endpoint| {
+            endpoint.workspace_uri == workspace_uri
+                && server.is_none_or(|server| server == endpoint.server)
+        }) {
+            let generation = endpoint.owner_generation.clone();
+            match send_owner_request(&endpoint, OwnerRequest::RefreshDocuments).await {
+                Ok(result) if result["delivered"].as_bool() == Some(true) => {
+                    refreshed.push(generation)
+                }
+                _ => failures.push(generation),
+            }
+        }
+        refreshed.sort();
+        failures.sort();
+        (refreshed, failures)
     })
 }
 

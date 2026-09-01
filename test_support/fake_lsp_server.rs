@@ -1,6 +1,7 @@
 //! Independently framed deterministic LSP fixture for acceptance tests.
 
 use std::{
+    collections::BTreeSet,
     env,
     io::{self, BufRead, BufReader, Write},
     process::ExitCode,
@@ -83,6 +84,7 @@ fn serve(scenario: Scenario) -> ExitCode {
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = io::stdout().lock();
     let mut delayed = None;
+    let mut open_documents = BTreeSet::new();
     loop {
         let message = match read_frame(&mut input) {
             Ok(Some(message)) => message,
@@ -171,7 +173,28 @@ fn serve(scenario: Scenario) -> ExitCode {
                 }
             }
             Some("textDocument/rename") => {
-                if result(&mut output, &message, json!({"changes":{}}), scenario).is_err() {
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file:///fixture.rs");
+                let new_name = message
+                    .pointer("/params/newName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("renamed");
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"changes": {(uri): [{
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 6}
+                        },
+                        "newText": new_name
+                    }]}}),
+                    scenario,
+                )
+                .is_err()
+                {
                     return ExitCode::from(1);
                 }
             }
@@ -221,6 +244,113 @@ fn serve(scenario: Scenario) -> ExitCode {
                 )
                 .is_err()
                 {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/request-apply-edit") => {
+                let uri = message
+                    .pointer("/params/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file:///fixture.rs");
+                let callback = json!({
+                    "jsonrpc": "2.0",
+                    "id": "fixture-preview-edit",
+                    "method": "workspace/applyEdit",
+                    "params": {
+                        "label": "fixture preview",
+                        "edit": {"changes": {(uri): [{
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 3}
+                            },
+                            "newText": "new"
+                        }]}}
+                    }
+                });
+                if write_frame(&mut output, &callback, scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+                let callback_response = read_frame(&mut input)
+                    .ok()
+                    .flatten()
+                    .and_then(|response| response.get("result").cloned())
+                    .unwrap_or(Value::Null);
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"callbackResponse": callback_response}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("textDocument/didOpen") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.insert(uri.to_owned());
+                }
+            }
+            Some("textDocument/didClose") => {
+                if let Some(uri) = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                {
+                    open_documents.remove(uri);
+                }
+            }
+            Some("test/open-documents") => {
+                if result(
+                    &mut output,
+                    &message,
+                    json!({"count": open_documents.len(), "uris": open_documents}),
+                    scenario,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/publish-diagnostic") => {
+                let uri = message
+                    .pointer("/params/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file:///fixture.rs");
+                let publication = json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": uri,
+                        "diagnostics": [{
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            },
+                            "severity": 2,
+                            "source": "lspc-fixture",
+                            "message": format!("diagnostic for {uri}")
+                        }]
+                    }
+                });
+                if write_frame(&mut output, &publication, scenario).is_err()
+                    || result(&mut output, &message, json!({"published": uri}), scenario).is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("test/await-file-change") => {
+                let marker = message
+                    .pointer("/params/marker")
+                    .and_then(Value::as_str)
+                    .map(std::path::Path::new);
+                if marker.is_none_or(|marker| std::fs::write(marker, b"ready\n").is_err()) {
+                    return ExitCode::from(1);
+                }
+                thread::sleep(Duration::from_millis(100));
+                if result(&mut output, &message, json!({"fixture": true}), scenario).is_err() {
                     return ExitCode::from(1);
                 }
             }

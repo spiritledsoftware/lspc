@@ -89,6 +89,20 @@ impl SessionLog {
             "records": self.records.iter().skip(skip).map(|(_, record)| record).collect::<Vec<_>>()
         })
     }
+
+    pub(crate) fn stderr_tail(&self) -> String {
+        let mut retained = self
+            .records
+            .iter()
+            .rev()
+            .filter(|(_, record)| record.kind == "server_stderr")
+            .map(|(_, record)| record.message.as_str())
+            .collect::<Vec<_>>();
+        retained.reverse();
+        let combined = retained.join("");
+        let start = utf8_suffix_start(&combined, 8192);
+        combined[start..].to_owned()
+    }
 }
 
 fn serialized_size(record: &SessionLogRecord) -> usize {

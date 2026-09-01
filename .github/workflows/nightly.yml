@@ -1,0 +1,65 @@
+name: Nightly acceptance
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reference-servers:
+    name: ${{ matrix.os }} / ${{ matrix.server }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        server: [rust-analyzer, typescript-language-server, basedpyright]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.7"
+      - name: Install stable Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/setup-node@v4
+        if: matrix.server == 'typescript-language-server'
+        with:
+          node-version: "24.6.0"
+      - name: Build lspc and fake server
+        run: cargo build --locked --release --features fake-server
+      - name: Install schema validator
+        run: python -m pip install jsonschema==4.25.1
+      - name: Run pinned reference smoke
+        run: python scripts/release/run_reference_matrix.py ${{ matrix.server }} --binary target/release/lspc --output reference.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-${{ matrix.os }}-${{ matrix.server }}
+          path: reference.json
+          retention-days: 30
+          if-no-files-found: error
+
+  soak:
+    name: ${{ matrix.os }} / deterministic soak
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+      - run: cargo build --locked --release --features fake-server
+      - run: python scripts/release/soak.py --binary target/release/lspc --fake-server target/release/lspc-fake-server --output soak.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ matrix.os }}
+          path: soak.json
+          if-no-files-found: error

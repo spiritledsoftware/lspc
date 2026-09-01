@@ -7,8 +7,13 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 jobs:
+  extended-acceptance:
+    uses: ./.github/workflows/nightly.yml
+
   verify:
     name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
     strategy:
@@ -30,6 +35,7 @@ jobs:
       - run: python scripts/release/check_schema.py
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      - run: python scripts/release/check_stored_state.py
       - run: python tests/release_scripts.py
 
   dependencies:
@@ -49,7 +55,7 @@ jobs:
       - name: Package and install from locked source
         run: python scripts/release/check_package.py
 
-  archive:
+  archive-linux:
     needs: package
     name: ${{ matrix.target }}
     strategy:
@@ -58,8 +64,42 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build, audit floor, and verify archive
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python3 scripts/release/package.py --target ${{ matrix.target }} --output-dir dist
+          python3 scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/lspc --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
+          cargo build --locked --release --target ${{ matrix.target }} --features fake-server --bin lspc-fake-server
+          python3 scripts/release/floor_smoke.py --archive "dist/lspc-v${VERSION}-${{ matrix.target }}.tar.gz" --fake-server target/${{ matrix.target }}/release/lspc-fake-server --target ${{ matrix.target }} --output dist/floor-smoke-${{ matrix.target }}.json
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/lspc-v*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lspc-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  archive-native:
+    needs: package
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
           - runner: macos-14
@@ -69,11 +109,21 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.7"
       - name: Install stable Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal
       - name: Build and verify archive
         run: python scripts/release/package.py --target ${{ matrix.target }} --output-dir dist
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ contains(matrix.target, 'apple-darwin') && '12.0' || '' }}
+      - name: Audit runtime floor
+        run: python scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/${{ contains(matrix.target, 'windows') && 'lspc.exe' || 'lspc' }} --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/lspc-v*.${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
       - uses: actions/upload-artifact@v4
         with:
           name: lspc-${{ matrix.target }}
@@ -81,7 +131,7 @@ jobs:
           if-no-files-found: error
 
   required-gates:
-    needs: [archive, companion-skill]
+    needs: [archive-linux, archive-native, runtime-floors, companion-skill, extended-acceptance]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,8 +145,71 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and verify companion skill archive
         run: python scripts/release/package.py --target x86_64-unknown-linux-gnu --skill-only --output-dir dist
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/lspc-agent-skill-v*.zip
       - uses: actions/upload-artifact@v4
         with:
           name: lspc-agent-skill
           path: dist/lspc-agent-skill-v*.zip*
           if-no-files-found: error
+
+  runtime-floors:
+    needs: [archive-native]
+    name: floor / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: '["self-hosted","lspc-floor","macos-12","x64"]'
+            target: x86_64-apple-darwin
+            extension: tar.gz
+            fake: lspc-fake-server
+          - runner: '["self-hosted","lspc-floor","macos-12","arm64"]'
+            target: aarch64-apple-darwin
+            extension: tar.gz
+            fake: lspc-fake-server
+          - runner: '["self-hosted","lspc-floor","windows-2019","x64"]'
+            target: x86_64-pc-windows-msvc
+            extension: zip
+            fake: lspc-fake-server.exe
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: lspc-${{ matrix.target }}
+          path: dist
+      - name: Install stable Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+      - name: Build independent fixture and run archive at native floor
+        shell: bash
+        run: |
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          cargo build --locked --release --features fake-server --bin lspc-fake-server
+          python scripts/release/floor_smoke.py --archive "dist/lspc-v${VERSION}-${{ matrix.target }}.${{ matrix.extension }}" --fake-server target/release/${{ matrix.fake }} --target ${{ matrix.target }} --output floor-smoke.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: floor-smoke-${{ matrix.target }}
+          path: floor-smoke.json
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: required-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lspc-*
+          path: dist
+          merge-multiple: true
+      - name: Publish immutable crate and release assets
+        run: python scripts/release/publish_release.py --tag "${GITHUB_REF_NAME}" --assets dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

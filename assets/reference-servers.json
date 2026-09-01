@@ -1,0 +1,16 @@
+{
+  "formatVersion": 1,
+  "rustAnalyzer": {
+    "version": "2026-08-31",
+    "runtime": "native"
+  },
+  "typescriptLanguageServer": {
+    "version": "6.0.0",
+    "typescriptVersion": "6.0.3",
+    "nodeVersion": "24.6.0"
+  },
+  "basedpyright": {
+    "version": "1.39.10",
+    "pythonVersion": "3.13.7"
+  }
+}

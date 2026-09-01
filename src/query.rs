@@ -328,6 +328,10 @@ pub(crate) struct DispatchRequest {
     pub(crate) params: Option<Value>,
     /// Native paths that the Owner must explicitly synchronize before raw dispatch.
     pub(crate) synchronized_files: Vec<PathBuf>,
+    /// Whether this named Workspace operation refreshes every Owner-open Document.
+    pub(crate) refresh_open_documents: bool,
+    /// Raw requests retain post-response staleness as metadata instead of failing.
+    pub(crate) raw_request: bool,
     /// The Owner assigns a unique token and injects `partialResultToken` when true.
     pub(crate) partial_results: bool,
     /// The Owner assigns a unique token and injects `workDoneToken` when true.
@@ -528,6 +532,13 @@ pub(crate) fn compose(
         request.work_done_progress = capabilities.work_done_progress(command);
     }
     if let Some(request) = &mut request {
+        request.refresh_open_documents = matches!(
+            command,
+            QueryCommand::WorkspaceSymbols
+                | QueryCommand::WorkspaceDiagnostics
+                | QueryCommand::ExecuteCommand
+        );
+        request.raw_request = command == QueryCommand::Raw;
         request.trace_protocol = invocation.has_option("--trace-protocol");
         request.apply_edits =
             command == QueryCommand::ExecuteCommand && invocation.has_option("--apply-edits");
@@ -630,6 +641,8 @@ fn request(
         method: method.to_owned(),
         params: Some(params),
         synchronized_files: Vec::new(),
+        refresh_open_documents: false,
+        raw_request: false,
         partial_results: false,
         work_done_progress: false,
         trace_protocol: false,
@@ -667,6 +680,8 @@ fn raw_request(invocation: &ParsedInvocation) -> Result<DispatchRequest, Contrac
         method,
         params: optional_json_input(invocation, "--params-json", "--params-file")?,
         synchronized_files: invocation.option_paths("--sync-file"),
+        refresh_open_documents: false,
+        raw_request: true,
         partial_results: false,
         work_done_progress: false,
         trace_protocol: false,

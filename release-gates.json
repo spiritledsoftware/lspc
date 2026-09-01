@@ -29,23 +29,23 @@
     },
     {
       "name": "reference-server-smoke",
-      "state": "pending",
-      "reason": "Pinned rust-analyzer, typescript-language-server, and basedpyright fixtures do not exist yet."
+      "state": "implemented",
+      "reason": "Nightly and candidate matrices run exact recorded rust-analyzer, typescript-language-server, TypeScript, Node, basedpyright, and Python versions on Linux, macOS, and Windows."
     },
     {
       "name": "native-floor-acceptance",
-      "state": "pending",
-      "reason": "glibc 2.28, macOS 12, and Windows Server 2019 floor infrastructure is not provisioned yet."
+      "state": "implemented",
+      "reason": "Linux artifacts build and smoke in native manylinux 2.28 containers; self-hosted Intel/ARM macOS 12 and Windows Server 2019 floor runners smoke extracted archives, while every artifact also receives a static floor audit."
     },
     {
       "name": "stored-state-compatibility",
-      "state": "pending",
-      "reason": "The first release has no historical state fixtures; future releases must add them."
+      "state": "implemented",
+      "reason": "The immutable 1.0.0 first-release seed covers Trust, Denial, Preview, Receipt, and Recovery records; digest and Rust deserialization checks run in CI."
     },
     {
       "name": "performance-and-soak",
-      "state": "pending",
-      "reason": "Owner reuse and the immediate-response fake server are not implemented yet."
+      "state": "implemented",
+      "reason": "Nightly and candidate matrices enforce cold readiness, 100-query warm p95, 1,000 operations, process/handle/memory bounds, and Document and diagnostic churn on every OS."
     }
   ]
 }

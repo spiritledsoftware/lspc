@@ -76,7 +76,8 @@ struct ActiveQuery {
     partial_items: Vec<Value>,
     partial_bytes: usize,
     trace: Option<ProtocolTrace>,
-    documents: Vec<OwnerDocumentInput>,
+    validated_documents: Vec<OwnerDocumentInput>,
+    raw_request: bool,
     apply_edits: bool,
     apply_edit_ledger: Vec<Value>,
     synchronization: Value,
@@ -102,6 +103,7 @@ struct LspRuntime {
     workspace_path: PathBuf,
     server: String,
     session_identity: String,
+    declaration_digest: Option<String>,
     workspace_folder: Value,
     cancellation_grace: Duration,
     shutdown_timeout: Duration,
@@ -163,7 +165,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
         let idle_sleep = tokio_time::sleep_until(TokioInstant::from_std(idle_deadline));
         tokio::pin!(idle_sleep);
         tokio::select! {
-            pending = requests_rx.recv() => {
+            pending = requests_rx.recv(), if active_queries.is_empty() => {
                 let Some(pending) = pending else { break };
                 if *pending.cancelled.borrow() {
                     continue;
@@ -214,6 +216,35 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         };
                         let _ = pending.response.send(response);
                     }
+                    OwnerRequest::RefreshDocuments => {
+                        let (outcomes, failures) = lsp.documents.refresh_open_documents(
+                            lsp.negotiated.text_synchronization,
+                        );
+                        let mut changed = Vec::new();
+                        let mut delivery_failed = false;
+                        for outcome in outcomes {
+                            if !outcome.events.is_empty() {
+                                changed.push(outcome.snapshot.uri.clone());
+                            }
+                            if lsp.send_synchronization_events(outcome.events).await.is_err() {
+                                delivery_failed = true;
+                            }
+                        }
+                        let pending_events = lsp.documents.drain_pending_events();
+                        if lsp
+                            .send_synchronization_events(pending_events)
+                            .await
+                            .is_err()
+                        {
+                            delivery_failed = true;
+                        }
+                        let result = json!({
+                            "changedUris": changed,
+                            "failures": failures.iter().map(contract_failure_ref_value).collect::<Vec<_>>(),
+                            "delivered": !delivery_failed && failures.is_empty()
+                        });
+                        let _ = pending.response.send(OwnerResponse::success(&bootstrap.owner_generation, result));
+                    }
                     OwnerRequest::Stop { force } => {
                         endpoint.state = "draining".to_owned();
                         let _ = write_endpoint(&bootstrap.endpoint_path, &endpoint);
@@ -236,12 +267,14 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         let _ = tokio_time::timeout(Duration::from_secs(1), pending.delivered).await;
                         should_stop = true;
                     }
-                    OwnerRequest::Dispatch { method, params, documents, request_timeout_ms, trace_protocol, apply_edits } => {
+                    OwnerRequest::Dispatch { method, params, documents, refresh_open_documents, raw_request, request_timeout_ms, trace_protocol, apply_edits } => {
                         lsp.start_dispatch(
                             &bootstrap.owner_generation,
                             method,
                             params,
                             documents,
+                            refresh_open_documents,
+                            raw_request,
                             Duration::from_millis(request_timeout_ms),
                             trace_protocol,
                             apply_edits,
@@ -278,7 +311,10 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         }
                     }
                     Ok(None) => {
-                        let failure = server_exited_failure(lsp.process.try_wait().ok().flatten());
+                        let failure = server_exited_failure(
+                            lsp.process.try_wait().ok().flatten(),
+                            &lsp.log.stderr_tail(),
+                        );
                         fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure);
                         should_stop = true;
                     }
@@ -310,7 +346,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     fail_active_queries(
                         &bootstrap.owner_generation,
                         &mut active_queries,
-                        server_exited_failure(Some(status)),
+                        server_exited_failure(Some(status), &lsp.log.stderr_tail()),
                     );
                     should_stop = true;
                 }
@@ -384,6 +420,7 @@ impl LspRuntime {
             workspace_path: bootstrap.workspace_path.clone(),
             server: bootstrap.server.clone(),
             session_identity: bootstrap.session_identity.clone(),
+            declaration_digest: settings.declaration_digest.clone(),
             workspace_folder,
             cancellation_grace: Duration::from_millis(settings.cancellation_grace_ms),
             shutdown_timeout: Duration::from_millis(settings.shutdown_timeout_ms),
@@ -496,6 +533,8 @@ impl LspRuntime {
         method: String,
         params: Option<Value>,
         documents: Vec<OwnerDocumentInput>,
+        refresh_open_documents: bool,
+        raw_request: bool,
         timeout: Duration,
         trace_protocol: bool,
         apply_edits: bool,
@@ -518,6 +557,10 @@ impl LspRuntime {
             ));
             return;
         }
+        let mut refresh_failures = Vec::new();
+        if refresh_open_documents {
+            refresh_failures = self.refresh_open_documents_best_effort().await;
+        }
         if let Err(failure) = self.synchronize_documents(&documents).await {
             let _ = response.send(OwnerResponse::failure(
                 owner_generation,
@@ -525,7 +568,17 @@ impl LspRuntime {
             ));
             return;
         }
-        let synchronization = self.synchronization_result(&method, &documents);
+        let validated_documents = if refresh_open_documents {
+            self.open_document_inputs()
+        } else {
+            documents.clone()
+        };
+        let synchronization = self.synchronization_result(
+            &method,
+            &documents,
+            refresh_open_documents,
+            &refresh_failures,
+        );
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         let request_params = params.clone();
@@ -560,7 +613,8 @@ impl LspRuntime {
                 partial_items: Vec::new(),
                 partial_bytes: 0,
                 trace,
-                documents,
+                validated_documents,
+                raw_request,
                 apply_edits,
                 apply_edit_ledger: Vec::new(),
                 synchronization,
@@ -606,10 +660,15 @@ impl LspRuntime {
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
                 self.record_pull_diagnostics(&query.method, query.params.as_ref(), &result);
                 match self
-                    .validate_documents_after_query(&query.documents, &result)
+                    .validate_documents_after_query(
+                        &query.validated_documents,
+                        &result,
+                        query.raw_request,
+                    )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(changed) => {
+                        query.synchronization["postResponseChanged"] = Value::Array(changed);
                         let mut output = json!({
                             "result": result,
                             "partialResults": query.partial_items,
@@ -641,7 +700,7 @@ impl LspRuntime {
 
         if message.get("id").is_some() && message.get("method").is_some() {
             let response = if message["method"] == "workspace/applyEdit" {
-                self.handle_apply_edit_callback(&message, active)
+                self.handle_apply_edit_callback(&message, active).await
             } else {
                 self.route_server_request(message).await
             };
@@ -721,41 +780,98 @@ impl LspRuntime {
         Err("Malformed JSON-RPC routing".to_owned())
     }
 
-    fn handle_apply_edit_callback(
-        &self,
+    async fn handle_apply_edit_callback(
+        &mut self,
         message: &Value,
         active: &mut BTreeMap<i64, ActiveQuery>,
     ) -> Value {
         let callback_id = message.get("id").cloned().unwrap_or(Value::Null);
-        let candidates = active
-            .iter()
-            .filter(|(_, query)| query.method == "workspace/executeCommand")
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        if candidates.len() != 1 {
-            return json!({
-                "jsonrpc": "2.0",
-                "id": callback_id,
-                "result": {"applied": false, "failureReason": "no_unique_preauthorized_request"}
-            });
-        }
-        let query = active.get_mut(&candidates[0]).unwrap();
-        let ordinal = query.apply_edit_ledger.len() as u64;
+        let candidate = (active.len() == 1)
+            .then(|| active.keys().next().copied())
+            .flatten();
+        let ordinal = candidate
+            .and_then(|id| active.get(&id))
+            .map_or(0, |query| query.apply_edit_ledger.len() as u64);
         let label = message.pointer("/params/label").and_then(Value::as_str);
-        if !query.apply_edits {
-            query.apply_edit_ledger.push(json!({
-                "ordinal": ordinal,
-                "label": label,
-                "applied": false,
-                "outcome": "rejected",
-                "failureReason": "preview_required"
-            }));
-            return json!({
-                "jsonrpc": "2.0",
-                "id": callback_id,
-                "result": {"applied": false, "failureReason": "preview_required"}
-            });
+        let Some(edit) = message.pointer("/params/edit").cloned() else {
+            if let Some(query) = candidate.and_then(|id| active.get_mut(&id)) {
+                query.apply_edit_ledger.push(json!({
+                    "ordinal": ordinal,
+                    "label": label,
+                    "applied": false,
+                    "outcome": "rejected",
+                    "failureReason": "invalid_workspace_edit"
+                }));
+            }
+            return json_rpc_error(
+                callback_id,
+                -32602,
+                "workspace/applyEdit requires params.edit",
+                None,
+            );
+        };
+        let preauthorized = candidate
+            .and_then(|id| active.get(&id))
+            .is_some_and(|query| query.method == "workspace/executeCommand" && query.apply_edits);
+        if !preauthorized {
+            let preview = crate::mutation::create_callback_preview(
+                &self.workspace_path,
+                &self.workspace_uri,
+                &self.server,
+                &self.session_identity,
+                self.declaration_digest.as_deref(),
+                self.negotiated.position_encoding,
+                label,
+                edit,
+                &self.preview_settings,
+                &self.mutation_settings,
+            );
+            return match preview {
+                Ok(preview) => {
+                    let preview_id = preview
+                        .get("previewId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(query) = candidate.and_then(|id| active.get_mut(&id)) {
+                        let mut ledger = json!({
+                            "ordinal": ordinal,
+                            "label": label,
+                            "applied": false,
+                            "outcome": if preview_id.is_some() { "previewed" } else { "unchanged" },
+                            "failureReason": "preview_required",
+                            "previewId": preview_id
+                        });
+                        compact_json_object(&mut ledger);
+                        query.apply_edit_ledger.push(ledger);
+                    }
+                    let mut result = json!({
+                        "applied": false,
+                        "failureReason": "preview_required",
+                        "previewId": preview_id
+                    });
+                    compact_json_object(&mut result);
+                    json!({"jsonrpc": "2.0", "id": callback_id, "result": result})
+                }
+                Err(failure) => {
+                    if let Some(query) = candidate.and_then(|id| active.get_mut(&id)) {
+                        query.apply_edit_ledger.push(json!({
+                            "ordinal": ordinal,
+                            "label": label,
+                            "applied": false,
+                            "outcome": "rejected",
+                            "failureReason": failure.code
+                        }));
+                    }
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": callback_id,
+                        "result": {"applied": false, "failureReason": failure.code}
+                    })
+                }
+            };
         }
+
+        let query = active.get_mut(&candidate.unwrap()).unwrap();
         if query.apply_edit_ledger.len() as u64
             >= self.mutation_settings.max_preauthorized_callbacks
         {
@@ -764,29 +880,14 @@ impl LspRuntime {
                 "label": label,
                 "applied": false,
                 "outcome": "rejected",
-                "failureReason": "callback_limit_exceeded"
+                "failureReason": "resource_limit_exceeded"
             }));
             return json!({
                 "jsonrpc": "2.0",
                 "id": callback_id,
-                "result": {"applied": false, "failureReason": "callback_limit_exceeded"}
+                "result": {"applied": false, "failureReason": "resource_limit_exceeded"}
             });
         }
-        let Some(edit) = message.pointer("/params/edit").cloned() else {
-            query.apply_edit_ledger.push(json!({
-                "ordinal": ordinal,
-                "label": label,
-                "applied": false,
-                "outcome": "rejected",
-                "failureReason": "invalid_workspace_edit"
-            }));
-            return json_rpc_error(
-                callback_id,
-                -32602,
-                "workspace/applyEdit requires params.edit",
-                None,
-            );
-        };
         match crate::mutation::apply_preauthorized_workspace_edit(
             &self.workspace_path,
             &self.workspace_uri,
@@ -801,6 +902,29 @@ impl LspRuntime {
         ) {
             Ok(application) => {
                 let result = &application["result"];
+                let receipt_id = result.get("receiptId").and_then(Value::as_str);
+                let (outcomes, failures) = self
+                    .documents
+                    .refresh_open_documents(self.negotiated.text_synchronization);
+                let mut synchronized = failures.is_empty();
+                for outcome in outcomes {
+                    synchronized &= self
+                        .send_synchronization_events(outcome.events)
+                        .await
+                        .is_ok();
+                }
+                let pending_events = self.documents.drain_pending_events();
+                synchronized &= self
+                    .send_synchronization_events(pending_events)
+                    .await
+                    .is_ok();
+                if synchronized {
+                    query.validated_documents = self.open_document_inputs();
+                }
+                if synchronized && let Some(receipt_id) = receipt_id {
+                    synchronized =
+                        crate::mutation::mark_receipt_session_synchronized(receipt_id).is_ok();
+                }
                 let mut ledger = json!({
                     "ordinal": ordinal,
                     "label": label,
@@ -808,7 +932,8 @@ impl LspRuntime {
                     "outcome": "applied",
                     "previewId": result.get("previewId"),
                     "receiptId": result.get("receiptId"),
-                    "filesystemState": result.get("filesystemState")
+                    "filesystemState": result.get("filesystemState"),
+                    "failureReason": (!synchronized).then_some("session_synchronization_failed")
                 });
                 compact_json_object(&mut ledger);
                 query.apply_edit_ledger.push(ledger);
@@ -939,21 +1064,70 @@ impl LspRuntime {
         Ok(())
     }
 
-    fn synchronization_result(&self, method: &str, documents: &[OwnerDocumentInput]) -> Value {
-        let before = documents
-            .iter()
-            .filter_map(|document| {
-                let uri = Url::from_file_path(&document.path).ok()?.to_string();
-                let snapshot = self.documents.get(&uri)?;
-                Some(json!({
-                    "uri": snapshot.uri,
-                    "digest": snapshot.digest,
-                    "version": snapshot.version,
-                    "languageId": snapshot.language_id
-                }))
+    async fn refresh_open_documents_best_effort(&mut self) -> Vec<ContractFailure> {
+        let (outcomes, failures) = self
+            .documents
+            .refresh_open_documents(self.negotiated.text_synchronization);
+        for outcome in outcomes {
+            if let Err(failure) = self.send_synchronization_events(outcome.events).await {
+                return vec![failure];
+            }
+        }
+        let pending_events = self.documents.drain_pending_events();
+        if let Err(failure) = self.send_synchronization_events(pending_events).await {
+            return vec![failure];
+        }
+        failures
+    }
+
+    fn open_document_inputs(&self) -> Vec<OwnerDocumentInput> {
+        self.documents
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| OwnerDocumentInput {
+                path: snapshot.path.clone(),
+                language_id: snapshot.language_id.clone(),
+                expected_digest: snapshot.digest.clone(),
             })
-            .collect::<Vec<_>>();
-        let mode = if method == "workspace/diagnostic" {
+            .collect()
+    }
+
+    fn synchronization_result(
+        &self,
+        method: &str,
+        documents: &[OwnerDocumentInput],
+        refresh_open_documents: bool,
+        failures: &[ContractFailure],
+    ) -> Value {
+        let before = if refresh_open_documents {
+            self.documents
+                .snapshots()
+                .into_iter()
+                .map(|snapshot| {
+                    json!({
+                        "uri": snapshot.uri,
+                        "digest": snapshot.digest,
+                        "version": snapshot.version,
+                        "languageId": snapshot.language_id
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            documents
+                .iter()
+                .filter_map(|document| {
+                    let uri = Url::from_file_path(&document.path).ok()?.to_string();
+                    let snapshot = self.documents.get(&uri)?;
+                    Some(json!({
+                        "uri": snapshot.uri,
+                        "digest": snapshot.digest,
+                        "version": snapshot.version,
+                        "languageId": snapshot.language_id
+                    }))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mode = if refresh_open_documents || method == "workspace/diagnostic" {
             "workspace"
         } else if documents.is_empty() {
             "none"
@@ -964,9 +1138,9 @@ impl LspRuntime {
         };
         json!({
             "mode": mode,
-            "bestEffort": false,
+            "bestEffort": refresh_open_documents,
             "before": before,
-            "failures": [],
+            "failures": failures.iter().map(contract_failure_ref_value).collect::<Vec<_>>(),
             "postResponseChanged": []
         })
     }
@@ -975,7 +1149,9 @@ impl LspRuntime {
         &mut self,
         documents: &[OwnerDocumentInput],
         server_result: &Value,
-    ) -> Result<(), ContractFailure> {
+        raw_request: bool,
+    ) -> Result<Vec<Value>, ContractFailure> {
+        let mut changed = Vec::new();
         for document in documents {
             let outcome = self.documents.refresh(
                 &document.path,
@@ -984,6 +1160,14 @@ impl LspRuntime {
             )?;
             if outcome.snapshot.digest != document.expected_digest {
                 self.send_synchronization_events(outcome.events).await?;
+                if raw_request {
+                    changed.push(json!({
+                        "uri": outcome.snapshot.uri,
+                        "beforeDigest": document.expected_digest,
+                        "afterDigest": outcome.snapshot.digest
+                    }));
+                    continue;
+                }
                 return Err(ContractFailure {
                     exit_code: 5,
                     category: "query",
@@ -1003,7 +1187,7 @@ impl LspRuntime {
                 });
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     async fn send_synchronization_events(
@@ -1163,8 +1347,14 @@ impl LspRuntime {
                 let diagnostics = message.pointer("/params/diagnostics").cloned();
                 let version = message.pointer("/params/version").and_then(Value::as_i64);
                 if let (Some(uri), Some(diagnostics)) = (uri, diagnostics) {
-                    self.diagnostics
-                        .publish(uri, version, diagnostics, version, true);
+                    let current_version = self.documents.get(uri).map(|document| document.version);
+                    self.diagnostics.publish(
+                        uri,
+                        version,
+                        diagnostics,
+                        current_version,
+                        current_version.is_some(),
+                    );
                 }
             }
             "window/logMessage" => {
@@ -1314,7 +1504,7 @@ fn route_callback(
     params: Value,
 ) -> Result<Value, ResponseError> {
     match method {
-        "workspace/configuration" => Ok(workspace_configuration_result(context, &params)),
+        "workspace/configuration" => workspace_configuration_result(context, &params),
         "workspace/workspaceFolders" => Ok(json!([context.workspace_folder])),
         "workspace/diagnostic/refresh" => Ok(Value::Null),
         "workspace/applyEdit" => Ok(json!({
@@ -1330,11 +1520,17 @@ fn route_callback(
     }
 }
 
-fn workspace_configuration_result(context: &CallbackContext, params: &Value) -> Value {
+fn workspace_configuration_result(
+    context: &CallbackContext,
+    params: &Value,
+) -> Result<Value, ResponseError> {
     let Some(items) = params.get("items").and_then(Value::as_array) else {
-        return Value::Array(Vec::new());
+        return Err(ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            "workspace/configuration requires an items array".to_owned(),
+        ));
     };
-    Value::Array(
+    Ok(Value::Array(
         items
             .iter()
             .map(|item| {
@@ -1362,7 +1558,7 @@ fn workspace_configuration_result(context: &CallbackContext, params: &Value) -> 
                 value.clone()
             })
             .collect(),
-    )
+    ))
 }
 
 fn configuration_scope_allowed(context: &CallbackContext, scope_uri: Option<&Value>) -> bool {
@@ -1489,7 +1685,7 @@ fn status_result(
         "serverPid": lsp.process.pid(),
         "uptimeMs": started.elapsed().as_millis() as u64,
         "idleDeadline": rfc3339_after(idle_deadline.saturating_duration_since(Instant::now())),
-        "queueDepth": queue_depth.saturating_add(active_queries.len()).min(OWNER_QUEUE_LIMIT),
+        "queueDepth": queue_depth.min(OWNER_QUEUE_LIMIT),
         "activeQuery": active_query,
         "capabilities": lsp.negotiated.providers_json(),
         "progress": lsp.progress.values().collect::<Vec<_>>()
@@ -1640,6 +1836,18 @@ fn contract_failure_value(failure: ContractFailure) -> Value {
     })
 }
 
+fn contract_failure_ref_value(failure: &ContractFailure) -> Value {
+    json!({
+        "category": failure.category,
+        "code": failure.code,
+        "message": failure.message,
+        "stage": failure.stage,
+        "delivery": failure.delivery,
+        "retry": failure.retry,
+        "data": failure.data
+    })
+}
+
 fn attach_trace(failure: &mut Value, trace: Option<ProtocolTrace>) {
     if let Some(trace) = trace {
         failure["trace"] = trace.render();
@@ -1682,11 +1890,11 @@ fn request_cancelled(source: &str) -> Value {
     })
 }
 
-fn server_exited_failure(status: Option<std::process::ExitStatus>) -> Value {
+fn server_exited_failure(status: Option<std::process::ExitStatus>, stderr_tail: &str) -> Value {
     json!({
         "category": "query", "code": "server_exited", "message": "The language server exited unexpectedly.",
         "stage": "await_response", "delivery": "uncertain", "retry": "unsafe",
-        "data": {"status": process_status(status), "stderrTail": ""}
+        "data": {"status": process_status(status), "stderrTail": stderr_tail}
     })
 }
 

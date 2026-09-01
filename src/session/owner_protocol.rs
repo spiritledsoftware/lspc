@@ -48,6 +48,7 @@ pub(crate) enum OwnerRequest {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         documents: Vec<OwnerDocumentInput>,
     },
+    RefreshDocuments,
     Stop {
         force: bool,
     },
@@ -57,6 +58,8 @@ pub(crate) enum OwnerRequest {
         params: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         documents: Vec<OwnerDocumentInput>,
+        refresh_open_documents: bool,
+        raw_request: bool,
         request_timeout_ms: u64,
         trace_protocol: bool,
         apply_edits: bool,
@@ -113,6 +116,7 @@ pub(crate) struct OwnerLaunchSettings {
     pub(crate) token: String,
     pub(crate) workspace_uri: String,
     pub(crate) server: String,
+    pub(crate) declaration_digest: Option<String>,
     pub(crate) server_args: Vec<String>,
     pub(crate) initialization_options: Option<Value>,
     pub(crate) settings: Value,

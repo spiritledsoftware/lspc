@@ -1621,7 +1621,7 @@ fn identity_digest(
     metadata: &Metadata,
     index: u64,
 ) -> Result<String, WorkspaceEditProblem> {
-    let mut identity = json!({"length": metadata.len()});
+    let mut identity = json!({});
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1631,6 +1631,7 @@ fn identity_digest(
     }
     #[cfg(windows)]
     {
+        let _ = metadata;
         let (volume_serial, file_index) = windows_file_identity(path).map_err(|error| {
             problem(
                 "filesystem_capability_unavailable",

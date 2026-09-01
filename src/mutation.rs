@@ -66,6 +66,10 @@ pub(crate) fn acquire_workspace_application_lock(
     Ok(lock)
 }
 
+pub(crate) fn mark_receipt_session_synchronized(receipt_id: &str) -> Result<(), ContractFailure> {
+    MutationStateStore::open()?.mark_receipt_session_synchronized(receipt_id)
+}
+
 fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let workspace = invocation.option_path("--workspace").unwrap();
     let server_name = invocation.option_string("--server").unwrap();
@@ -250,9 +254,101 @@ pub(crate) fn apply_preauthorized_workspace_edit(
         receipt_limits: receipts,
         mutation_limits: mutation,
         reauthorize: None,
+        post_commit: None,
         preauthorized: true,
     };
     apply_preview(&context, &preview_id)
+}
+
+/// Validates and persists a server-initiated edit that was not preauthorized.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_callback_preview(
+    workspace_path: &std::path::Path,
+    workspace_uri: &str,
+    server: &str,
+    session_identity: &str,
+    declaration_digest: Option<&str>,
+    position_encoding: PositionEncoding,
+    label: Option<&str>,
+    edit: Value,
+    previews: &PreviewSettings,
+    mutation: &MutationSettings,
+) -> Result<Value, ContractFailure> {
+    let planner = WorkspaceEditPlanner::open(
+        workspace_path,
+        workspace_uri,
+        position_encoding,
+        previews,
+        mutation,
+    )
+    .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
+    let planned = planner
+        .plan_workspace_edit(&edit)
+        .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
+    if planned.plan.operations.is_empty() {
+        return Ok(Value::Null);
+    }
+    let current = planner
+        .inspect_manifest_paths(
+            &planned
+                .plan
+                .before_manifest
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|problems| unsupported_filesystem(workspace_uri, &problems))?;
+    let stale_reasons = manifest_mismatches(&planned.plan.before_manifest, &current);
+    if !stale_reasons.is_empty() {
+        return Err(ContractFailure {
+            exit_code: 6,
+            category: "mutation",
+            code: "proposal_stale",
+            message: "The Workspace changed while the callback was being planned.".to_owned(),
+            stage: "validate_mutation",
+            delivery: "not_applicable",
+            retry: "after_change",
+            data: json!({
+                "proposal": edit,
+                "reasons": stale_reasons,
+                "preconditions": planned.plan.before_manifest
+            }),
+        });
+    }
+    let store = MutationStateStore::open()?;
+    let preview_id = store.new_preview_id()?;
+    let recovery_manifest_digest = current_recovery_manifest(&store, workspace_uri)?;
+    let record = create_preview_record(
+        PreviewRecordContext {
+            preview_id: &preview_id,
+            workspace_uri,
+            server: Some(server.to_owned()),
+            session_identity,
+            position_encoding: position_encoding.name(),
+            source: json!({"kind": "workspace_apply_edit", "label": label}),
+            edit,
+            command: None,
+        },
+        planned,
+    );
+    let mut stored = store.create_preview(
+        record,
+        workspace_path.to_path_buf(),
+        authorization_digest(session_identity, declaration_digest),
+        recovery_manifest_digest,
+        previews,
+    )?;
+    refresh_preview_presentation(&mut stored, previews, mutation);
+    serde_json::to_value(stored.preview).map_err(|error| ContractFailure {
+        exit_code: 70,
+        category: "internal",
+        code: "internal_error",
+        message: "The callback Preview cannot be serialized.".to_owned(),
+        stage: "create_preview",
+        delivery: "sent",
+        retry: "after_change",
+        data: json!({"reason": error.to_string()}),
+    })
 }
 
 fn persist_preview(
@@ -406,7 +502,7 @@ fn preview_discard(invocation: &ParsedInvocation) -> Result<Value, ContractFailu
 fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
     let id = invocation.positional_string(0).unwrap();
     let store = MutationStateStore::open()?;
-    if let Some(receipt) = store.already_applied(&id)?
+    let application = if let Some(receipt) = store.already_applied(&id)?
         && receipt.receipt.outcome == "applied"
     {
         let (previews, receipts, mutation) = default_mutation_settings();
@@ -416,25 +512,71 @@ fn apply(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
             receipt_limits: &receipts,
             mutation_limits: &mutation,
             reauthorize: None,
+            post_commit: None,
             preauthorized: false,
         };
-        return apply_preview(&context, &id);
-    }
-    let preview = store.read_preview(&id)?;
-    let configuration = load_configuration(
-        &preview.workspace_path,
-        invocation.has_option("--ignore-project-config"),
-    )?;
-    let reauthorize = |stored: &StoredPreview| reauthorize_preview(invocation, &store, stored);
-    let context = ApplicationContext {
-        store: &store,
-        preview_limits: &configuration.previews,
-        receipt_limits: &configuration.receipts,
-        mutation_limits: &configuration.mutation,
-        reauthorize: Some(&reauthorize),
-        preauthorized: false,
+        apply_preview(&context, &id)?
+    } else {
+        let preview = store.read_preview(&id)?;
+        let configuration = load_configuration(
+            &preview.workspace_path,
+            invocation.has_option("--ignore-project-config"),
+        )?;
+        let reauthorize = |stored: &StoredPreview| reauthorize_preview(invocation, &store, stored);
+        let synchronize = |receipt: &state::ReceiptRecord| {
+            let (_, failures) = crate::session::refresh_workspace_owners(
+                &receipt.workspace_uri,
+                receipt.server.as_deref(),
+            );
+            failures.is_empty()
+        };
+        let context = ApplicationContext {
+            store: &store,
+            preview_limits: &configuration.previews,
+            receipt_limits: &configuration.receipts,
+            mutation_limits: &configuration.mutation,
+            reauthorize: Some(&reauthorize),
+            post_commit: Some(&synchronize),
+            preauthorized: false,
+        };
+        apply_preview(&context, &id)?
     };
-    apply_preview(&context, &id)
+    synchronize_application_receipt(&store, application)
+}
+
+fn synchronize_application_receipt(
+    store: &MutationStateStore,
+    mut application: Value,
+) -> Result<Value, ContractFailure> {
+    if application
+        .pointer("/result/sessionSynchronized")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Ok(application);
+    }
+    let Some(receipt_id) = application
+        .pointer("/result/receiptId")
+        .and_then(Value::as_str)
+    else {
+        return Ok(application);
+    };
+    let receipt = store.read_receipt(receipt_id)?;
+    let (_, failures) = crate::session::refresh_workspace_owners(
+        &receipt.receipt.workspace_uri,
+        receipt.receipt.server.as_deref(),
+    );
+    if failures.is_empty() {
+        store.mark_receipt_session_synchronized(receipt_id)?;
+        application["result"]["sessionSynchronized"] = Value::Bool(true);
+    } else {
+        application["warnings"] = json!([{
+            "code": "session_synchronization_failed",
+            "message": "One or more live Owners could not refresh after the commit.",
+            "data": {"ownerGenerations": failures}
+        }]);
+    }
+    Ok(application)
 }
 
 fn recovery_status(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {

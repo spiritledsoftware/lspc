@@ -60,6 +60,7 @@ def archive_entries(binary: Path, skill_dir: Path) -> tuple[list[tuple[str, Path
         ("README.md", ROOT / "README.md"),
         ("LICENSE-MIT", ROOT / "LICENSE-MIT"),
         ("LICENSE-APACHE", ROOT / "LICENSE-APACHE"),
+        ("reference-servers.json", ROOT / "assets/reference-servers.json"),
     ]
     skill_files = payload_files(skill_dir)
     files.extend((f"skills/lspc/{relative}", path) for relative, path in skill_files)
@@ -71,6 +72,9 @@ def archive_entries(binary: Path, skill_dir: Path) -> tuple[list[tuple[str, Path
 def archive_manifest(
     entries: list[tuple[str, Path]], version: str, target: str, commit: str, rust_version: str, skill: str
 ) -> bytes:
+    reference_servers = json.loads(
+        (ROOT / "assets/reference-servers.json").read_text(encoding="utf-8")
+    )
     manifest = {
         "formatVersion": 1,
         "name": "lspc",
@@ -79,6 +83,7 @@ def archive_manifest(
         "sourceCommit": commit,
         "rustVersion": rust_version,
         "skillDigest": skill,
+        "referenceServers": reference_servers,
         "files": [
             {"path": relative, "sha256": f"sha256:{sha256(path)}", "bytes": path.stat().st_size}
             for relative, path in entries
@@ -113,7 +118,13 @@ def write_archive(path: Path, entries: list[tuple[str, Path]], manifest: bytes, 
 
 
 def verify_archive(path: Path, manifest: bytes, prefix: str, kind: str) -> None:
-    expected = {f"{prefix}/manifest.json", f"{prefix}/README.md", f"{prefix}/LICENSE-MIT", f"{prefix}/LICENSE-APACHE"}
+    expected = {
+        f"{prefix}/manifest.json",
+        f"{prefix}/README.md",
+        f"{prefix}/LICENSE-MIT",
+        f"{prefix}/LICENSE-APACHE",
+        f"{prefix}/reference-servers.json",
+    }
     if kind == "zip":
         with zipfile.ZipFile(path) as archive:
             names = set(archive.namelist())

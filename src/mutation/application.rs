@@ -32,6 +32,7 @@ use super::{
 };
 
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
+type PostCommit<'a> = dyn Fn(&ReceiptRecord) -> bool + 'a;
 
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
@@ -39,6 +40,7 @@ pub(crate) struct ApplicationContext<'a> {
     pub(crate) receipt_limits: &'a ReceiptSettings,
     pub(crate) mutation_limits: &'a MutationSettings,
     pub(crate) reauthorize: Option<&'a ReauthorizePreview<'a>>,
+    pub(crate) post_commit: Option<&'a PostCommit<'a>>,
     pub(crate) preauthorized: bool,
 }
 
@@ -52,18 +54,32 @@ pub(crate) fn apply_preview(
     {
         return Ok(application_success(&receipt.receipt, "already_applied"));
     };
-    let mut stored = context.store.reserve_preview(preview_id)?;
+    let preliminary = match context.store.read_preview(preview_id) {
+        Ok(preview) => preview,
+        Err(failure) if failure.code == "preview_unknown" => {
+            if let Some(receipt) = context.store.already_applied(preview_id)?
+                && receipt.receipt.outcome == "applied"
+            {
+                return Ok(application_success(&receipt.receipt, "already_applied"));
+            }
+            return Err(failure);
+        }
+        Err(failure) => return Err(failure),
+    };
     let lock_file = context
         .store
-        .open_application_lock(&stored.preview.workspace_uri)?;
-    if let Err(failure) = lock_workspace(
+        .open_application_lock(&preliminary.preview.workspace_uri)?;
+    lock_workspace(
         &lock_file,
-        &stored.preview.workspace_uri,
+        &preliminary.preview.workspace_uri,
         &context.mutation_limits.application_lock_timeout,
-    ) {
-        let _ = context.store.release_preview(&mut stored);
-        return Err(failure);
+    )?;
+    if let Some(receipt) = context.store.already_applied(preview_id)?
+        && receipt.receipt.outcome == "applied"
+    {
+        return Ok(application_success(&receipt.receipt, "already_applied"));
     }
+    let mut stored = context.store.reserve_preview(preview_id)?;
     if let Some(reauthorize) = context.reauthorize {
         let stale_reasons = match reauthorize(&stored) {
             Ok(reasons) => reasons,
@@ -193,7 +209,7 @@ pub(crate) fn apply_preview(
         transaction.observed_manifest.clone_from(&observed);
         let cleanup_pending = cleanup_transaction_artifacts(&transaction).is_err();
         transaction.cleanup_pending = cleanup_pending;
-        let receipt = ReceiptRecord {
+        let mut receipt = ReceiptRecord {
             receipt_id: preview_id.to_owned(),
             kind: "receipt".to_owned(),
             transaction_id: transaction_id.clone(),
@@ -227,6 +243,15 @@ pub(crate) fn apply_preview(
             context.store.remove_transaction(&transaction_id)?;
         } else {
             context.store.write_transaction(&transaction)?;
+        }
+        if context
+            .post_commit
+            .is_some_and(|post_commit| post_commit(&receipt))
+        {
+            context
+                .store
+                .mark_receipt_session_synchronized(&receipt.receipt_id)?;
+            receipt.session_synchronized = true;
         }
         return Ok(application_success(&receipt, "applied"));
     }
@@ -1301,6 +1326,7 @@ mod tests {
             receipt_limits: &receipt_limits,
             mutation_limits: &mutation_limits,
             reauthorize: None,
+            post_commit: None,
             preauthorized: false,
         };
         let first = apply_preview(&context, &id).unwrap();

@@ -188,7 +188,7 @@ impl DiagnosticCache {
                 && snapshot.received_for_version.is_some()
                 && snapshot.received_for_version == current_version;
             if exact_version || usable_versionless {
-                return render(snapshot, true, true, true);
+                return render(snapshot, exact_version, true, true);
             }
         }
         DiagnosticResult {
@@ -335,13 +335,15 @@ impl DiagnosticCache {
     }
 
     pub(crate) fn invalidate_pull_result_ids(&mut self) {
-        for (key, snapshot) in &mut self.snapshots {
-            if !key.starts_with("pull\0") {
-                continue;
-            }
-            snapshot.result_id = None;
-            if let Some(report) = snapshot.raw_report.as_object_mut() {
-                report.remove("resultId");
+        let pull_keys = self
+            .snapshots
+            .keys()
+            .filter(|key| key.starts_with("pull\0"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in pull_keys {
+            if let Some(snapshot) = self.snapshots.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(snapshot.serialized_bytes);
             }
         }
     }
@@ -456,7 +458,7 @@ mod tests {
         assert!(versioned.complete);
 
         let versionless = cache.publish("file:///a", None, json!([]), Some(2), true);
-        assert!(versionless.fresh);
+        assert!(!versionless.fresh);
         assert!(versionless.complete);
         let later_revision = cache.published("file:///a", Some(3), true);
         assert!(!later_revision.complete);

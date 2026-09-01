@@ -423,6 +423,20 @@ impl MutationStateStore {
         Ok(receipt)
     }
 
+    pub(crate) fn mark_receipt_session_synchronized(
+        &self,
+        receipt_id: &str,
+    ) -> Result<(), ContractFailure> {
+        let mut stored = self.read_receipt(receipt_id)?;
+        if stored.receipt.session_synchronized {
+            return Ok(());
+        }
+        stored.receipt.session_synchronized = true;
+        let path = self.receipt_path(receipt_id);
+        let bytes = serialize_record(&stored, "receipt", &path)?;
+        write_record(&path, &bytes, "receipt")
+    }
+
     pub(crate) fn list_receipts(&self) -> Result<Vec<StoredReceipt>, ContractFailure> {
         self.prune_expired_records()?;
         let mut records = self
@@ -945,13 +959,9 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn preview_store_reserves_and_discards_exact_records() {
-        let directory = TempDir::new().unwrap();
-        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
-        let id = store.new_preview_id().unwrap();
-        let preview = PreviewRecord {
-            preview_id: id.clone(),
+    fn preview_record(id: String) -> PreviewRecord {
+        PreviewRecord {
+            preview_id: id,
             workspace_uri: "file:///workspace/".to_owned(),
             server: None,
             session_identity: format!("sid_{}", "0".repeat(64)),
@@ -972,7 +982,63 @@ mod tests {
             stale_reasons: vec![],
             diff: None,
             reserved: false,
-        };
+        }
+    }
+
+    fn receipt_record(id: String) -> ReceiptRecord {
+        ReceiptRecord {
+            receipt_id: id,
+            kind: "receipt".to_owned(),
+            transaction_id: "txn_test".to_owned(),
+            workspace_uri: "file:///workspace/".to_owned(),
+            server: None,
+            session_identity: None,
+            preview_id: None,
+            linked_receipt_id: None,
+            preauthorized: false,
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            completed_at: "2026-01-01T00:00:01Z".to_owned(),
+            outcome: "applied".to_owned(),
+            filesystem_state: "unchanged".to_owned(),
+            summary: PreviewSummary::default(),
+            before_manifest: Vec::new(),
+            intended_manifest: Vec::new(),
+            observed_manifest: Vec::new(),
+            session_synchronized: false,
+            cleanup_pending: false,
+            durability: json!({}),
+            manifest_digest: "sha256:test".to_owned(),
+            failure_stage: None,
+            failed_change: None,
+        }
+    }
+
+    #[test]
+    fn first_release_stored_state_fixtures_remain_readable() {
+        let preview: StoredPreview = serde_json::from_str(include_str!(
+            "../../tests/fixtures/stored-state/v1/preview.json"
+        ))
+        .unwrap();
+        let receipt: StoredReceipt = serde_json::from_str(include_str!(
+            "../../tests/fixtures/stored-state/v1/receipt.json"
+        ))
+        .unwrap();
+        let recovery: TransactionRecord = serde_json::from_str(include_str!(
+            "../../tests/fixtures/stored-state/v1/recovery.json"
+        ))
+        .unwrap();
+
+        assert_eq!(preview.format_version, MUTATION_STATE_VERSION);
+        assert_eq!(receipt.format_version, MUTATION_STATE_VERSION);
+        assert_eq!(recovery.format_version, MUTATION_STATE_VERSION);
+    }
+
+    #[test]
+    fn preview_store_reserves_and_discards_exact_records() {
+        let directory = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+        let id = store.new_preview_id().unwrap();
+        let preview = preview_record(id.clone());
         let limits = PreviewSettings {
             max_count: 2,
             max_total_bytes: 100_000,
@@ -993,5 +1059,40 @@ mod tests {
         store.release_preview(&mut reserved).unwrap();
         store.discard_preview(&id).unwrap();
         assert!(store.read_preview(&id).is_err());
+    }
+
+    #[test]
+    fn state_churn_respects_preview_and_receipt_capacity() {
+        let directory = TempDir::new().unwrap();
+        let store = MutationStateStore::open_at(directory.path().join("state")).unwrap();
+        let preview_limits = PreviewSettings {
+            max_count: 1,
+            max_total_bytes: 100_000,
+            max_document_text_bytes: 100,
+            max_text_bytes: 100,
+        };
+        for index in 0..2 {
+            let result = store.create_preview(
+                preview_record(format!("prv_{index:032}")),
+                directory.path().to_path_buf(),
+                "sha256:test".to_owned(),
+                None,
+                &preview_limits,
+            );
+            assert_eq!(result.is_ok(), index == 0);
+            if let Err(failure) = result {
+                assert_eq!(failure.code, "state_capacity_exceeded");
+            }
+        }
+
+        let receipt_limits = ReceiptSettings { max_count: 1 };
+        for index in 0..2 {
+            let result =
+                store.write_receipt(receipt_record(format!("rcp_{index:032}")), &receipt_limits);
+            assert_eq!(result.is_ok(), index == 0);
+            if let Err(failure) = result {
+                assert_eq!(failure.code, "state_capacity_exceeded");
+            }
+        }
     }
 }

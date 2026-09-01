@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+import importlib.util
 from pathlib import Path
 
 
@@ -18,9 +19,38 @@ ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = ROOT / "scripts/release/build_archive.py"
 SKILL_ARCHIVE = ROOT / "scripts/release/build_skill_archive.py"
 VERIFY_ARCHIVE = ROOT / "scripts/release/verify_archive.py"
+FLOOR_AUDIT = ROOT / "scripts/release/audit_runtime_floor.py"
+
+
+def load_floor_audit():
+    spec = importlib.util.spec_from_file_location("audit_runtime_floor", FLOOR_AUDIT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def test_runtime_floor_parsers_reject_newer_requirements(self) -> None:
+        audit = load_floor_audit()
+        self.assertEqual(
+            audit.linux_floor("Version: GLIBC_2.17 GLIBC_2.28")["requiredGlibc"],
+            "2.28",
+        )
+        with self.assertRaises(SystemExit):
+            audit.linux_floor("Version: GLIBC_2.34")
+        self.assertEqual(
+            audit.macos_floor("cmd LC_BUILD_VERSION\n  minos 12.0\n")["minimumOs"],
+            "12.0",
+        )
+        with self.assertRaises(SystemExit):
+            audit.macos_floor("cmd LC_BUILD_VERSION\n  minos 13.0\n")
+        dependents = "    KERNEL32.dll\n    bcrypt.dll\n"
+        headers = "  10.00 operating system version\n  6.00 subsystem version\n"
+        self.assertEqual(audit.windows_floor(dependents, headers)["encodedOsVersion"], "10.00")
+        with self.assertRaises(SystemExit):
+            audit.windows_floor("    future.dll\n", headers)
+
     def test_archives_contain_a_verified_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             temporary = Path(temporary)
@@ -66,6 +96,10 @@ class ReleaseArchiveTests(unittest.TestCase):
                 self.assertIn(f"{prefix}/skills/lspc/SKILL.md", names)
                 self.assertEqual(manifest["version"], "1.2.3")
                 self.assertTrue(manifest["skillDigest"].startswith("sha256:"))
+                self.assertEqual(
+                    manifest["referenceServers"]["rustAnalyzer"]["version"],
+                    "2026-08-31",
+                )
                 checksum = (output / f"lspc-v1.2.3-{target}.{extension}.sha256").read_text(encoding="ascii")
                 self.assertTrue(checksum.startswith(hashlib.sha256(archive.read_bytes()).hexdigest()))
                 subprocess.run([sys.executable, str(VERIFY_ARCHIVE), str(archive), "--target", target, "--version", "1.2.3"], check=True)
