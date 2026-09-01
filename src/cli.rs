@@ -155,9 +155,9 @@ fn dispatch_invocation(invocation: ParsedInvocation) -> ExitCode {
             match crate::session::dispatch_owner_query_command(&invocation) {
                 Ok(envelope) => emit_envelope(&envelope, ExitCode::SUCCESS),
                 Err(failure) => {
-                    let exit_code = failure.exit_code;
+                    let exit_code = failure.failure.exit_code;
                     emit_envelope(
-                        &failure_envelope(invocation.command, &failure),
+                        &crate::query::query_failure_envelope(invocation.command, &failure),
                         ExitCode::from(exit_code),
                     )
                 }

@@ -174,9 +174,36 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
             Some("textDocument/definition")
             | Some("textDocument/references")
             | Some("textDocument/documentSymbol")
-            | Some("workspace/symbol")
             | Some("textDocument/formatting")
             | Some("textDocument/codeAction") => {
+                if result(&mut output, &message, json!([]), scenario).is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("workspace/symbol")
+                if message.pointer("/params/query").and_then(Value::as_str)
+                    == Some("error-with-partial") =>
+            {
+                let progress = json!({
+                    "jsonrpc": "2.0",
+                    "method": "$/progress",
+                    "params": {
+                        "token": message.pointer("/params/partialResultToken").cloned().unwrap_or(Value::Null),
+                        "value": [{"name": "partial-symbol", "kind": 12}]
+                    }
+                });
+                let error = json!({
+                    "jsonrpc": "2.0",
+                    "id": message.get("id").cloned().unwrap_or(Value::Null),
+                    "error": {"code": -32603, "message": "fixture failure", "data": {"fixture": true}}
+                });
+                if write_frame(&mut output, &progress, scenario).is_err()
+                    || write_frame(&mut output, &error, scenario).is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
+            Some("workspace/symbol") => {
                 if result(&mut output, &message, json!([]), scenario).is_err() {
                     return ExitCode::from(1);
                 }

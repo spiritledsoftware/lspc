@@ -814,11 +814,11 @@ impl LspRuntime {
             };
             let response = if let Some(cancellation) = query.cancellation.take() {
                 let mut failure = cancellation.failure;
-                attach_trace(&mut failure, query.trace);
+                attach_dispatch_evidence(&mut failure, &mut query);
                 OwnerResponse::failure(owner_generation, failure)
             } else if let Some(error) = message.get("error") {
                 let mut failure = server_error_failure(error);
-                attach_trace(&mut failure, query.trace);
+                attach_dispatch_evidence(&mut failure, &mut query);
                 OwnerResponse::failure(owner_generation, failure)
             } else if message.get("result").is_some() {
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
@@ -850,7 +850,9 @@ impl LspRuntime {
                         OwnerResponse::success(owner_generation, output)
                     }
                     Err(failure) => {
-                        OwnerResponse::failure(owner_generation, contract_failure_value(failure))
+                        let mut failure = contract_failure_value(failure);
+                        attach_dispatch_evidence(&mut failure, &mut query);
+                        OwnerResponse::failure(owner_generation, failure)
                     }
                 }
             } else {
@@ -2343,6 +2345,16 @@ fn attach_trace(failure: &mut Value, trace: Option<ProtocolTrace>) {
     }
 }
 
+fn attach_dispatch_evidence(failure: &mut Value, query: &mut ActiveQuery) {
+    if !query.partial_items.is_empty() {
+        failure["partialResult"] = json!({"items": query.partial_items.clone(), "complete": false});
+    }
+    if !query.apply_edit_ledger.is_empty() {
+        failure["applyEditLedger"] = Value::Array(query.apply_edit_ledger.clone());
+    }
+    attach_trace(failure, query.trace.take());
+}
+
 async fn fail_active_queries(
     owner_generation: &str,
     active: &mut BTreeMap<i64, ActiveQuery>,
@@ -2351,7 +2363,7 @@ async fn fail_active_queries(
     let mut deliveries = Vec::new();
     for (_, mut query) in std::mem::take(active) {
         let mut failure = failure.clone();
-        attach_trace(&mut failure, query.trace.take());
+        attach_dispatch_evidence(&mut failure, &mut query);
         if let Some(response) = query.response.take() {
             let _ = response.send(OwnerResponse::failure(owner_generation, failure));
         }

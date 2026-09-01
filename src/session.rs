@@ -32,8 +32,8 @@ use crate::{
     },
     contract::ContractFailure,
     query::{
-        Capabilities, DispatchRequest, DispatchResponse, PreviewCreator, PreviewProposal, Provider,
-        ProviderState, QueryContext, SessionDispatcher, compose, execute,
+        Capabilities, DispatchFailure, DispatchRequest, DispatchResponse, PreviewCreator,
+        PreviewProposal, QueryContext, QueryExecutionFailure, SessionDispatcher, compose, execute,
     },
     workspace::{
         DiagnosticCache, DocumentStore, PositionEncoding, TextSynchronization, select_workspace,
@@ -87,11 +87,13 @@ pub(crate) fn dispatch_session_command(
 /// Runs every Query through the persistent Owner transport.
 pub(crate) fn dispatch_owner_query_command(
     invocation: &ParsedInvocation,
-) -> Result<Value, ContractFailure> {
+) -> Result<Value, QueryExecutionFailure> {
     run_async(dispatch_owner_query(invocation))
 }
 
-async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, ContractFailure> {
+async fn dispatch_owner_query(
+    invocation: &ParsedInvocation,
+) -> Result<Value, QueryExecutionFailure> {
     let queue_deadline = invocation
         .option_string("--deadline")
         .map(|value| QueueDeadline::new(parse_duration(&value)));
@@ -125,7 +127,7 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
         queue_deadline_remaining(queue_deadline)?,
     )
     .await?;
-    let capabilities = capabilities_from_owner(&owner_capabilities);
+    let capabilities = Capabilities::from_owner_result(&owner_capabilities);
     let position_encoding = match owner_capabilities["positionEncoding"].as_str() {
         Some("utf-8") => PositionEncoding::Utf8,
         _ => PositionEncoding::Utf16,
@@ -286,38 +288,6 @@ async fn dispatch_owner_query(invocation: &ParsedInvocation) -> Result<Value, Co
     )
 }
 
-fn capabilities_from_owner(value: &Value) -> Capabilities {
-    let providers = value["providers"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(name, provider)| {
-            let state = match provider["state"].as_str() {
-                Some("supported") => ProviderState::Supported,
-                Some("invalid") => ProviderState::Invalid,
-                _ => ProviderState::Unsupported,
-            };
-            (
-                name.clone(),
-                Provider {
-                    state,
-                    capability_path: provider["capabilityPath"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    options: provider.get("options").cloned(),
-                    selector: provider.get("documentSelector").cloned(),
-                    problems: provider["problems"].as_array().cloned().unwrap_or_default(),
-                },
-            )
-        })
-        .collect();
-    Capabilities {
-        providers,
-        initialize_result: value.get("initializeResult").cloned(),
-    }
-}
-
 #[derive(Clone, Copy)]
 struct QueueDeadline {
     started: Instant,
@@ -384,20 +354,23 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
     fn dispatch(
         &mut self,
         mut request: DispatchRequest,
-    ) -> Result<DispatchResponse, ContractFailure> {
+    ) -> Result<DispatchResponse, DispatchFailure> {
         let mut synchronized = Vec::new();
         for path in &request.synchronized_files {
             let path =
-                validate_document_scope(self.workspace, path, self.explicit_workspace, false)?;
+                validate_document_scope(self.workspace, path, self.explicit_workspace, false)
+                    .map_err(DispatchFailure::from)?;
             let language_id = crate::configuration::document_language_id(
                 self.configuration,
                 self.server,
                 &path,
                 self.explicit_language_id.as_deref(),
-            )?;
+            )
+            .map_err(DispatchFailure::from)?;
             let snapshot = self
                 .documents
-                .refresh(&path, &language_id, self.text_synchronization)?
+                .refresh(&path, &language_id, self.text_synchronization)
+                .map_err(DispatchFailure::from)?
                 .snapshot;
             synchronized.push(owner_protocol::OwnerDocumentInput {
                 path: snapshot.path,
@@ -407,15 +380,22 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
         }
         if let Some(params) = request.params.as_mut() {
             if request.partial_results && params.is_object() {
-                params["partialResultToken"] = json!(format!("lspc-partial-{}", random_hex(16)?));
+                params["partialResultToken"] = json!(format!(
+                    "lspc-partial-{}",
+                    random_hex(16).map_err(DispatchFailure::from)?
+                ));
             }
             if request.work_done_progress && params.is_object() {
-                params["workDoneToken"] = json!(format!("lspc-work-{}", random_hex(16)?));
+                params["workDoneToken"] = json!(format!(
+                    "lspc-work-{}",
+                    random_hex(16).map_err(DispatchFailure::from)?
+                ));
             }
         }
-        let queue_deadline = queue_deadline_remaining(self.queue_deadline)?;
-        let mut response = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(send_owner_request_with_queue_deadline(
+        let queue_deadline =
+            queue_deadline_remaining(self.queue_deadline).map_err(DispatchFailure::from)?;
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(exchange_owner_request_with_queue_deadline(
                 self.endpoint,
                 OwnerRequest::Dispatch {
                     method: request.method,
@@ -429,7 +409,15 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
                 },
                 queue_deadline,
             ))
-        })?;
+        })
+        .map_err(DispatchFailure::from)?;
+        let mut response = if response.ok {
+            response.result.unwrap_or(Value::Null)
+        } else {
+            return Err(dispatch_failure_from_owner(
+                response.error.unwrap_or_else(|| json!({})),
+            ));
+        };
         let result = response
             .as_object_mut()
             .and_then(|object| object.remove("result"))
@@ -900,6 +888,22 @@ async fn send_owner_request_with_queue_deadline(
     request: OwnerRequest,
     queue_deadline: Option<Duration>,
 ) -> Result<Value, ContractFailure> {
+    let response =
+        exchange_owner_request_with_queue_deadline(endpoint, request, queue_deadline).await?;
+    if response.ok {
+        Ok(response.result.unwrap_or(Value::Null))
+    } else {
+        Err(contract_failure_from_owner(
+            response.error.unwrap_or_else(|| json!({})),
+        ))
+    }
+}
+
+async fn exchange_owner_request_with_queue_deadline(
+    endpoint: &OwnerEndpoint,
+    request: OwnerRequest,
+    queue_deadline: Option<Duration>,
+) -> Result<OwnerResponse, ContractFailure> {
     if endpoint.owner_protocol_version != OWNER_PROTOCOL_VERSION {
         return Err(ContractFailure {
             exit_code: 4,
@@ -941,13 +945,7 @@ async fn send_owner_request_with_queue_deadline(
             "response_identity_mismatch",
         ));
     }
-    if response.ok {
-        Ok(response.result.unwrap_or(Value::Null))
-    } else {
-        Err(contract_failure_from_owner(
-            response.error.unwrap_or_else(|| json!({})),
-        ))
-    }
+    Ok(response)
 }
 
 fn spawn_detached_owner(
@@ -1215,6 +1213,32 @@ fn contract_failure_from_owner(error: Value) -> ContractFailure {
         ),
         retry: leak_contract_string(error.get("retry").and_then(Value::as_str).unwrap_or("safe")),
         data: error.get("data").cloned().unwrap_or_else(|| json!({})),
+    }
+}
+
+fn dispatch_failure_from_owner(mut error: Value) -> DispatchFailure {
+    let server_error = error
+        .as_object_mut()
+        .and_then(|error| error.remove("serverError"));
+    let trace = error
+        .as_object_mut()
+        .and_then(|error| error.remove("trace"));
+    let apply_edit_ledger = error
+        .as_object_mut()
+        .and_then(|error| error.remove("applyEditLedger"))
+        .and_then(|ledger| ledger.as_array().cloned())
+        .unwrap_or_default();
+    let partial_results = error
+        .as_object_mut()
+        .and_then(|error| error.remove("partialResult"))
+        .and_then(|partial| partial.get("items").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    DispatchFailure {
+        failure: contract_failure_from_owner(error),
+        server_error,
+        partial_results,
+        trace,
+        apply_edit_ledger,
     }
 }
 

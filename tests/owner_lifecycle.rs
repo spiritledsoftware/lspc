@@ -420,6 +420,49 @@ fn owner_reports_bounded_stderr_after_an_unexpected_server_exit() {
 }
 
 #[test]
+fn query_failure_preserves_server_error_partial_results_context_and_trace() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    let output = fixture.output(&[
+        "workspace-symbols",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--query",
+        "error-with-partial",
+        "--trace-protocol",
+    ]);
+
+    assert_eq!(output.status.code(), Some(5));
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["error"]["code"], "server_error");
+    assert_eq!(failure["error"]["serverError"]["code"], -32603);
+    assert_eq!(failure["method"], "workspace/symbol");
+    assert_eq!(failure["partialResult"]["complete"], false);
+    assert_eq!(
+        failure["partialResult"]["items"][0]["name"],
+        "partial-symbol"
+    );
+    assert_eq!(
+        failure["context"]["workspaceUri"],
+        url::Url::from_directory_path(&fixture.workspace)
+            .unwrap()
+            .to_string()
+    );
+    assert!(failure["trace"]["frames"].as_array().is_some());
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+}
+
+#[test]
 fn graceful_stop_drains_the_active_query_and_rejects_new_work() {
     let fixture = Fixture::new();
     let workspace = fixture.workspace.to_str().unwrap();

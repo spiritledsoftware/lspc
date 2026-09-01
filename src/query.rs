@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::{
     cli::ParsedInvocation,
-    contract::ContractFailure,
+    contract::{ContractFailure, failure_envelope},
     workspace::{
         DiagnosticCache, DocumentSnapshot, PositionEncoding, ProtocolPosition,
         resolve_source_position,
@@ -205,6 +205,62 @@ pub(crate) struct Capabilities {
 }
 
 impl Capabilities {
+    /// Converts the Owner's normalized Capability response into Query gates.
+    pub(crate) fn from_owner_result(owner_result: &Value) -> Self {
+        let providers = owner_result
+            .get("providers")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| {
+                let state = match value.get("state").and_then(Value::as_str) {
+                    Some("supported") => ProviderState::Supported,
+                    Some("unsupported") => ProviderState::Unsupported,
+                    _ => ProviderState::Invalid,
+                };
+                let capability_path = value
+                    .get("capabilityPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("capabilities.{name}"));
+                let options = value.get("options").cloned();
+                let selector = value
+                    .get("selector")
+                    .cloned()
+                    .or_else(|| options.as_ref()?.get("documentSelector").cloned());
+                let mut problems = value
+                    .get("problems")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !matches!(
+                    value.get("state").and_then(Value::as_str),
+                    Some("supported" | "unsupported" | "invalid")
+                ) {
+                    problems.push(json!({
+                        "code": "malformed_capability",
+                        "message": "The Owner returned an invalid normalized provider state.",
+                        "jsonPath": format!("providers.{name}.state")
+                    }));
+                }
+                (
+                    name.clone(),
+                    Provider {
+                        state,
+                        capability_path,
+                        options,
+                        selector,
+                        problems,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            providers,
+            initialize_result: owner_result.get("initializeResult").cloned(),
+        }
+    }
+
     pub(crate) fn require(
         &self,
         command: QueryCommand,
@@ -351,6 +407,107 @@ pub(crate) struct DispatchResponse {
     pub(crate) synchronization: Option<Value>,
 }
 
+/// A failed Owner dispatch, including observations made before it failed.
+#[derive(Debug)]
+pub(crate) struct DispatchFailure {
+    pub(crate) failure: ContractFailure,
+    /// The exact LSP ResponseError for server-derived failures.
+    pub(crate) server_error: Option<Value>,
+    /// Exact `$/progress` values collected for the request's partial-result token.
+    pub(crate) partial_results: Vec<Value>,
+    pub(crate) trace: Option<Value>,
+    pub(crate) apply_edit_ledger: Vec<Value>,
+}
+
+impl From<ContractFailure> for DispatchFailure {
+    fn from(failure: ContractFailure) -> Self {
+        Self {
+            failure,
+            server_error: None,
+            partial_results: Vec::new(),
+            trace: None,
+            apply_edit_ledger: Vec::new(),
+        }
+    }
+}
+
+/// A Query failure plus the optional top-level evidence in its frozen envelope.
+#[derive(Debug)]
+pub(crate) struct QueryExecutionFailure {
+    pub(crate) failure: ContractFailure,
+    pub(crate) server_error: Option<Value>,
+    pub(crate) method: Option<String>,
+    pub(crate) context: Option<Value>,
+    pub(crate) partial_result: Option<Value>,
+    pub(crate) trace: Option<Value>,
+    pub(crate) apply_edit_ledger: Vec<Value>,
+}
+
+impl QueryExecutionFailure {
+    fn before_dispatch(failure: ContractFailure) -> Self {
+        Self {
+            failure,
+            server_error: None,
+            method: None,
+            context: None,
+            partial_result: None,
+            trace: None,
+            apply_edit_ledger: Vec::new(),
+        }
+    }
+
+    fn after_dispatch(
+        failure: ContractFailure,
+        method: &str,
+        context: &Value,
+        trace: Option<Value>,
+        apply_edit_ledger: Vec<Value>,
+    ) -> Self {
+        Self {
+            failure,
+            server_error: None,
+            method: Some(method.to_owned()),
+            context: Some(context.clone()),
+            partial_result: None,
+            trace,
+            apply_edit_ledger,
+        }
+    }
+}
+
+impl From<ContractFailure> for QueryExecutionFailure {
+    fn from(failure: ContractFailure) -> Self {
+        Self::before_dispatch(failure)
+    }
+}
+
+/// Renders the complete failure envelope without dropping partial results or protocol evidence.
+pub(crate) fn query_failure_envelope(
+    command: Vec<String>,
+    failure: &QueryExecutionFailure,
+) -> Value {
+    let mut envelope = failure_envelope(command, &failure.failure);
+    if let Some(server_error) = &failure.server_error {
+        envelope["error"]["serverError"] = server_error.clone();
+    }
+    if let Some(method) = &failure.method {
+        envelope["method"] = Value::String(method.clone());
+    }
+    if let Some(context) = &failure.context {
+        envelope["context"] = context.clone();
+    }
+    if let Some(partial_result) = &failure.partial_result {
+        envelope["partialResult"] = partial_result.clone();
+    }
+    if let Some(trace) = &failure.trace {
+        envelope["trace"] = trace.clone();
+    }
+    if !failure.apply_edit_ledger.is_empty() {
+        envelope["applyEditLedger"] = Value::Array(failure.apply_edit_ledger.clone());
+    }
+    envelope
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QueryContext {
     pub(crate) workspace_uri: String,
@@ -382,7 +539,7 @@ impl QueryContext {
 
 /// The only seam required by the Query layer. The Owner implements this once.
 pub(crate) trait SessionDispatcher {
-    fn dispatch(&mut self, request: DispatchRequest) -> Result<DispatchResponse, ContractFailure>;
+    fn dispatch(&mut self, request: DispatchRequest) -> Result<DispatchResponse, DispatchFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -440,12 +597,10 @@ pub(crate) fn compose(
         QueryCommand::WorkspaceSymbols => Some(request(
             command.method().unwrap(),
             json!({"query": required_string(invocation, "--query")?}),
-            Vec::new(),
         )),
         QueryCommand::WorkspaceDiagnostics => Some(request(
             command.method().unwrap(),
             json!({"previousResultIds": diagnostics.map_or_else(Vec::new, DiagnosticCache::pull_result_ids)}),
-            Vec::new(),
         )),
         QueryCommand::DocumentSymbols => Some(document_request(
             command.method().unwrap(),
@@ -498,7 +653,9 @@ pub(crate) fn compose(
         QueryCommand::Format => Some(document_request(
             command.method().unwrap(),
             required_document(document)?,
-            Some(json!({"options": json_input(invocation, "--options-json", "--options-file")?})),
+            Some(
+                json!({"options": object_json_input(invocation, "--options-json", "--options-file", "FormattingOptions")?}),
+            ),
         )),
         QueryCommand::CodeActions => {
             let document = required_document(document)?;
@@ -507,22 +664,20 @@ pub(crate) fn compose(
                 command.method().unwrap(),
                 document,
                 Some(
-                    json!({"range": range, "context": json_input(invocation, "--context-json", "--context-file")?}),
+                    json!({"range": range, "context": object_json_input(invocation, "--context-json", "--context-file", "CodeActionContext")?}),
                 ),
             ))
         }
         QueryCommand::ResolveCodeAction => Some(request(
             command.method().unwrap(),
-            json_input(invocation, "--action-json", "--action-file")?,
-            Vec::new(),
+            object_json_input(invocation, "--action-json", "--action-file", "CodeAction")?,
         )),
         QueryCommand::ExecuteCommand => Some(request(
             command.method().unwrap(),
             json!({
                 "command": required_string(invocation, "--command")?,
-                "arguments": optional_json_input(invocation, "--arguments-json", "--arguments-file")?.unwrap_or_else(|| json!([]))
+                "arguments": optional_array_json_input(invocation, "--arguments-json", "--arguments-file", "execute-command arguments")?.unwrap_or_default()
             }),
-            Vec::new(),
         )),
     };
     if let Some(request) = &mut request
@@ -561,7 +716,7 @@ pub(crate) fn execute(
     mut context: QueryContext,
     diagnostics: &mut DiagnosticCache,
     previews: &mut impl PreviewCreator,
-) -> Result<Value, ContractFailure> {
+) -> Result<Value, QueryExecutionFailure> {
     match composed.command {
         QueryCommand::Capabilities => {
             return Ok(capabilities_envelope(
@@ -572,12 +727,19 @@ pub(crate) fn execute(
         }
         QueryCommand::PublishedDiagnostics => {
             let has_position = has_source_position(composed.command);
-            return published_envelope(composed, context.json(has_position), diagnostics);
+            return published_envelope(composed, context.json(has_position), diagnostics)
+                .map_err(QueryExecutionFailure::before_dispatch);
         }
         _ => {}
     }
 
-    let response = dispatcher.dispatch(composed.request.clone().unwrap())?;
+    let method = composed.request.as_ref().unwrap().method.clone();
+    let response = dispatcher
+        .dispatch(composed.request.clone().unwrap())
+        .map_err(|failure| {
+            let context = context.json(has_source_position(composed.command));
+            query_dispatch_failure(&composed, &context, failure)
+        })?;
     if let Some(synchronization) = response.synchronization.clone() {
         context.synchronization = synchronization;
     }
@@ -589,54 +751,91 @@ pub(crate) fn execute(
             response.result,
             response.trace,
             response.apply_edit_ledger,
-        );
+        )
+        .map_err(QueryExecutionFailure::before_dispatch);
     }
-    let result =
-        merge_partial_results(composed.command, response.result, response.partial_results)?;
-    let result = normalize_named_result(composed.command, result)?;
+    let trace = response.trace;
+    let apply_edit_ledger = response.apply_edit_ledger;
+    let enrich_failure = |failure| {
+        QueryExecutionFailure::after_dispatch(
+            failure,
+            &method,
+            &context,
+            trace.clone(),
+            apply_edit_ledger.clone(),
+        )
+    };
+    let result = merge_partial_results(composed.command, response.result, response.partial_results)
+        .map_err(enrich_failure)?;
+    let result = normalize_named_result(composed.command, result).map_err(enrich_failure)?;
 
-    match composed.command {
+    let output = match composed.command {
         QueryCommand::DocumentDiagnostics => document_diagnostic_envelope(
             &composed,
-            context,
+            context.clone(),
             result,
-            response.trace,
-            response.apply_edit_ledger,
+            trace.clone(),
+            apply_edit_ledger.clone(),
             diagnostics,
         ),
         QueryCommand::WorkspaceDiagnostics => workspace_diagnostic_envelope(
             &composed,
-            context,
+            context.clone(),
             result,
-            response.trace,
-            response.apply_edit_ledger,
+            trace.clone(),
+            apply_edit_ledger.clone(),
             diagnostics,
         ),
         QueryCommand::Rename | QueryCommand::Format | QueryCommand::ResolveCodeAction => {
             mutation_query_envelope(
                 &composed,
-                context,
+                context.clone(),
                 result,
-                response.trace,
-                response.apply_edit_ledger,
+                trace.clone(),
+                apply_edit_ledger.clone(),
                 previews,
             )
         }
         _ => query_envelope(
             &composed,
-            context,
+            context.clone(),
             result,
-            response.trace,
-            response.apply_edit_ledger,
+            trace.clone(),
+            apply_edit_ledger.clone(),
         ),
+    };
+    output.map_err(enrich_failure)
+}
+
+fn query_dispatch_failure(
+    composed: &ComposedQuery,
+    context: &Value,
+    failure: DispatchFailure,
+) -> QueryExecutionFailure {
+    let partial_items = failure
+        .partial_results
+        .into_iter()
+        .flat_map(|partial| match partial {
+            Value::Array(items) => items,
+            partial => vec![partial],
+        })
+        .collect::<Vec<_>>();
+    QueryExecutionFailure {
+        failure: failure.failure,
+        server_error: failure.server_error,
+        method: composed
+            .request
+            .as_ref()
+            .map(|request| request.method.clone()),
+        context: Some(context.clone()),
+        partial_result: (composed.command.supports_partial_results() && !partial_items.is_empty())
+            .then(|| json!({"items": partial_items, "complete": false})),
+        trace: failure.trace,
+        apply_edit_ledger: failure.apply_edit_ledger,
     }
 }
 
-fn request(
-    method: &str,
-    params: Value,
-    _already_synchronized_uris: Vec<String>,
-) -> DispatchRequest {
+fn request(method: &str, params: Value) -> DispatchRequest {
     DispatchRequest {
         method: method.to_owned(),
         params: Some(params),
@@ -657,7 +856,7 @@ fn document_request(
 ) -> DispatchRequest {
     let mut params = extra.unwrap_or_else(|| json!({}));
     params["textDocument"] = json!({"uri": document.uri});
-    let mut request = request(method, params, vec![document.uri.clone()]);
+    let mut request = request(method, params);
     request.synchronized_files.push(document.path.clone());
     request
 }
@@ -1016,6 +1215,37 @@ fn json_input(
         .ok_or_else(|| input_failure("A JSON input source is required."))
 }
 
+fn object_json_input(
+    invocation: &ParsedInvocation,
+    json_flag: &str,
+    file_flag: &str,
+    expected: &str,
+) -> Result<Value, ContractFailure> {
+    let value = json_input(invocation, json_flag, file_flag)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(input_failure(&format!(
+            "The JSON input must be a {expected} object."
+        )))
+    }
+}
+
+fn optional_array_json_input(
+    invocation: &ParsedInvocation,
+    json_flag: &str,
+    file_flag: &str,
+    expected: &str,
+) -> Result<Option<Vec<Value>>, ContractFailure> {
+    optional_json_input(invocation, json_flag, file_flag)?
+        .map(|value| {
+            value.as_array().cloned().ok_or_else(|| {
+                input_failure(&format!("The JSON input must be an array of {expected}."))
+            })
+        })
+        .transpose()
+}
+
 fn optional_json_input(
     invocation: &ParsedInvocation,
     json_flag: &str,
@@ -1236,11 +1466,38 @@ fn normalize_named_result(
                 Value::Array(_) => result,
                 _ => return Err(invalid_result(method, "an array or null", "$")),
             };
+            for (index, item) in result.as_array().unwrap().iter().enumerate() {
+                if !item.is_object() {
+                    return Err(invalid_result(
+                        method,
+                        "an array of LSP objects",
+                        &format!("$[{index}]"),
+                    ));
+                }
+            }
             canonicalize_result_uris(command, &mut result)?;
         }
-        QueryCommand::DocumentDiagnostics | QueryCommand::WorkspaceDiagnostics => {
-            if !result.is_object() {
-                return Err(invalid_result(method, "a diagnostic report object", "$"));
+        QueryCommand::DocumentDiagnostics => validate_document_diagnostic_report(
+            &result,
+            method,
+            "$",
+            DiagnosticReportContext::Document,
+        )?,
+        QueryCommand::WorkspaceDiagnostics => {
+            let Some(items) = result.get("items").and_then(Value::as_array) else {
+                return Err(invalid_result(
+                    method,
+                    "a WorkspaceDiagnosticReport items array",
+                    "$.items",
+                ));
+            };
+            for (index, item) in items.iter().enumerate() {
+                validate_document_diagnostic_report(
+                    item,
+                    method,
+                    &format!("$.items[{index}]"),
+                    DiagnosticReportContext::Workspace,
+                )?;
             }
         }
         QueryCommand::Rename => {
@@ -1263,6 +1520,92 @@ fn normalize_named_result(
         }
     }
     Ok(result)
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticReportContext {
+    Document,
+    Workspace,
+    Related,
+}
+
+fn validate_document_diagnostic_report(
+    report: &Value,
+    method: &str,
+    json_path: &str,
+    context: DiagnosticReportContext,
+) -> Result<(), ContractFailure> {
+    let Some(report) = report.as_object() else {
+        return Err(invalid_result(
+            method,
+            "a diagnostic report object",
+            json_path,
+        ));
+    };
+    if matches!(context, DiagnosticReportContext::Workspace) {
+        if report.get("uri").and_then(Value::as_str).is_none() {
+            return Err(invalid_result(
+                method,
+                "a Workspace diagnostic report URI",
+                &format!("{json_path}.uri"),
+            ));
+        }
+        if !matches!(report.get("version"), Some(Value::Number(_) | Value::Null)) {
+            return Err(invalid_result(
+                method,
+                "a Workspace diagnostic report version or null",
+                &format!("{json_path}.version"),
+            ));
+        }
+    }
+    match report.get("kind").and_then(Value::as_str) {
+        Some("full") if report.get("items").is_some_and(Value::is_array) => {}
+        Some("full") => {
+            return Err(invalid_result(
+                method,
+                "a full diagnostic report items array",
+                &format!("{json_path}.items"),
+            ));
+        }
+        Some("unchanged") if report.get("resultId").is_some_and(Value::is_string) => {}
+        Some("unchanged") => {
+            return Err(invalid_result(
+                method,
+                "an unchanged diagnostic report resultId",
+                &format!("{json_path}.resultId"),
+            ));
+        }
+        _ => {
+            return Err(invalid_result(
+                method,
+                "a full or unchanged diagnostic report kind",
+                &format!("{json_path}.kind"),
+            ));
+        }
+    }
+    if matches!(context, DiagnosticReportContext::Document)
+        && let Some(related) = report.get("relatedDocuments")
+    {
+        if related.is_null() {
+            return Ok(());
+        }
+        let Some(related) = related.as_object() else {
+            return Err(invalid_result(
+                method,
+                "a relatedDocuments object or null",
+                &format!("{json_path}.relatedDocuments"),
+            ));
+        };
+        for (uri, report) in related {
+            validate_document_diagnostic_report(
+                report,
+                method,
+                &format!("{json_path}.relatedDocuments[{uri:?}]"),
+                DiagnosticReportContext::Related,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize_result_uris(
@@ -1380,28 +1723,31 @@ fn query_envelope(
     Ok(envelope)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diagnostic_envelope(
-    composed: &ComposedQuery,
-    context: Value,
-    result: Value,
+struct DiagnosticMetadata {
     raw_report: Option<Value>,
     fresh: bool,
     complete: bool,
     workspace_complete: Option<bool>,
-    source: &str,
+    source: &'static str,
+}
+
+fn diagnostic_envelope(
+    composed: &ComposedQuery,
+    context: Value,
+    result: Value,
+    metadata: DiagnosticMetadata,
     trace: Option<Value>,
     apply_edit_ledger: Vec<Value>,
 ) -> Result<Value, ContractFailure> {
     let mut envelope = query_envelope(composed, context, result, trace, apply_edit_ledger)?;
     envelope["diagnostics"] = compact_object(json!({
-        "source": source,
-        "fresh": fresh,
-        "complete": complete,
-        "workspaceComplete": workspace_complete,
-        "rawReport": raw_report,
+        "source": metadata.source,
+        "fresh": metadata.fresh,
+        "complete": metadata.complete,
+        "workspaceComplete": metadata.workspace_complete,
+        "rawReport": metadata.raw_report,
     }));
-    if workspace_complete.is_none() {
+    if metadata.workspace_complete.is_none() {
         envelope["diagnostics"]["workspaceComplete"] = Value::Null;
     }
     Ok(envelope)
@@ -1416,29 +1762,81 @@ fn document_diagnostic_envelope(
     diagnostics: &mut DiagnosticCache,
 ) -> Result<Value, ContractFailure> {
     let uri = composed.document_uri.as_deref().unwrap();
-    let diagnostic = diagnostics.apply_pull_report(uri, result);
-    if diagnostic.effective_report.is_null() {
+    let raw_contains_unchanged = diagnostic_report_contains_unchanged(&result);
+    require_cached_unchanged_report(uri, &result, diagnostics, "$")?;
+    if let Some(related) = result.get("relatedDocuments").and_then(Value::as_object) {
+        for (related_uri, related_report) in related {
+            require_cached_unchanged_report(
+                related_uri,
+                related_report,
+                diagnostics,
+                &format!("$.relatedDocuments[{related_uri:?}]"),
+            )?;
+        }
+    }
+    let diagnostic = diagnostics.apply_document_pull_report(uri, result);
+    if diagnostic.effective_report.is_null()
+        || diagnostic_report_contains_unchanged(&diagnostic.effective_report)
+    {
         return Err(invalid_result(
             composed.command.method().unwrap(),
             "a cached full report for an unchanged diagnostic result",
             "$",
         ));
     }
-    let raw_report = (diagnostic.raw_report.get("kind").and_then(Value::as_str)
-        == Some("unchanged"))
-    .then_some(diagnostic.raw_report);
+    let raw_report = raw_contains_unchanged.then_some(diagnostic.raw_report);
     diagnostic_envelope(
         composed,
         context,
         diagnostic.effective_report,
-        raw_report,
-        diagnostic.fresh,
-        diagnostic.complete,
-        None,
-        "pull-document",
+        DiagnosticMetadata {
+            raw_report,
+            fresh: diagnostic.fresh,
+            complete: diagnostic.complete,
+            workspace_complete: None,
+            source: "pull-document",
+        },
         trace,
         apply_edit_ledger,
     )
+}
+
+fn require_cached_unchanged_report(
+    uri: &str,
+    report: &Value,
+    diagnostics: &DiagnosticCache,
+    json_path: &str,
+) -> Result<(), ContractFailure> {
+    if report.get("kind").and_then(Value::as_str) == Some("unchanged")
+        && diagnostics.pull_result_id(uri).is_none()
+    {
+        return Err(invalid_result(
+            "textDocument/diagnostic",
+            "a cached full report for an unchanged diagnostic result",
+            json_path,
+        ));
+    }
+    Ok(())
+}
+
+fn diagnostic_report_contains_unchanged(report: &Value) -> bool {
+    report.get("kind").and_then(Value::as_str) == Some("unchanged")
+        || report
+            .get("relatedDocuments")
+            .and_then(Value::as_object)
+            .is_some_and(|reports| {
+                reports
+                    .values()
+                    .any(|report| report.get("kind").and_then(Value::as_str) == Some("unchanged"))
+            })
+        || report
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|reports| {
+                reports
+                    .iter()
+                    .any(|report| report.get("kind").and_then(Value::as_str) == Some("unchanged"))
+            })
 }
 
 fn workspace_diagnostic_envelope(
@@ -1449,16 +1847,37 @@ fn workspace_diagnostic_envelope(
     apply_edit_ledger: Vec<Value>,
     diagnostics: &mut DiagnosticCache,
 ) -> Result<Value, ContractFailure> {
+    for (index, item) in result["items"].as_array().unwrap().iter().enumerate() {
+        let uri = item["uri"].as_str().unwrap();
+        if item.get("kind").and_then(Value::as_str) == Some("unchanged")
+            && diagnostics.pull_result_id(uri).is_none()
+        {
+            return Err(invalid_result(
+                composed.command.method().unwrap(),
+                "a cached full report for an unchanged diagnostic result",
+                &format!("$.items[{index}]"),
+            ));
+        }
+    }
     let diagnostic = diagnostics.apply_workspace_pull_report(result);
+    if diagnostic_report_contains_unchanged(&diagnostic.effective_report) {
+        return Err(invalid_result(
+            composed.command.method().unwrap(),
+            "cached full reports for unchanged diagnostic results",
+            "$.items",
+        ));
+    }
     diagnostic_envelope(
         composed,
         context,
         diagnostic.effective_report,
-        (!diagnostic.raw_report.is_null()).then_some(diagnostic.raw_report),
-        diagnostic.fresh,
-        diagnostic.complete,
-        Some(diagnostic.workspace_complete),
-        "pull-workspace",
+        DiagnosticMetadata {
+            raw_report: (!diagnostic.raw_report.is_null()).then_some(diagnostic.raw_report),
+            fresh: diagnostic.fresh,
+            complete: diagnostic.complete,
+            workspace_complete: Some(diagnostic.workspace_complete),
+            source: "pull-workspace",
+        },
         trace,
         apply_edit_ledger,
     )
@@ -1473,8 +1892,17 @@ fn mutation_query_envelope(
     previews: &mut impl PreviewCreator,
 ) -> Result<Value, ContractFailure> {
     if composed.command == QueryCommand::ResolveCodeAction
-        && let Some(disabled) = result.get("disabled")
+        && let Some(disabled) = result
+            .get("disabled")
+            .filter(|disabled| !disabled.is_null())
     {
+        let Some(disabled) = disabled.as_object() else {
+            return Err(invalid_result(
+                composed.command.method().unwrap(),
+                "a CodeAction disabled object",
+                "$.disabled",
+            ));
+        };
         let reason = disabled
             .get("reason")
             .and_then(Value::as_str)
@@ -1521,7 +1949,7 @@ fn mutation_query_envelope(
         _ => unreachable!("only Mutation Queries create Previews"),
     };
 
-    let preview = if edit.is_null() {
+    let preview = if workspace_edit_is_empty(&edit) {
         Value::Null
     } else {
         previews.create_preview(PreviewProposal {
@@ -1548,6 +1976,26 @@ fn mutation_query_envelope(
     Ok(envelope)
 }
 
+fn workspace_edit_is_empty(edit: &Value) -> bool {
+    if edit.is_null() {
+        return true;
+    }
+    let Some(edit) = edit.as_object() else {
+        return false;
+    };
+    let changes_are_empty = edit.get("changes").is_none_or(|changes| {
+        changes.as_object().is_some_and(|changes| {
+            changes
+                .values()
+                .all(|edits| edits.as_array().is_some_and(Vec::is_empty))
+        })
+    });
+    let document_changes_are_empty = edit
+        .get("documentChanges")
+        .is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty));
+    changes_are_empty && document_changes_are_empty
+}
+
 fn published_envelope(
     composed: ComposedQuery,
     context: Value,
@@ -1567,11 +2015,13 @@ fn published_envelope(
         &composed,
         context,
         results,
-        None,
-        fresh,
-        complete,
-        None,
-        "published",
+        DiagnosticMetadata {
+            raw_report: None,
+            fresh,
+            complete,
+            workspace_complete: None,
+            source: "published",
+        },
         None,
         Vec::new(),
     )
@@ -1745,6 +2195,8 @@ mod tests {
 
     struct TestDispatcher(DispatchResponse);
 
+    struct FailedDispatcher(Option<DispatchFailure>);
+
     struct NoPreview;
 
     impl PreviewCreator for NoPreview {
@@ -1753,36 +2205,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingPreview {
+        proposals: Vec<PreviewProposal>,
+    }
+
+    impl PreviewCreator for RecordingPreview {
+        fn create_preview(&mut self, proposal: PreviewProposal) -> Result<Value, ContractFailure> {
+            self.proposals.push(proposal);
+            Ok(json!({"previewId":"prv_00000000000000000000000000000000"}))
+        }
+    }
+
     impl SessionDispatcher for TestDispatcher {
         fn dispatch(
             &mut self,
             _request: DispatchRequest,
-        ) -> Result<DispatchResponse, ContractFailure> {
+        ) -> Result<DispatchResponse, DispatchFailure> {
             Ok(self.0.clone())
         }
     }
 
-    #[test]
-    fn protocol_globs_support_recursive_braces_classes_and_relative_patterns() {
-        assert!(glob_matches(b"**/*.{rs,py}", b"main.rs"));
-        assert!(glob_matches(b"**/*.{rs,py}", b"src/lib.py"));
-        assert!(glob_matches(b"src/[!0-9][a-z].rs", b"src/ab.rs"));
-        assert!(!glob_matches(b"src/[!0-9][a-z].rs", b"src/1b.rs"));
-
-        let root = TempDir::new().unwrap();
-        let source = root.path().join("src");
-        std::fs::create_dir(&source).unwrap();
-        let path = source.join("main.rs");
-        std::fs::write(&path, "fn main() {}\n").unwrap();
-        let document = DocumentStore::new(2, 1024, 2048)
-            .refresh(&path, "rust", TextSynchronization::OpenClose)
-            .unwrap()
-            .snapshot;
-        let base_uri = Url::from_directory_path(root.path()).unwrap().to_string();
-        assert!(document_pattern_matches(
-            &json!({"baseUri": base_uri, "pattern": "src/*.{rs,py}"}),
-            &document
-        ));
+    impl SessionDispatcher for FailedDispatcher {
+        fn dispatch(
+            &mut self,
+            _request: DispatchRequest,
+        ) -> Result<DispatchResponse, DispatchFailure> {
+            Err(self.0.take().unwrap())
+        }
     }
 
     #[test]
@@ -1861,6 +2311,134 @@ mod tests {
     }
 
     #[test]
+    fn capability_gates_subfeatures_commands_and_document_selectors() {
+        let document = document();
+        let prepare = ParsedInvocation {
+            command: vec!["prepare-rename".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        assert_eq!(
+            compose(
+                &prepare,
+                Some(&document),
+                PositionEncoding::Utf16,
+                &supported("renameProvider"),
+                None,
+            )
+            .unwrap_err()
+            .code,
+            "capability_unavailable"
+        );
+        compose(
+            &prepare,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &supported_with_options("rename", json!({"prepareProvider":true})),
+            None,
+        )
+        .unwrap();
+
+        let definition = ParsedInvocation {
+            command: vec!["definition".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        let mut capabilities = supported_with_options(
+            "definition",
+            json!({"documentSelector":[{"language":"rust","scheme":"file","pattern":"**/*.{rs,txt}"}]}),
+        );
+        capabilities
+            .providers
+            .get_mut("definition")
+            .unwrap()
+            .selector =
+            Some(json!([{"language":"rust","scheme":"file","pattern":"**/*.{rs,txt}"}]));
+        compose(
+            &definition,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &capabilities,
+            None,
+        )
+        .unwrap();
+        capabilities
+            .providers
+            .get_mut("definition")
+            .unwrap()
+            .selector = Some(json!([{"language":"typescript"}]));
+        assert_eq!(
+            compose(
+                &definition,
+                Some(&document),
+                PositionEncoding::Utf16,
+                &capabilities,
+                None,
+            )
+            .unwrap_err()
+            .data["selector"][0]["language"],
+            "typescript"
+        );
+
+        assert!(glob_matches(b"**/main.[r-t][!x]", b"/workspace/main.rs"));
+        assert!(!glob_matches(b"**/main.[!r]s", b"/workspace/main.rs"));
+    }
+
+    #[test]
+    fn compose_requests_owner_progress_trace_and_apply_policies() {
+        let document = document();
+        let references = ParsedInvocation {
+            command: vec!["references".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+                ("--include-declaration".into(), vec!["false".into()]),
+                ("--trace-protocol".into(), Vec::new()),
+            ]),
+            positionals: Vec::new(),
+        };
+        let request = compose(
+            &references,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &supported_with_options("references", json!({"workDoneProgress":true})),
+            None,
+        )
+        .unwrap()
+        .request
+        .unwrap();
+        assert!(request.partial_results);
+        assert!(request.work_done_progress);
+        assert!(request.trace_protocol);
+
+        let execute_command = ParsedInvocation {
+            command: vec!["execute-command".into()],
+            options: BTreeMap::from([
+                ("--command".into(), vec!["test.run".into()]),
+                ("--apply-edits".into(), Vec::new()),
+            ]),
+            positionals: Vec::new(),
+        };
+        let request = compose(
+            &execute_command,
+            None,
+            PositionEncoding::Utf16,
+            &supported_with_options("executeCommand", json!({"commands":["test.run"]})),
+            None,
+        )
+        .unwrap()
+        .request
+        .unwrap();
+        assert!(request.apply_edits);
+    }
+
+    #[test]
     fn partials_and_paging_are_normalized() {
         assert_eq!(
             merge_partial_results(QueryCommand::References, json!([3]), vec![json!([1, 2])])
@@ -1879,6 +2457,83 @@ mod tests {
         .unwrap();
         assert_eq!(envelope["result"], json!([1]));
         assert_eq!(envelope["page"]["nextOffset"], 2);
+
+        assert_eq!(
+            merge_partial_results(
+                QueryCommand::WorkspaceDiagnostics,
+                json!({"items":[{"uri":"file:///final","kind":"full","items":[]}]}),
+                vec![json!({"items":[{"uri":"file:///partial","kind":"full","items":[]}]})],
+            )
+            .unwrap()["items"][0]["uri"],
+            "file:///partial"
+        );
+        assert_eq!(
+            merge_partial_results(
+                QueryCommand::DocumentDiagnostics,
+                json!({"kind":"full","items":[]}),
+                vec![json!({"relatedDocuments":{"file:///related":{"kind":"full","items":[]}}})],
+            )
+            .unwrap()["relatedDocuments"]["file:///related"]["kind"],
+            "full"
+        );
+    }
+
+    #[test]
+    fn failed_dispatch_keeps_partial_results_trace_and_apply_ledger() {
+        let document = document();
+        let invocation = ParsedInvocation {
+            command: vec!["references".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+                ("--include-declaration".into(), vec!["false".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &invocation,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &supported("references"),
+            None,
+        )
+        .unwrap();
+        let failure = execute(
+            &mut FailedDispatcher(Some(DispatchFailure {
+                failure: ContractFailure {
+                    exit_code: 5,
+                    category: "query",
+                    code: "request_timeout",
+                    message: "The language-server request timed out.".to_owned(),
+                    stage: "await_response",
+                    delivery: "uncertain",
+                    retry: "unsafe",
+                    data: json!({"timeout":"1s"}),
+                },
+                server_error: None,
+                partial_results: vec![json!([1, 2]), json!([3])],
+                trace: Some(json!({"frames":[]})),
+                apply_edit_ledger: vec![json!({
+                    "ordinal": 0,
+                    "applied": false,
+                    "outcome": "previewed"
+                })],
+            })),
+            query,
+            context(),
+            &mut DiagnosticCache::new(4, 4096),
+            &mut NoPreview,
+        )
+        .unwrap_err();
+        let envelope = query_failure_envelope(invocation.command_path().to_vec(), &failure);
+        assert_eq!(envelope["method"], "textDocument/references");
+        assert_eq!(
+            envelope["partialResult"],
+            json!({"items":[1, 2, 3], "complete":false})
+        );
+        assert_eq!(envelope["trace"]["frames"], json!([]));
+        assert_eq!(envelope["applyEditLedger"][0]["ordinal"], 0);
+        assert_eq!(envelope["context"]["server"], "test");
     }
 
     #[test]
@@ -1976,6 +2631,318 @@ mod tests {
             json!({"kind":"full", "resultId":"one", "items":[{"message":"one"}]})
         );
         assert_eq!(output["diagnostics"]["source"], "pull-document");
+        assert_eq!(output["diagnostics"].get("rawReport"), None);
+    }
+
+    #[test]
+    fn mutation_queries_create_previews_without_applying_edits() {
+        let document = document();
+        let invocation = ParsedInvocation {
+            command: vec!["format".into()],
+            options: BTreeMap::from([("--options-json".into(), vec!["{}".into()])]),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &invocation,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &supported("formatting"),
+            None,
+        )
+        .unwrap();
+        let mut dispatcher = TestDispatcher(DispatchResponse {
+            result: json!([{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use x;\n"}]),
+            partial_results: Vec::new(),
+            trace: Some(json!({"frames":[]})),
+            apply_edit_ledger: vec![json!({"ordinal":0,"applied":false,"outcome":"previewed"})],
+            synchronization: None,
+        });
+        let mut previews = RecordingPreview::default();
+        let output = execute(
+            &mut dispatcher,
+            query,
+            context(),
+            &mut DiagnosticCache::new(4, 4096),
+            &mut previews,
+        )
+        .unwrap();
+        assert_eq!(output["outcome"], "previewed");
+        assert_eq!(output["method"], "textDocument/formatting");
+        assert_eq!(output["applyEditLedger"][0]["ordinal"], 0);
+        assert_eq!(previews.proposals.len(), 1);
+        assert_eq!(
+            previews.proposals[0].edit["documentChanges"][0]["textDocument"]["uri"],
+            document.uri
+        );
+        assert_eq!(
+            previews.proposals[0].edit["documentChanges"][0]["textDocument"]["version"],
+            document.version
+        );
+    }
+
+    #[test]
+    fn unchanged_and_disabled_mutation_results_are_distinct() {
+        let document = document();
+        let rename = ParsedInvocation {
+            command: vec!["rename".into()],
+            options: BTreeMap::from([
+                ("--line".into(), vec!["0".into()]),
+                ("--column".into(), vec!["0".into()]),
+                ("--new-name".into(), vec!["next".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &rename,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &supported("rename"),
+            None,
+        )
+        .unwrap();
+        let mut dispatcher = TestDispatcher(DispatchResponse {
+            result: json!({}),
+            partial_results: Vec::new(),
+            trace: None,
+            apply_edit_ledger: Vec::new(),
+            synchronization: None,
+        });
+        let output = execute(
+            &mut dispatcher,
+            query,
+            context(),
+            &mut DiagnosticCache::new(4, 4096),
+            &mut NoPreview,
+        )
+        .unwrap();
+        assert_eq!(output["outcome"], "unchanged");
+        assert_eq!(output["result"], Value::Null);
+        assert!(workspace_edit_is_empty(
+            &json!({"changes":{"file:///one":[]}})
+        ));
+        assert!(!workspace_edit_is_empty(
+            &json!({"documentChanges":[{"kind":"create","uri":"file:///one"}]})
+        ));
+
+        let resolve = ParsedInvocation {
+            command: vec!["resolve-code-action".into()],
+            options: BTreeMap::from([(
+                "--action-json".into(),
+                vec![r#"{"title":"disabled"}"#.into()],
+            )]),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &resolve,
+            None,
+            PositionEncoding::Utf16,
+            &supported_with_options("codeActions", json!({"resolveProvider":true})),
+            None,
+        )
+        .unwrap();
+        let mut dispatcher = TestDispatcher(DispatchResponse {
+            result: json!({"title":"disabled","disabled":{"reason":"not applicable"}}),
+            partial_results: Vec::new(),
+            trace: Some(json!({"frames":[]})),
+            apply_edit_ledger: Vec::new(),
+            synchronization: None,
+        });
+        let failure = execute(
+            &mut dispatcher,
+            query,
+            context(),
+            &mut DiagnosticCache::new(4, 4096),
+            &mut NoPreview,
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure.code, "disabled_code_action");
+        assert_eq!(failure.failure.data["reason"], "not applicable");
+        assert_eq!(failure.method.as_deref(), Some("codeAction/resolve"));
+        assert_eq!(failure.trace.unwrap()["frames"], json!([]));
+    }
+
+    #[test]
+    fn named_cardinality_and_invalid_results_are_normalized() {
+        assert_eq!(
+            normalize_named_result(QueryCommand::Hover, Value::Null).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            normalize_named_result(
+                QueryCommand::Definition,
+                json!({"uri":"https://example.test/a","range":{}}),
+            )
+            .unwrap(),
+            json!([{"uri":"https://example.test/a","range":{}}])
+        );
+        let failure =
+            normalize_named_result(QueryCommand::References, json!([{"range":{}}])).unwrap_err();
+        assert_eq!(failure.code, "invalid_server_result");
+        assert_eq!(failure.data["jsonPath"], "$[0].uri");
+
+        let failure = normalize_named_result(
+            QueryCommand::WorkspaceDiagnostics,
+            json!({"items":[{"uri":"file:///one","kind":"full","items":[]}]}),
+        )
+        .unwrap_err();
+        assert_eq!(failure.data["jsonPath"], "$.items[0].version");
+    }
+
+    #[test]
+    fn published_and_workspace_diagnostics_report_contract_metadata() {
+        let document = document();
+        let mut diagnostics = DiagnosticCache::new(8, 8192);
+        diagnostics.publish(
+            &document.uri,
+            Some(document.version),
+            json!([{"message":"published"}]),
+            Some(document.version),
+            true,
+        );
+        let published = ParsedInvocation {
+            command: vec!["published-diagnostics".into()],
+            options: BTreeMap::new(),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &published,
+            Some(&document),
+            PositionEncoding::Utf16,
+            &Capabilities::default(),
+            Some(&diagnostics),
+        )
+        .unwrap();
+        let output = execute(
+            &mut TestDispatcher(DispatchResponse {
+                result: Value::Null,
+                partial_results: Vec::new(),
+                trace: None,
+                apply_edit_ledger: Vec::new(),
+                synchronization: None,
+            }),
+            query,
+            context(),
+            &mut diagnostics,
+            &mut NoPreview,
+        )
+        .unwrap();
+        assert_eq!(output["method"], "textDocument/publishDiagnostics");
+        assert_eq!(output["result"][0]["message"], "published");
+        assert_eq!(output["diagnostics"]["fresh"], true);
+        assert_eq!(output["diagnostics"]["workspaceComplete"], Value::Null);
+
+        let workspace = ParsedInvocation {
+            command: vec!["workspace-diagnostics".into()],
+            options: BTreeMap::new(),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &workspace,
+            None,
+            PositionEncoding::Utf16,
+            &supported_with_options("diagnostics", json!({"workspaceDiagnostics":true})),
+            Some(&diagnostics),
+        )
+        .unwrap();
+        let output = execute(
+            &mut TestDispatcher(DispatchResponse {
+                result: json!({"items":[{"uri":"file:///one","version":null,"kind":"full","items":[]}]}),
+                partial_results: Vec::new(),
+                trace: None,
+                apply_edit_ledger: Vec::new(),
+            synchronization: None,
+            }),
+            query,
+            context(),
+            &mut diagnostics,
+            &mut NoPreview,
+        )
+        .unwrap();
+        assert_eq!(output["diagnostics"]["source"], "pull-workspace");
+        assert_eq!(output["diagnostics"]["workspaceComplete"], true);
+    }
+
+    #[test]
+    fn capabilities_raw_output_and_json_input_errors_are_exact() {
+        let capabilities = Capabilities::from_owner_result(&json!({
+            "providers": {
+                "definition": {
+                    "state": "supported",
+                    "capabilityPath": "capabilities.definitionProvider",
+                    "options": {"documentSelector": [{"language":"rust"}]}
+                }
+            },
+            "initializeResult": {"capabilities":{}}
+        }));
+        assert_eq!(
+            capabilities.providers["definition"].selector,
+            Some(json!([{"language":"rust"}]))
+        );
+        let invocation = ParsedInvocation {
+            command: vec!["capabilities".into()],
+            options: BTreeMap::from([("--raw".into(), Vec::new())]),
+            positionals: Vec::new(),
+        };
+        let query = compose(
+            &invocation,
+            None,
+            PositionEncoding::Utf16,
+            &capabilities,
+            None,
+        )
+        .unwrap();
+        let output = execute(
+            &mut TestDispatcher(DispatchResponse {
+                result: Value::Null,
+                partial_results: Vec::new(),
+                trace: None,
+                apply_edit_ledger: Vec::new(),
+                synchronization: None,
+            }),
+            query,
+            context(),
+            &mut DiagnosticCache::new(1, 1024),
+            &mut NoPreview,
+        )
+        .unwrap();
+        assert_eq!(
+            output["result"]["initializeResult"]["capabilities"],
+            json!({})
+        );
+
+        let format = ParsedInvocation {
+            command: vec!["format".into()],
+            options: BTreeMap::from([("--options-json".into(), vec!["{".into()])]),
+            positionals: Vec::new(),
+        };
+        let failure = compose(
+            &format,
+            Some(&document()),
+            PositionEncoding::Utf16,
+            &supported("formatting"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "invalid_json_input");
+        assert_eq!(failure.stage, "read_input");
+
+        let execute = ParsedInvocation {
+            command: vec!["execute-command".into()],
+            options: BTreeMap::from([
+                ("--command".into(), vec!["test.run".into()]),
+                ("--arguments-json".into(), vec!["{}".into()]),
+            ]),
+            positionals: Vec::new(),
+        };
+        let failure = compose(
+            &execute,
+            None,
+            PositionEncoding::Utf16,
+            &supported_with_options("executeCommand", json!({"commands":["test.run"]})),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "invalid_arguments");
     }
 
     #[test]
@@ -2023,5 +2990,19 @@ mod tests {
             .code,
             "raw_method_forbidden"
         );
+
+        let progress = ParsedInvocation {
+            command: vec!["raw".into()],
+            options: BTreeMap::from([("--method".into(), vec!["$/progress".into()])]),
+            positionals: Vec::new(),
+        };
+        compose(
+            &progress,
+            None,
+            PositionEncoding::Utf16,
+            &Capabilities::default(),
+            None,
+        )
+        .unwrap();
     }
 }
