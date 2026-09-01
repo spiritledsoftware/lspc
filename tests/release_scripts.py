@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = ROOT / "scripts/release/build_archive.py"
+SKILL_ARCHIVE = ROOT / "scripts/release/build_skill_archive.py"
 
 
 class ReleaseArchiveTests(unittest.TestCase):
@@ -66,6 +67,18 @@ class ReleaseArchiveTests(unittest.TestCase):
                 self.assertTrue(manifest["skillDigest"].startswith("sha256:"))
                 checksum = (output / f"lspc-v1.2.3-{target}.{extension}.sha256").read_text(encoding="ascii")
                 self.assertTrue(checksum.startswith(hashlib.sha256(archive.read_bytes()).hexdigest()))
+
+    def test_companion_skill_archive_has_manifest_and_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            subprocess.run([sys.executable, str(SKILL_ARCHIVE), "--version", "1.2.3", "--schema-json", str(ROOT / "assets/contract/catalog.json"), "--output-dir", str(output)], check=True)
+            archive = output / "lspc-agent-skill-v1.2.3.zip"
+            with zipfile.ZipFile(archive) as contents:
+                manifest = json.loads(contents.read("lspc-agent-skill-v1.2.3/manifest.json"))
+                self.assertIn("lspc-agent-skill-v1.2.3/skills/lspc/SKILL.md", contents.namelist())
+            self.assertEqual(manifest["version"], "1.2.3")
+            self.assertTrue(manifest["skillDigest"].startswith("sha256:"))
+            self.assertTrue(manifest["schemaDigest"].startswith("sha256:"))
 
 
 if __name__ == "__main__":
