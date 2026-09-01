@@ -278,6 +278,42 @@ impl DiagnosticCache {
         }
     }
 
+    /// Reconstructs unchanged main and related Document diagnostic reports.
+    pub(crate) fn apply_document_pull_report(
+        &mut self,
+        uri: &str,
+        report: Value,
+    ) -> DiagnosticResult {
+        let raw_report = report.clone();
+        let related_reports = report
+            .get("relatedDocuments")
+            .and_then(Value::as_object)
+            .cloned();
+        let mut result = self.apply_pull_report(uri, report);
+        let Some(related_reports) = related_reports else {
+            return result;
+        };
+        let mut effective_related = serde_json::Map::new();
+        for (related_uri, related_report) in related_reports {
+            let related = self.apply_pull_report(&related_uri, related_report.clone());
+            result.fresh &= related.fresh;
+            result.complete &= related.complete;
+            effective_related.insert(
+                related_uri,
+                if related.effective_report.is_null() {
+                    related_report
+                } else {
+                    related.effective_report
+                },
+            );
+        }
+        if !result.effective_report.is_null() {
+            result.effective_report["relatedDocuments"] = Value::Object(effective_related);
+        }
+        result.raw_report = raw_report;
+        result
+    }
+
     /// Reconstructs effective full items in a Workspace diagnostic report while
     /// retaining an exact report containing `unchanged` items as metadata.
     pub(crate) fn apply_workspace_pull_report(
@@ -482,6 +518,44 @@ mod tests {
         assert_eq!(unchanged.diagnostics, json!([{"message":"x"}]));
         assert_eq!(unchanged.result_id.as_deref(), Some("two"));
         assert_eq!(unchanged.raw_report["kind"], "unchanged");
+    }
+
+    #[test]
+    fn document_pull_reconstructs_related_unchanged_reports() {
+        let mut cache = DiagnosticCache::new(8, 8192);
+        cache.apply_document_pull_report(
+            "file:///main",
+            json!({
+                "kind":"full",
+                "resultId":"main-one",
+                "items":[],
+                "relatedDocuments": {
+                    "file:///related": {
+                        "kind":"full",
+                        "resultId":"related-one",
+                        "items":[{"message":"one"}]
+                    }
+                }
+            }),
+        );
+        let result = cache.apply_document_pull_report(
+            "file:///main",
+            json!({
+                "kind":"unchanged",
+                "resultId":"main-two",
+                "relatedDocuments": {
+                    "file:///related": {"kind":"unchanged", "resultId":"related-two"}
+                }
+            }),
+        );
+        assert_eq!(
+            result.effective_report["relatedDocuments"]["file:///related"]["items"],
+            json!([{"message":"one"}])
+        );
+        assert_eq!(
+            result.effective_report["relatedDocuments"]["file:///related"]["resultId"],
+            "related-two"
+        );
     }
 
     #[test]
