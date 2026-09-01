@@ -547,26 +547,12 @@ fn valid_sha256_digest(value: &str) -> bool {
     })
 }
 
-#[cfg(unix)]
 fn restrict_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    crate::state_permissions::restrict_directory(path)
 }
 
-#[cfg(not(unix))]
-fn restrict_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn restrict_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+    crate::state_permissions::restrict_file(path)
 }
 
 #[cfg(unix)]

@@ -6,6 +6,7 @@ mod configuration;
 mod contract;
 mod session;
 mod skill_install;
+mod state_permissions;
 #[allow(dead_code, unused_imports)]
 mod workspace;
 

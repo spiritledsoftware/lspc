@@ -7,7 +7,7 @@ pub(crate) use diagnostics::{DiagnosticCache, DiagnosticResult};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, Metadata},
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -620,7 +620,14 @@ fn read_document_once(
             max_document_bytes,
         )));
     }
-    let before = file_identity(&before_metadata);
+    let before = file_identity(&file, &before_metadata).map_err(|error| {
+        ReadAttemptError::Failure(document_failure(
+            "document_read_failed",
+            path,
+            5,
+            json!({"uri": uri, "reason": error.to_string(), "osCode": error.raw_os_error()}),
+        ))
+    })?;
     let capacity = usize::try_from(before_metadata.len()).unwrap_or(usize::MAX);
     let mut bytes = Vec::with_capacity(capacity.min(1024 * 1024));
     (&mut file)
@@ -644,7 +651,7 @@ fn read_document_once(
     }
     let after_handle = file
         .metadata()
-        .map(|metadata| file_identity(&metadata))
+        .and_then(|metadata| file_identity(&file, &metadata))
         .map_err(|error| {
             ReadAttemptError::Failure(document_failure(
                 "document_read_failed",
@@ -653,8 +660,17 @@ fn read_document_once(
                 json!({"uri": uri, "reason": error.to_string(), "osCode": error.raw_os_error()}),
             ))
         })?;
-    let after_path = fs::metadata(path)
-        .map(|metadata| file_identity(&metadata))
+    let after_path_file = File::open(path).map_err(|error| {
+        ReadAttemptError::Failure(document_failure(
+            "document_read_failed",
+            path,
+            5,
+            json!({"uri": uri, "reason": error.to_string(), "osCode": error.raw_os_error()}),
+        ))
+    })?;
+    let after_path = after_path_file
+        .metadata()
+        .and_then(|metadata| file_identity(&after_path_file, &metadata))
         .map_err(|error| {
             ReadAttemptError::Failure(document_failure(
                 "document_read_failed",
@@ -690,35 +706,45 @@ fn modified_nanos(metadata: &Metadata) -> Option<u128> {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
+fn file_identity(_file: &File, metadata: &Metadata) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    FileIdentity {
+    Ok(FileIdentity {
         length: metadata.len(),
         modified_nanos: modified_nanos(metadata),
         device: metadata.dev(),
         inode: metadata.ino(),
-    }
+    })
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt;
+fn file_identity(file: &File, metadata: &Metadata) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
 
-    FileIdentity {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+
+    Ok(FileIdentity {
         length: metadata.len(),
         modified_nanos: modified_nanos(metadata),
-        volume_serial: metadata.volume_serial_number(),
-        file_index: metadata.file_index(),
-    }
+        volume_serial: Some(information.dwVolumeSerialNumber),
+        file_index: Some(file_index),
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    FileIdentity {
+fn file_identity(_file: &File, metadata: &Metadata) -> io::Result<FileIdentity> {
+    Ok(FileIdentity {
         length: metadata.len(),
         modified_nanos: modified_nanos(metadata),
-    }
+    })
 }
 
 fn identity_json(identity: &FileIdentity) -> Value {

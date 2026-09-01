@@ -702,28 +702,14 @@ fn lock_with_timeout(file: &fs::File, timeout: Duration) -> Result<(), ContractF
     }
 }
 
-#[cfg(unix)]
 fn restrict_directory(path: &Path) -> Result<(), ContractFailure> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    crate::state_permissions::restrict_directory(path)
         .map_err(|error| state_failure(&format!("State directory permissions failed: {error}")))
 }
 
-#[cfg(not(unix))]
-fn restrict_directory(_path: &Path) -> Result<(), ContractFailure> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn restrict_file(path: &Path) -> Result<(), ContractFailure> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    crate::state_permissions::restrict_file(path)
         .map_err(|error| state_failure(&format!("State file permissions failed: {error}")))
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> Result<(), ContractFailure> {
-    Ok(())
 }
 
 fn now_rfc3339() -> String {

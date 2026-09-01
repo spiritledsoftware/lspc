@@ -467,6 +467,7 @@ dependencies = [
  "toml",
  "url",
  "which",
+ "windows-sys",
 ]
 
 [[package]]
