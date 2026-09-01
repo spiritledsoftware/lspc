@@ -20,6 +20,10 @@ binary, README, both licenses, `skills/lspc/`, and a manifest with the release
 version, target, source commit, Rust version, skill digest, and per-file
 checksums. The script rejects missing or symlinked skill payloads.
 
+`build_skill_archive.py` creates a separate versioned companion-skill ZIP with
+a checksum and skill/schema digests. `package.py --skill-only` derives the
+schema from the built release binary before archiving the skill.
+
 `release.yml` uses native runners for the five supported targets. It deliberately
 does not cross-compile a release artifact and runs locked packaging, source
 installation, and archive verification before uploading it. The candidate
@@ -28,8 +32,7 @@ workflow then reads `release-gates.json`; any pending gate fails the candidate.
 ## Pending gates
 
 The repository is not release-ready. `release-gates.json` is the authoritative
-machine-readable list: embedded skill packaging, independent fake-server
-acceptance, pinned reference-server smoke tests, native OS-floor checks,
+machine-readable list: pinned reference-server smoke tests, native OS-floor checks,
 stored-state compatibility, and performance/soak checks remain pending. They
 must be implemented and marked `implemented`; they are never represented by
 empty or passing placeholder tests.

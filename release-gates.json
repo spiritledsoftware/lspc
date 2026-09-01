@@ -19,13 +19,13 @@
     },
     {
       "name": "release-archives",
-      "state": "pending",
-      "reason": "Requires the embedded companion skill from issue #33 before a complete archive can be built."
+      "state": "implemented",
+      "reason": "Native archives and the standalone companion-skill ZIP have deterministic manifests, digests, checksums, and verification."
     },
     {
       "name": "deterministic-fake-server",
-      "state": "pending",
-      "reason": "The independent fake server and its integration suite do not exist yet."
+      "state": "implemented",
+      "reason": "The feature-gated independent fixture covers fragmented and invalid frames, delayed and out-of-order IDs, diagnostics, progress, callbacks, crash, and hang scenarios."
     },
     {
       "name": "reference-server-smoke",

@@ -25,8 +25,8 @@ jobs:
           rustup toolchain install ${{ matrix.toolchain }} --profile minimal
           rustup component add rustfmt clippy --toolchain ${{ matrix.toolchain }}
       - run: cargo +${{ matrix.toolchain }} fmt --all -- --check
-      - run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets -- -D warnings
-      - run: cargo +${{ matrix.toolchain }} test --locked --all-targets
+      - run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets --features fake-server -- -D warnings
+      - run: cargo +${{ matrix.toolchain }} test --locked --all-targets --features fake-server
       - run: python scripts/release/check_schema.py
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
@@ -81,9 +81,22 @@ jobs:
           if-no-files-found: error
 
   required-gates:
-    needs: archive
+    needs: [archive, companion-skill]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Block incomplete release acceptance
         run: python scripts/release/check_gates.py --require-complete
+
+  companion-skill:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify companion skill archive
+        run: python scripts/release/package.py --target x86_64-unknown-linux-gnu --skill-only --output-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lspc-agent-skill
+          path: dist/lspc-agent-skill-v*.zip*
+          if-no-files-found: error

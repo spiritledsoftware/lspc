@@ -39,6 +39,9 @@ def main() -> None:
         suffix = ".exe" if os.name == "nt" else ""
         if not (root / "bin" / f"lspc{suffix}").is_file():
             raise SystemExit("locked source installation did not install lspc")
+        if (root / "bin" / f"lspc-fake-server{suffix}").exists():
+            raise SystemExit("locked source installation included test-only fake server")
+        subprocess.run([str(root / "bin" / f"lspc{suffix}"), "schema", "--full"], check=True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

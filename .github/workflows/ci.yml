@@ -29,7 +29,7 @@ jobs:
       - name: Lint
         run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo +${{ matrix.toolchain }} test --locked --all-targets
+        run: cargo +${{ matrix.toolchain }} test --locked --all-targets --features fake-server
       - name: Check schema snapshot
         run: python scripts/release/check_schema.py
         env:
