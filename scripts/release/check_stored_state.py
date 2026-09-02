@@ -16,7 +16,7 @@ def main() -> None:
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
     if set(manifest) != {"formatVersion", "release", "firstRelease", "files"}:
         raise SystemExit("stored-state manifest has unexpected fields")
-    if manifest["formatVersion"] != 1 or manifest["release"] != "1.0.0":
+    if manifest["formatVersion"] != 1 or manifest["release"] != "0.1.0":
         raise SystemExit("stored-state manifest identity is invalid")
     if manifest["firstRelease"] is not True or not isinstance(manifest["files"], list):
         raise SystemExit("stored-state manifest is not a first-release seed")

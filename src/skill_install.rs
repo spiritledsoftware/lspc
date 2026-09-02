@@ -660,7 +660,7 @@ mod tests {
             serde_json::to_vec(&ManagedMarker {
                 format_version: 1,
                 manager: "lspc".to_owned(),
-                skill_version: "0.9.0".to_owned(),
+                skill_version: "0.0.9".to_owned(),
                 digest: old_digest,
             })
             .unwrap(),
