@@ -346,16 +346,8 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 }
             }
             Some("test/server-request-limit") => {
-                for id in 0..=64 {
-                    let callback = json!({
-                        "jsonrpc": "2.0",
-                        "id": format!("fixture-callback-{id}"),
-                        "method": "workspace/configuration",
-                        "params": {"items": [{"section": "fixture"}]}
-                    });
-                    if write_frame(&mut output, &callback, scenario).is_err() {
-                        return ExitCode::from(1);
-                    }
+                if write_configuration_request_burst(&mut output, "fixture-callback").is_err() {
+                    return ExitCode::from(1);
                 }
                 let mut accepted = 0;
                 let mut busy = 0;
@@ -386,18 +378,27 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 }
             }
             Some("test/cancel-server-request") => {
-                let callback_id = json!("fixture-cancelled-callback");
-                if write_frame(
-                    &mut output,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": callback_id,
-                        "method": "workspace/configuration",
-                        "params": {"items": []}
-                    }),
-                    scenario,
-                )
-                .is_err()
+                let callback_id = json!("fixture-cancellable-63");
+                if write_configuration_request_burst(&mut output, "fixture-cancellable").is_err() {
+                    return ExitCode::from(1);
+                }
+
+                let mut capacity_observed = false;
+                for _ in 0..=64 {
+                    let Some(response) = read_callback_message(&mut input, &mut open_documents)
+                    else {
+                        return ExitCode::from(1);
+                    };
+                    if response
+                        .pointer("/error/data/reason")
+                        .and_then(Value::as_str)
+                        == Some("client_busy")
+                    {
+                        capacity_observed = true;
+                        break;
+                    }
+                }
+                if !capacity_observed
                     || write_frame(
                         &mut output,
                         &json!({
@@ -411,9 +412,19 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 {
                     return ExitCode::from(1);
                 }
-                let Some(callback_response) =
-                    read_callback_message(&mut input, &mut open_documents)
-                else {
+
+                let mut callback_response = None;
+                for _ in 0..64 {
+                    let Some(response) = read_callback_message(&mut input, &mut open_documents)
+                    else {
+                        return ExitCode::from(1);
+                    };
+                    if response.get("id") == Some(&callback_id) {
+                        callback_response = Some(response);
+                        break;
+                    }
+                }
+                let Some(callback_response) = callback_response else {
                     return ExitCode::from(1);
                 };
                 if result(
@@ -689,6 +700,22 @@ fn write_frame(output: &mut impl Write, message: &Value, scenario: Scenario) -> 
         output.flush().map_err(|_| ())?;
     }
     Ok(())
+}
+
+fn write_configuration_request_burst(output: &mut impl Write, id_prefix: &str) -> Result<(), ()> {
+    let mut frames = Vec::new();
+    for id in 0..=64 {
+        frames.extend(encode_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": format!("{id_prefix}-{id}"),
+            "method": "workspace/configuration",
+            "params": {"items": [{"section": "fixture"}]}
+        }))?);
+    }
+    output
+        .write_all(&frames)
+        .and_then(|()| output.flush())
+        .map_err(|_| ())
 }
 
 fn encode_frame(message: &Value) -> Result<Vec<u8>, ()> {

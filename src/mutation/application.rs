@@ -1711,6 +1711,7 @@ fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> s
 }
 
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn open_copied_file_for_flush(path: &Path, metadata: &fs::Metadata) -> std::io::Result<File> {
     let mut permissions = metadata.permissions();
     permissions.set_readonly(false);
