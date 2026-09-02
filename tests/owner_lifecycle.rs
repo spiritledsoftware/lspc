@@ -62,6 +62,9 @@ impl Fixture {
             )
         };
 
+        for (_, directory) in &environment {
+            fs::create_dir_all(directory).unwrap();
+        }
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let arguments = serde_json::to_string(arguments).unwrap();
         fs::write(
