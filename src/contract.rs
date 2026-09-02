@@ -161,9 +161,9 @@ pub(crate) fn schema_success_envelope(
         result["subject"] = json!(subject);
     }
     if subject == ["config", "user"]
-        && let Some(path) = user_config_path()
+        && let Ok(path) = crate::configuration::resolved_user_config_path()
     {
-        result["resolvedPath"] = Value::String(path);
+        result["resolvedPath"] = Value::String(path.to_string_lossy().into_owned());
     }
 
     Ok(json!({
@@ -354,32 +354,6 @@ fn collect_schema_references(value: &Value, references: &mut Vec<String>) {
         }
         _ => {}
     }
-}
-
-fn user_config_path() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        let path = std::path::PathBuf::from(xdg);
-        if !path.is_absolute() {
-            return None;
-        }
-        return Some(path.join("lspc/config.toml").to_string_lossy().into_owned());
-    }
-    #[cfg(windows)]
-    if let Some(app_data) = std::env::var_os("APPDATA") {
-        let path = std::path::PathBuf::from(app_data);
-        if !path.is_absolute() {
-            return None;
-        }
-        return Some(path.join("lspc/config.toml").to_string_lossy().into_owned());
-    }
-    directories::ProjectDirs::from("", "", "lspc").map(|directories| {
-        directories
-            .config_dir()
-            .join("config.toml")
-            .to_string_lossy()
-            .into_owned()
-    })
 }
 
 #[derive(Serialize)]

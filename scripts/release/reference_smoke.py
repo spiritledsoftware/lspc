@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_environment import isolated_user_environment
+
 
 def native(path: Path) -> Path:
     if os.name == "nt" and path.suffix.lower() != ".exe":
@@ -19,21 +21,12 @@ def native(path: Path) -> Path:
 
 
 def environment(root: Path) -> dict[str, str]:
-    values = os.environ.copy()
-    toolchain_home = Path(values.get("USERPROFILE") or values.get("HOME") or Path.home())
+    toolchain_home = Path(
+        os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home()
+    )
+    values = isolated_user_environment(root)
     values.setdefault("CARGO_HOME", str(toolchain_home / ".cargo"))
     values.setdefault("RUSTUP_HOME", str(toolchain_home / ".rustup"))
-    home = root / "home"
-    roaming = home / "AppData/Roaming"
-    local = home / "AppData/Local"
-    for directory in (home, root / "config", root / "state", roaming, local):
-        directory.mkdir(parents=True, exist_ok=True)
-    values["HOME"] = str(home)
-    values["USERPROFILE"] = str(home)
-    values["XDG_CONFIG_HOME"] = str(root / "config")
-    values["XDG_STATE_HOME"] = str(root / "state")
-    values["APPDATA"] = str(roaming)
-    values["LOCALAPPDATA"] = str(local)
     return values
 
 

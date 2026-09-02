@@ -54,7 +54,6 @@ impl ParsedInvocation {
             .map(std::path::PathBuf::from)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn option_paths(&self, name: &str) -> Vec<std::path::PathBuf> {
         self.options
             .get(name)
@@ -428,7 +427,7 @@ fn valid_duration(value: &str) -> bool {
     })
 }
 
-fn valid_server_name(value: &str) -> bool {
+pub(crate) fn valid_server_name(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .bytes()

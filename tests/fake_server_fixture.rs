@@ -15,16 +15,10 @@ fn fixture(scenario: &str) -> (Child, ChildStdin, BufReader<ChildStdout>) {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    (child.stdin.take().unwrap(), child.stdout.take().unwrap())
-        .pipe(|(input, output)| (child, input, BufReader::new(output)))
+    let input = child.stdin.take().unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap());
+    (child, input, output)
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, function: impl FnOnce(Self) -> T) -> T {
-        function(self)
-    }
-}
-impl<T> Pipe for T {}
 
 fn send(output: &mut impl Write, message: Value, chunks: usize) {
     let body = serde_json::to_vec(&message).unwrap();

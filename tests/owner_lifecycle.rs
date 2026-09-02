@@ -94,6 +94,17 @@ impl Fixture {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn stop(&self, workspace: &str) -> Value {
+        self.command(&[
+            "session",
+            "stop",
+            "--workspace",
+            workspace,
+            "--server",
+            "fake",
+        ])
+    }
+
     fn output(&self, arguments: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lspc"));
         command.args(arguments);
@@ -181,14 +192,7 @@ fn owner_serializes_simultaneous_agent_operations_in_fifo_order() {
             .to_string()
     );
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -248,14 +252,7 @@ fn queued_operation_deadline_removes_work_before_dispatch() {
         assert_eq!(active.join().unwrap()["result"], json!({"fixture": true}));
     });
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -311,14 +308,7 @@ fn owner_accepts_status_and_queues_work_during_initialization() {
         );
     });
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -465,14 +455,7 @@ fn owner_bounds_tracks_and_cancels_server_requests() {
         -32800
     );
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -532,14 +515,7 @@ fn query_failure_preserves_server_error_partial_results_context_and_trace() {
     );
     assert!(failure["trace"]["frames"].as_array().is_some());
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -578,16 +554,7 @@ fn graceful_stop_drains_the_active_query_and_rejects_new_work() {
         assert!(marker.exists());
 
         let stop_started = std::time::Instant::now();
-        let stop = scope.spawn(|| {
-            fixture.command(&[
-                "session",
-                "stop",
-                "--workspace",
-                workspace,
-                "--server",
-                "fake",
-            ])
-        });
+        let stop = scope.spawn(|| fixture.stop(workspace));
         let state_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let status = fixture.command(&[
@@ -772,14 +739,7 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
     assert_eq!(listed["result"].as_array().unwrap().len(), 1);
     assert_eq!(listed["result"][0]["ownerGeneration"], generation);
 
-    let stopped = fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    let stopped = fixture.stop(workspace);
     assert_eq!(stopped["result"]["ownerGeneration"], generation);
     assert_eq!(stopped["result"]["outcome"], "stopped");
 
@@ -830,14 +790,7 @@ fn empty_query_result_includes_active_server_progress() {
         }])
     );
 
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 }
 
 #[test]
@@ -863,14 +816,7 @@ fn graceful_stop_closes_open_documents_before_shutdown() {
         "--column",
         "3",
     ]);
-    fixture.command(&[
-        "session",
-        "stop",
-        "--workspace",
-        workspace,
-        "--server",
-        "fake",
-    ]);
+    fixture.stop(workspace);
 
     let events = fs::read_to_string(event_log).unwrap();
     let close = events.find("textDocument/didClose").unwrap();

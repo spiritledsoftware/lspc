@@ -28,7 +28,6 @@ pub(crate) struct DiagnosticResult {
     pub(crate) fresh: bool,
     pub(crate) complete: bool,
     pub(crate) closed: bool,
-    pub(crate) cached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +156,7 @@ impl DiagnosticCache {
             },
         );
         if cached {
-            self.published(uri, current_version, false)
+            self.published(uri, current_version)
         } else {
             DiagnosticResult {
                 uri: uri.to_owned(),
@@ -169,7 +168,6 @@ impl DiagnosticCache {
                 fresh: version.is_some() && version == current_version,
                 complete: false,
                 closed: false,
-                cached: false,
             }
         }
     }
@@ -178,7 +176,6 @@ impl DiagnosticCache {
         &mut self,
         uri: &str,
         current_version: Option<i64>,
-        _wait_timed_out: bool,
     ) -> DiagnosticResult {
         self.clock = self.clock.saturating_add(1);
         if let Some(snapshot) = self.snapshots.get_mut(&push_key(uri)) {
@@ -188,7 +185,7 @@ impl DiagnosticCache {
                 && snapshot.received_for_version.is_some()
                 && snapshot.received_for_version == current_version;
             if exact_version || usable_versionless {
-                return render(snapshot, exact_version, true, true);
+                return render(snapshot, exact_version, true);
             }
         }
         DiagnosticResult {
@@ -201,7 +198,6 @@ impl DiagnosticCache {
             fresh: false,
             complete: false,
             closed: false,
-            cached: false,
         }
     }
 
@@ -217,7 +213,7 @@ impl DiagnosticCache {
                     .map(str::to_owned)
                     .or_else(|| snapshot.result_id.clone());
                 snapshot.result_id.clone_from(&result_id);
-                let mut result = render(snapshot, true, true, true);
+                let mut result = render(snapshot, true, true);
                 result.raw_report = report.clone();
                 result.result_id = result_id;
                 if let Some(result_id) = &result.result_id {
@@ -239,7 +235,6 @@ impl DiagnosticCache {
                 fresh: false,
                 complete: false,
                 closed: false,
-                cached: false,
             };
         }
         let diagnostics = report
@@ -250,7 +245,7 @@ impl DiagnosticCache {
             .get("resultId")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let cached = self.store(
+        self.store(
             pull_key(uri),
             CachedDiagnostics {
                 uri: uri.to_owned(),
@@ -274,7 +269,6 @@ impl DiagnosticCache {
             fresh: true,
             complete: true,
             closed: false,
-            cached,
         }
     }
 
@@ -411,7 +405,7 @@ impl DiagnosticCache {
             .filter(|(key, _)| key.starts_with("push\0"))
             .map(|(_, snapshot)| {
                 snapshot.last_used = clock;
-                render(snapshot, false, true, true)
+                render(snapshot, false, true)
             })
             .collect()
     }
@@ -456,12 +450,7 @@ fn pull_key(uri: &str) -> String {
     format!("pull\0{uri}")
 }
 
-fn render(
-    snapshot: &CachedDiagnostics,
-    fresh: bool,
-    complete: bool,
-    cached: bool,
-) -> DiagnosticResult {
+fn render(snapshot: &CachedDiagnostics, fresh: bool, complete: bool) -> DiagnosticResult {
     DiagnosticResult {
         uri: snapshot.uri.clone(),
         diagnostics: snapshot.diagnostics.clone(),
@@ -472,7 +461,6 @@ fn render(
         fresh,
         complete,
         closed: snapshot.closed,
-        cached,
     }
 }
 
@@ -496,11 +484,11 @@ mod tests {
         let versionless = cache.publish("file:///a", None, json!([]), Some(2), true);
         assert!(!versionless.fresh);
         assert!(versionless.complete);
-        let later_revision = cache.published("file:///a", Some(3), true);
+        let later_revision = cache.published("file:///a", Some(3));
         assert!(!later_revision.complete);
 
         cache.publish("file:///b", None, json!([]), Some(1), false);
-        let timeout = cache.published("file:///b", Some(1), true);
+        let timeout = cache.published("file:///b", Some(1));
         assert!(!timeout.fresh);
         assert!(!timeout.complete);
         assert_eq!(timeout.diagnostics, json!([]));
@@ -561,11 +549,10 @@ mod tests {
     #[test]
     fn oversized_snapshot_is_not_cached() {
         let mut cache = DiagnosticCache::new(1, 8);
-        let result = cache.apply_pull_report(
+        cache.apply_pull_report(
             "file:///a",
             json!({"kind":"full", "items":[{"message":"far too large"}]}),
         );
-        assert!(!result.cached);
         assert!(cache.all_known().is_empty());
     }
 }

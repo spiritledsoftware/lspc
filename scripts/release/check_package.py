@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -29,8 +28,10 @@ def main() -> None:
     crate = ROOT / "target/package" / f"lspc-{package['version']}.crate"
     if not crate.is_file():
         raise SystemExit("cargo package did not create the expected crate")
-    root = Path(tempfile.mkdtemp(prefix="lspc-install-"))
-    try:
+    with tempfile.TemporaryDirectory(
+        prefix="lspc-install-", ignore_cleanup_errors=True
+    ) as temporary:
+        root = Path(temporary)
         subprocess.run(
             ["cargo", "install", "--locked", "--path", ".", "--root", str(root)],
             cwd=ROOT,
@@ -46,8 +47,6 @@ def main() -> None:
             check=True,
             stdout=subprocess.DEVNULL,
         )
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -1293,16 +1293,7 @@ fn validate_version(version: u32, path: &Path) -> Result<(), ContractFailure> {
 }
 
 fn validate_server_name(name: &str, path: &Path) -> Result<(), ContractFailure> {
-    let valid = (1..=64).contains(&name.len())
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic())
-        && name
-            .bytes()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-    if valid {
+    if crate::cli::valid_server_name(name) {
         Ok(())
     } else {
         Err(configuration_failure(

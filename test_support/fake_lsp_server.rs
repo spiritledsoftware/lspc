@@ -511,21 +511,8 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                 thread::sleep(Duration::from_secs(30));
                 return ExitCode::from(1);
             }
-            Some("textDocument/didOpen") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.insert(uri.to_owned());
-                }
-            }
-            Some("textDocument/didClose") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.remove(uri);
-                }
+            Some("textDocument/didOpen" | "textDocument/didClose") => {
+                update_open_documents(&message, &mut open_documents);
             }
             Some("test/open-documents") => {
                 if result(
@@ -617,6 +604,24 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
     }
 }
 
+fn update_open_documents(message: &Value, open_documents: &mut BTreeSet<String>) {
+    let Some(uri) = message
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    match message.get("method").and_then(Value::as_str) {
+        Some("textDocument/didOpen") => {
+            open_documents.insert(uri.to_owned());
+        }
+        Some("textDocument/didClose") => {
+            open_documents.remove(uri);
+        }
+        _ => {}
+    }
+}
+
 fn read_callback_result<R: BufRead>(
     input: &mut R,
     open_documents: &mut BTreeSet<String>,
@@ -627,25 +632,7 @@ fn read_callback_result<R: BufRead>(
         if message.get("method").is_none() && message.get("id") == Some(callback_id) {
             return message.get("result").cloned();
         }
-        match message.get("method").and_then(Value::as_str) {
-            Some("textDocument/didOpen") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.insert(uri.to_owned());
-                }
-            }
-            Some("textDocument/didClose") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.remove(uri);
-                }
-            }
-            _ => {}
-        }
+        update_open_documents(&message, open_documents);
     }
 }
 
@@ -658,25 +645,7 @@ fn read_callback_message<R: BufRead>(
         if message.get("method").is_none() && message.get("id").is_some() {
             return Some(message);
         }
-        match message.get("method").and_then(Value::as_str) {
-            Some("textDocument/didOpen") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.insert(uri.to_owned());
-                }
-            }
-            Some("textDocument/didClose") => {
-                if let Some(uri) = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                {
-                    open_documents.remove(uri);
-                }
-            }
-            _ => {}
-        }
+        update_open_documents(&message, open_documents);
     }
 }
 

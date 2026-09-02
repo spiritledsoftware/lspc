@@ -14,7 +14,6 @@ use std::{
 use ::time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use async_lsp::{AnyRequest, ErrorCode, ResponseError, router::Router};
 use atomic_write_file::AtomicWriteFile;
-use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio::{
     io::AsyncReadExt,
@@ -639,7 +638,7 @@ impl LspRuntime {
             cancellation_grace: Duration::from_millis(settings.cancellation_grace_ms),
             shutdown_timeout: Duration::from_millis(settings.shutdown_timeout_ms),
             max_partial_result_bytes: settings.max_partial_result_bytes,
-            log: SessionLog::new(),
+            log: SessionLog::default(),
             startup_trace: settings.trace_initialization.then(ProtocolTrace::new),
             preview_settings: settings.previews.clone(),
             receipt_settings: settings.receipts.clone(),
@@ -2512,8 +2511,8 @@ fn acquire_owner_lock(path: &Path) -> io::Result<std::fs::File> {
         .read(true)
         .write(true)
         .open(path)?;
-    restrict_private_file(path)?;
-    file.try_lock_exclusive()?;
+    crate::state_permissions::restrict_file(path)?;
+    file.try_lock()?;
     Ok(file)
 }
 
@@ -2521,10 +2520,6 @@ fn write_endpoint(path: &Path, endpoint: &OwnerEndpoint) -> io::Result<()> {
     let mut file = AtomicWriteFile::options().open(path)?;
     serde_json::to_writer(&mut file, endpoint).map_err(io::Error::other)?;
     file.commit()?;
-    restrict_private_file(path)
-}
-
-fn restrict_private_file(path: &Path) -> io::Result<()> {
     crate::state_permissions::restrict_file(path)
 }
 

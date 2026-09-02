@@ -12,6 +12,8 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from smoke_environment import isolated_user_environment as test_environment
+
 
 def safe_name(name: str) -> bool:
     path = PurePosixPath(name)
@@ -37,26 +39,6 @@ def extract(archive: Path, destination: Path) -> None:
                 raise SystemExit("release tarball entry cannot be read")
             target.write_bytes(extracted.read())
             target.chmod(member.mode & 0o777)
-
-
-def test_environment(root: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    home = root / "home"
-    roaming = home / "AppData/Roaming"
-    local = home / "AppData/Local"
-    for directory in (home, root / "config", root / "state", roaming, local):
-        directory.mkdir(parents=True, exist_ok=True)
-    env.update(
-        {
-            "HOME": str(home),
-            "USERPROFILE": str(home),
-            "XDG_CONFIG_HOME": str(root / "config"),
-            "XDG_STATE_HOME": str(root / "state"),
-            "APPDATA": str(roaming),
-            "LOCALAPPDATA": str(local),
-        }
-    )
-    return env
 
 
 def command(

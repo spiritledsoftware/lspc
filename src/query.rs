@@ -1697,7 +1697,7 @@ fn query_envelope(
     trace: Option<Value>,
     apply_edit_ledger: Vec<Value>,
 ) -> Result<Value, ContractFailure> {
-    let command = command_name(composed.command);
+    let command = composed.command.name();
     let method = composed
         .request
         .as_ref()
@@ -2008,7 +2008,7 @@ fn published_envelope(
     diagnostics: &mut DiagnosticCache,
 ) -> Result<Value, ContractFailure> {
     let (results, fresh, complete) = if let Some(uri) = &composed.document_uri {
-        let current = diagnostics.published(uri, composed.document_version, true);
+        let current = diagnostics.published(uri, composed.document_version);
         (current.diagnostics, current.fresh, current.complete)
     } else {
         (
@@ -2097,27 +2097,6 @@ fn has_source_position(command: QueryCommand) -> bool {
             | QueryCommand::Rename
             | QueryCommand::CodeActions
     )
-}
-
-fn command_name(command: QueryCommand) -> &'static str {
-    match command {
-        QueryCommand::Definition => "definition",
-        QueryCommand::References => "references",
-        QueryCommand::Hover => "hover",
-        QueryCommand::DocumentSymbols => "document-symbols",
-        QueryCommand::WorkspaceSymbols => "workspace-symbols",
-        QueryCommand::DocumentDiagnostics => "document-diagnostics",
-        QueryCommand::WorkspaceDiagnostics => "workspace-diagnostics",
-        QueryCommand::PublishedDiagnostics => "published-diagnostics",
-        QueryCommand::PrepareRename => "prepare-rename",
-        QueryCommand::Rename => "rename",
-        QueryCommand::Format => "format",
-        QueryCommand::CodeActions => "code-actions",
-        QueryCommand::ResolveCodeAction => "resolve-code-action",
-        QueryCommand::ExecuteCommand => "execute-command",
-        QueryCommand::Raw => "raw",
-        QueryCommand::Capabilities => "capabilities",
-    }
 }
 
 fn input_failure(message: &str) -> ContractFailure {

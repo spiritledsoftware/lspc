@@ -200,7 +200,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
     /// Opens the canonical Workspace as the capability root for Mutation planning.
     pub(crate) fn open(
         workspace: &'a Path,
-        _workspace_uri: &'a str,
         position_encoding: PositionEncoding,
         preview_limits: &'a PreviewSettings,
         mutation_limits: &'a MutationSettings,
@@ -2358,13 +2357,9 @@ mod tests {
         let file = workspace.path().join("main.rs");
         fs::write(&file, "a😀b\r\n").unwrap();
         let uri = Url::from_file_path(&file).unwrap().to_string();
-        let workspace_uri = Url::from_directory_path(workspace.path())
-            .unwrap()
-            .to_string();
         let (previews, mutation) = settings();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf16,
             &previews,
             &mutation,
@@ -2386,13 +2381,9 @@ mod tests {
         let file = workspace.path().join("main.rs");
         fs::write(&file, "abc").unwrap();
         let uri = Url::from_file_path(&file).unwrap().to_string();
-        let workspace_uri = Url::from_directory_path(workspace.path())
-            .unwrap()
-            .to_string();
         let (previews, mutation) = settings();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &previews,
             &mutation,
@@ -2452,13 +2443,9 @@ mod tests {
         let file = workspace.path().join("main.rs");
         fs::write(&file, "abc").unwrap();
         let uri = Url::from_file_path(&file).unwrap().to_string();
-        let workspace_uri = Url::from_directory_path(workspace.path())
-            .unwrap()
-            .to_string();
         let (previews, mutation) = settings();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &previews,
             &mutation,
@@ -2582,13 +2569,9 @@ mod tests {
         let file = workspace.path().join("main.rs");
         fs::write(&file, "abc").unwrap();
         let uri = Url::from_file_path(&file).unwrap().to_string();
-        let workspace_uri = Url::from_directory_path(workspace.path())
-            .unwrap()
-            .to_string();
         let (previews, mutation) = settings();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &previews,
             &mutation,

@@ -134,7 +134,6 @@ pub(crate) fn apply_preview(
         .ensure_receipt_capacity(context.receipt_limits)?;
     let planner = WorkspaceEditPlanner::open(
         &stored.workspace_path,
-        &stored.preview.workspace_uri,
         parse_position_encoding(&stored.preview.position_encoding),
         context.preview_limits,
         context.mutation_limits,
@@ -504,7 +503,6 @@ pub(crate) fn reconcile_recovery_status(
     }
     let planner = WorkspaceEditPlanner::open(
         &transaction.workspace_path,
-        &transaction.workspace_uri,
         PositionEncoding::Utf8,
         preview_limits,
         mutation_limits,
@@ -615,7 +613,6 @@ fn recover_transaction(
     store.ensure_receipt_capacity(receipt_limits)?;
     let planner = WorkspaceEditPlanner::open(
         &transaction.workspace_path,
-        &transaction.workspace_uri,
         PositionEncoding::Utf8,
         preview_limits,
         mutation_limits,
@@ -2315,7 +2312,6 @@ mod tests {
         let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &preview_limits,
             &mutation_limits,
@@ -2482,7 +2478,6 @@ mod tests {
         let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &preview_limits,
             &mutation_limits,
@@ -2555,7 +2550,6 @@ mod tests {
             .to_string();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &preview_limits,
             &mutation_limits,
@@ -2640,7 +2634,6 @@ mod tests {
         let file_uri = url::Url::from_file_path(&file).unwrap().to_string();
         let planner = WorkspaceEditPlanner::open(
             workspace.path(),
-            &workspace_uri,
             PositionEncoding::Utf8,
             &preview_limits,
             &mutation_limits,

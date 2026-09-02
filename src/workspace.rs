@@ -2,11 +2,11 @@
 
 mod diagnostics;
 
-pub(crate) use diagnostics::{DiagnosticCache, DiagnosticResult};
+pub(crate) use diagnostics::DiagnosticCache;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, Metadata},
+    fs::{File, Metadata},
     io::{self, Read},
     path::{Path, PathBuf},
 };
@@ -48,7 +48,6 @@ pub(crate) struct ProtocolPosition {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedPosition {
-    pub(crate) byte_offset: usize,
     pub(crate) protocol: ProtocolPosition,
 }
 
@@ -60,7 +59,6 @@ pub(crate) struct DocumentSnapshot {
     pub(crate) version: i64,
     pub(crate) text: String,
     pub(crate) digest: String,
-    identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +91,6 @@ pub(crate) enum SynchronizationEvent {
 pub(crate) struct RefreshOutcome {
     pub(crate) snapshot: DocumentSnapshot,
     pub(crate) events: Vec<SynchronizationEvent>,
-    pub(crate) evicted_uris: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -139,14 +136,13 @@ impl DocumentStore {
         language_id: &str,
         synchronization: TextSynchronization,
     ) -> Result<RefreshOutcome, ContractFailure> {
-        let (canonical, uri, text, digest, identity) =
-            match read_document(path, self.max_document_bytes) {
-                Ok(document) => document,
-                Err(failure) => {
-                    self.close_failed_document(path, synchronization);
-                    return Err(failure);
-                }
-            };
+        let (canonical, uri, text, digest) = match read_document(path, self.max_document_bytes) {
+            Ok(document) => document,
+            Err(failure) => {
+                self.close_failed_document(path, synchronization);
+                return Err(failure);
+            }
+        };
         if self.max_open_documents == 0 || text.len() as u64 > self.max_total_text_bytes {
             self.close_failed_document(&canonical, synchronization);
             return Err(document_too_large(
@@ -177,7 +173,6 @@ impl DocumentStore {
             version,
             text,
             digest,
-            identity,
         };
         let mut events = Vec::new();
         if synchronization == TextSynchronization::OpenClose && !unchanged {
@@ -198,13 +193,9 @@ impl DocumentStore {
                 last_used: self.use_clock,
             },
         );
-        let (mut eviction_events, evicted_uris) = self.evict_to_limits(&uri, synchronization)?;
+        let mut eviction_events = self.evict_to_limits(&uri, synchronization)?;
         events.append(&mut eviction_events);
-        Ok(RefreshOutcome {
-            snapshot,
-            events,
-            evicted_uris,
-        })
+        Ok(RefreshOutcome { snapshot, events })
     }
 
     pub(crate) fn refresh_open_documents(
@@ -291,9 +282,8 @@ impl DocumentStore {
         &mut self,
         active_uri: &str,
         synchronization: TextSynchronization,
-    ) -> Result<(Vec<SynchronizationEvent>, Vec<String>), ContractFailure> {
+    ) -> Result<Vec<SynchronizationEvent>, ContractFailure> {
         let mut events = Vec::new();
-        let mut evicted = Vec::new();
         while self.documents.len() > self.max_open_documents
             || self.total_text_bytes > self.max_total_text_bytes
         {
@@ -323,9 +313,8 @@ impl DocumentStore {
             if synchronization == TextSynchronization::OpenClose {
                 events.push(SynchronizationEvent::DidClose { uri: uri.clone() });
             }
-            evicted.push(uri);
         }
-        Ok((events, evicted))
+        Ok(events)
     }
 }
 
@@ -435,7 +424,7 @@ pub(crate) fn resolve_source_position(
     scalar_column: u32,
     encoding: PositionEncoding,
 ) -> Result<ResolvedPosition, ContractFailure> {
-    let (line_start, line_text) = line_slice(text, line).ok_or_else(|| {
+    let (_, line_text) = line_slice(text, line).ok_or_else(|| {
         invalid_position_failure(
             file,
             line,
@@ -456,7 +445,6 @@ pub(crate) fn resolve_source_position(
         PositionEncoding::Utf16 => line_text[..byte_in_line].encode_utf16().count(),
     };
     Ok(ResolvedPosition {
-        byte_offset: line_start + byte_in_line,
         protocol: ProtocolPosition {
             line,
             character: u32::try_from(character).map_err(|_| {
@@ -466,86 +454,10 @@ pub(crate) fn resolve_source_position(
     })
 }
 
-pub(crate) fn protocol_position_to_offset(
-    file: &Path,
-    text: &str,
-    position: ProtocolPosition,
-    encoding: PositionEncoding,
-) -> Result<usize, ContractFailure> {
-    let (line_start, line_text) = line_slice(text, position.line).ok_or_else(|| {
-        invalid_position_failure(file, position.line, None, "line is outside the Document")
-    })?;
-    let wanted = usize::try_from(position.character).unwrap_or(usize::MAX);
-    let byte_in_line = match encoding {
-        PositionEncoding::Utf8 => line_text
-            .is_char_boundary(wanted)
-            .then_some(wanted)
-            .filter(|offset| *offset <= line_text.len()),
-        PositionEncoding::Utf16 => {
-            let mut units = 0;
-            let mut found = None;
-            for (offset, character) in line_text.char_indices() {
-                if units == wanted {
-                    found = Some(offset);
-                    break;
-                }
-                units += character.len_utf16();
-                if units > wanted {
-                    return Err(invalid_position_failure(
-                        file,
-                        position.line,
-                        None,
-                        "UTF-16 position splits a surrogate pair",
-                    ));
-                }
-            }
-            if found.is_none() && units == wanted {
-                found = Some(line_text.len());
-            }
-            found
-        }
-    }
-    .ok_or_else(|| {
-        invalid_position_failure(
-            file,
-            position.line,
-            None,
-            "protocol position is outside the Document line",
-        )
-    })?;
-    Ok(line_start + byte_in_line)
-}
-
-pub(crate) fn validate_snapshot_after_query(
-    snapshot: &DocumentSnapshot,
-    max_document_bytes: u64,
-    server_result: &Value,
-) -> Result<(), ContractFailure> {
-    let (_, _, _, after_digest, _) = read_document(&snapshot.path, max_document_bytes)?;
-    if after_digest == snapshot.digest {
-        return Ok(());
-    }
-    Err(ContractFailure {
-        exit_code: 5,
-        category: "query",
-        code: "document_changed_during_query",
-        message: "A synchronized Document changed while the server request was running.".to_owned(),
-        stage: "validate_result",
-        delivery: "sent",
-        retry: "after_change",
-        data: json!({
-            "uri": snapshot.uri,
-            "beforeDigest": snapshot.digest,
-            "afterDigest": after_digest,
-            "serverResult": server_result
-        }),
-    })
-}
-
 fn read_document(
     path: &Path,
     max_document_bytes: u64,
-) -> Result<(PathBuf, String, String, String, FileIdentity), ContractFailure> {
+) -> Result<(PathBuf, String, String, String), ContractFailure> {
     let canonical = dunce::canonicalize(path).map_err(|error| {
         document_failure(
             "document_read_failed",
@@ -558,7 +470,7 @@ fn read_document(
     let mut observations = Vec::new();
     for _ in 0..2 {
         match read_document_once(&canonical, max_document_bytes, &uri) {
-            Ok(value) => return Ok((canonical, uri, value.0, value.1, value.2)),
+            Ok(value) => return Ok((canonical, uri, value.0, value.1)),
             Err(ReadAttemptError::Changed(before, after)) => {
                 observations.push((before, after));
             }
@@ -894,7 +806,7 @@ fn document_too_large(path: &Path, uri: &str, size: u64, limit: u64) -> Contract
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{fs, io::Write};
 
     use tempfile::TempDir;
 
@@ -938,24 +850,6 @@ mod tests {
         let utf16 = resolve_source_position(file, text, 1, 2, PositionEncoding::Utf16).unwrap();
         assert_eq!(utf8.protocol.character, 5);
         assert_eq!(utf16.protocol.character, 3);
-        assert_eq!(utf8.byte_offset, utf16.byte_offset);
-        assert_eq!(
-            protocol_position_to_offset(file, text, utf16.protocol, PositionEncoding::Utf16)
-                .unwrap(),
-            utf16.byte_offset
-        );
-        assert!(
-            protocol_position_to_offset(
-                file,
-                text,
-                ProtocolPosition {
-                    line: 1,
-                    character: 2
-                },
-                PositionEncoding::Utf16
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -984,7 +878,7 @@ mod tests {
         let second = store
             .refresh(&second, "rust", TextSynchronization::OpenClose)
             .unwrap();
-        assert_eq!(second.evicted_uris.len(), 1);
+        assert_eq!(second.events.len(), 2);
         assert_eq!(store.snapshots().len(), 1);
     }
 

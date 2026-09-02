@@ -19,7 +19,6 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
-use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use url::Url;
@@ -204,7 +203,7 @@ async fn dispatch_owner_query(
             let deadline =
                 Instant::now() + parse_duration(&authorized.server.published_diagnostics_wait);
             while !diagnostics
-                .published(&document.uri, Some(document.version), false)
+                .published(&document.uri, Some(document.version))
                 .complete
                 && Instant::now() < deadline
             {
@@ -1092,7 +1091,7 @@ impl OwnerStatePaths {
                     &error.to_string(),
                 )
             })?;
-            restrict_private_directory(path).map_err(|error| {
+            crate::state_permissions::restrict_directory(path).map_err(|error| {
                 owner_unavailable(
                     "sid_0000000000000000000000000000000000000000000000000000000000000000",
                     &error.to_string(),
@@ -1129,7 +1128,7 @@ fn acquire_startup_lock(path: &Path, timeout: Duration) -> Result<std::fs::File,
                 &error.to_string(),
             )
         })?;
-    restrict_private_file(path).map_err(|error| {
+    crate::state_permissions::restrict_file(path).map_err(|error| {
         owner_unavailable(
             "sid_0000000000000000000000000000000000000000000000000000000000000000",
             &format!("startup_lock_permissions_failed: {error}"),
@@ -1137,11 +1136,9 @@ fn acquire_startup_lock(path: &Path, timeout: Duration) -> Result<std::fs::File,
     })?;
     let deadline = Instant::now() + timeout;
     loop {
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10))
             }
             Err(error) => {
@@ -1164,10 +1161,10 @@ fn owner_lock_is_free(path: &Path) -> bool {
     else {
         return false;
     };
-    if restrict_private_file(path).is_err() {
+    if crate::state_permissions::restrict_file(path).is_err() {
         return false;
     }
-    file.try_lock_exclusive().is_ok()
+    file.try_lock().is_ok()
 }
 
 fn write_private_json(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
@@ -1175,7 +1172,7 @@ fn write_private_json(path: &Path, value: &impl serde::Serialize) -> io::Result<
     serde_json::to_writer(&mut file, value).map_err(io::Error::other)?;
     file.flush()?;
     file.commit()?;
-    restrict_private_file(path)
+    crate::state_permissions::restrict_file(path)
 }
 
 fn read_endpoint(path: &Path) -> Option<OwnerEndpoint> {
@@ -1314,12 +1311,4 @@ fn run_async<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("Tokio runtime construction is infallible on supported platforms")
         .block_on(future)
-}
-
-fn restrict_private_directory(path: &Path) -> io::Result<()> {
-    crate::state_permissions::restrict_directory(path)
-}
-
-fn restrict_private_file(path: &Path) -> io::Result<()> {
-    crate::state_permissions::restrict_file(path)
 }

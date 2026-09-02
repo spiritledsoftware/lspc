@@ -332,7 +332,7 @@ fn create_random_sibling(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
         let path = parent.join(format!("{prefix}{}", hex::encode(random)));
         match fs::create_dir(&path) {
             Ok(()) => {
-                restrict_directory(&path)?;
+                crate::state_permissions::restrict_directory(&path)?;
                 return Ok(path);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -347,7 +347,7 @@ fn create_random_sibling(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
-    restrict_file(path)?;
+    crate::state_permissions::restrict_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
@@ -545,14 +545,6 @@ fn valid_sha256_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
-}
-
-fn restrict_directory(path: &Path) -> io::Result<()> {
-    crate::state_permissions::restrict_directory(path)
-}
-
-fn restrict_file(path: &Path) -> io::Result<()> {
-    crate::state_permissions::restrict_file(path)
 }
 
 #[cfg(unix)]

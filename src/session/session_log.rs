@@ -18,6 +18,7 @@ struct SessionLogRecord {
     omitted_bytes: u64,
 }
 
+#[derive(Default)]
 pub(crate) struct SessionLog {
     records: VecDeque<(usize, SessionLogRecord)>,
     retained_bytes: usize,
@@ -27,16 +28,6 @@ pub(crate) struct SessionLog {
 }
 
 impl SessionLog {
-    pub(crate) fn new() -> Self {
-        Self {
-            records: VecDeque::new(),
-            retained_bytes: 0,
-            evicted_records: 0,
-            evicted_bytes: 0,
-            next_sequence: 0,
-        }
-    }
-
     pub(crate) fn push(
         &mut self,
         kind: &'static str,
@@ -111,7 +102,7 @@ mod tests {
 
     #[test]
     fn bounds_log_and_keeps_utf8_tail() {
-        let mut log = SessionLog::new();
+        let mut log = SessionLog::default();
         log.push("server_stderr", "error", "😀".repeat(400_000));
         let rendered = log.render("gen_00000000000000000000000000000000", 100);
         assert!(rendered["retainedBytes"].as_u64().unwrap() <= 1024 * 1024);

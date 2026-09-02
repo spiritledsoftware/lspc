@@ -209,14 +209,8 @@ pub(crate) fn apply_preauthorized_workspace_edit<F>(
 where
     F: FnMut(&[Value]) -> bool,
 {
-    let planner = WorkspaceEditPlanner::open(
-        workspace_path,
-        workspace_uri,
-        position_encoding,
-        previews,
-        mutation,
-    )
-    .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
+    let planner = WorkspaceEditPlanner::open(workspace_path, position_encoding, previews, mutation)
+        .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
     let planned = planner
         .plan_workspace_edit(&edit)
         .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
@@ -361,14 +355,8 @@ pub(crate) fn create_callback_preview(
     previews: &PreviewSettings,
     mutation: &MutationSettings,
 ) -> Result<Value, ContractFailure> {
-    let planner = WorkspaceEditPlanner::open(
-        workspace_path,
-        workspace_uri,
-        position_encoding,
-        previews,
-        mutation,
-    )
-    .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
+    let planner = WorkspaceEditPlanner::open(workspace_path, position_encoding, previews, mutation)
+        .map_err(|problem| unsupported_filesystem(workspace_uri, &[problem]))?;
     let planned = planner
         .plan_workspace_edit(&edit)
         .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
@@ -449,7 +437,6 @@ fn persist_preview(
 ) -> Result<Value, ContractFailure> {
     let planner = WorkspaceEditPlanner::open(
         &configuration.workspace,
-        &configuration.workspace_uri,
         position_encoding,
         &configuration.previews,
         &configuration.mutation,
@@ -1034,7 +1021,6 @@ fn refresh_preview_presentation(
 ) {
     let Ok(planner) = WorkspaceEditPlanner::open(
         &stored.workspace_path,
-        &stored.preview.workspace_uri,
         parse_position_encoding(&stored.preview.position_encoding),
         preview_settings,
         mutation_settings,
