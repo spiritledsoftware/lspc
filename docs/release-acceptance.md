@@ -24,12 +24,13 @@ checksums. The script rejects missing or symlinked skill payloads.
 a checksum and skill/schema digests. `package.py --skill-only` derives the
 schema from the built release binary before archiving the skill.
 
-`release.yml` uses native hosted runners for the five supported targets. Linux
-builds and smokes inside architecture-native manylinux 2.28 containers; macOS
-sets a 12.0 deployment target; Windows uses the MSVC target. Static audits
-reject a GLIBC symbol above 2.28, a Mach-O minimum above macOS 12, or an
-unreviewed Windows runtime import/PE version. Hosted native runners also smoke
-every extracted archive before build-provenance attestation and upload.
+`release.yml` uses native runners for the five supported targets. Linux builds
+inside architecture-native manylinux 2.28 containers; macOS sets a 12.0
+deployment target; Windows uses the MSVC target. `audit_runtime_floor.py`
+rejects a GLIBC symbol above 2.28, a Mach-O minimum above macOS 12, or an
+unreviewed Windows runtime import/PE version. The workflow runs locked
+packaging, source installation, archive verification, and build-provenance
+attestation before uploading each candidate.
 
 ## Extended acceptance
 
