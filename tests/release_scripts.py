@@ -81,6 +81,20 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertEqual(Path(environment["CARGO_HOME"]), toolchain_home / ".cargo")
             self.assertEqual(Path(environment["RUSTUP_HOME"]), toolchain_home / ".rustup")
 
+    def test_reference_smoke_allows_transient_content_modified(self) -> None:
+        reference = load_script(REFERENCE_SMOKE)
+        failure = subprocess.CompletedProcess(
+            ["lspc", "definition"],
+            5,
+            stdout=b'{"ok":false,"error":{"code":"content_modified"}}',
+            stderr=b"",
+        )
+        smoke = reference.Smoke(Path("lspc"), Path("workspace"), {})
+        with mock.patch.object(reference.subprocess, "run", return_value=failure):
+            output = smoke.run("definition", allowed_error_code="content_modified")
+        self.assertEqual(output["error"]["code"], "content_modified")
+        self.assertEqual(smoke.outputs, [])
+
     def test_soak_uses_the_native_user_config_path(self) -> None:
         soak = load_script(SOAK)
         with tempfile.TemporaryDirectory() as temporary:

@@ -48,7 +48,9 @@ class Smoke:
         self.env = env
         self.outputs: list[dict[str, object]] = []
 
-    def run(self, *arguments: str) -> dict[str, object]:
+    def run(
+        self, *arguments: str, allowed_error_code: str | None = None
+    ) -> dict[str, object]:
         command = [str(self.binary), *arguments]
         completed = subprocess.run(command, env=self.env, check=False, capture_output=True)
         if completed.stderr:
@@ -58,6 +60,11 @@ class Smoke:
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise SystemExit(f"command did not emit JSON: {command!r}: {error}") from error
         if completed.returncode != 0 or output.get("ok") is not True:
+            if (
+                allowed_error_code is not None
+                and output.get("error", {}).get("code") == allowed_error_code
+            ):
+                return output
             raise SystemExit(f"command failed: {command!r}: {json.dumps(output, sort_keys=True)}")
         self.outputs.append(output)
         return output
@@ -165,10 +172,12 @@ def main() -> None:
                 "definition", "--workspace", workspace_text, "--server", arguments.server,
                 "--file", str(source), "--line", str(line), "--column", str(column),
                 "--request-timeout", "2m",
+                allowed_error_code="content_modified",
             )
             if definition.get("result"):
                 break
-            smoke.outputs.pop()
+            if definition.get("ok") is True:
+                smoke.outputs.pop()
             if time.monotonic() >= definition_deadline:
                 raise SystemExit("reference definition did not resolve within 30 seconds")
             time.sleep(1)

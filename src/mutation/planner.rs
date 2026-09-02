@@ -38,6 +38,42 @@ pub(crate) struct DocumentVersionPrecondition {
     pub(crate) digest: String,
 }
 
+fn document_version_precondition<'a>(
+    preconditions: &'a BTreeMap<String, DocumentVersionPrecondition>,
+    uri: &str,
+    version: i64,
+) -> Option<&'a DocumentVersionPrecondition> {
+    if let Some(precondition) = preconditions.get(uri) {
+        return (precondition.version == version).then_some(precondition);
+    }
+    #[cfg(windows)]
+    {
+        preconditions.iter().find_map(|(known_uri, precondition)| {
+            (windows_file_uri_drive_alias(known_uri, uri) && precondition.version == version)
+                .then_some(precondition)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_file_uri_drive_alias(left: &str, right: &str) -> bool {
+    const PREFIX: &[u8] = b"file:///";
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    left.len() > PREFIX.len() + 1
+        && left.len() == right.len()
+        && left.starts_with(PREFIX)
+        && right.starts_with(PREFIX)
+        && left[PREFIX.len()].eq_ignore_ascii_case(&right[PREFIX.len()])
+        && left[PREFIX.len()].is_ascii_alphabetic()
+        && left[PREFIX.len() + 1..] == right[PREFIX.len() + 1..]
+        && left[PREFIX.len() + 1] == b':'
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResourceKind {
@@ -358,9 +394,11 @@ impl<'a> WorkspaceEditPlanner<'a> {
                         .filter(|version| !version.is_null())
                         .and_then(Value::as_i64)
                         .and_then(|version| {
-                            document_version_preconditions
-                                .get(uri)
-                                .filter(|known| known.version == version)
+                            document_version_precondition(
+                                document_version_preconditions,
+                                uri,
+                                version,
+                            )
                         });
                     if version.is_some_and(|version| !version.is_null())
                         && document_precondition.is_none()
@@ -2451,6 +2489,33 @@ mod tests {
                 )
                 .is_ok()
         );
+        #[cfg(windows)]
+        {
+            let drive = uri.as_bytes()[8];
+            let alias_drive = if drive.is_ascii_lowercase() {
+                drive.to_ascii_uppercase()
+            } else {
+                drive.to_ascii_lowercase()
+            };
+            let drive_alias_uri = format!("{}{}{}", &uri[..8], char::from(alias_drive), &uri[9..]);
+            assert!(
+                planner
+                    .plan_workspace_edit_with_document_preconditions(
+                        &json!({"documentChanges": [{
+                            "textDocument": {"uri": drive_alias_uri, "version": 1},
+                            "edits": []
+                        }]}),
+                        &BTreeMap::from([(
+                            uri.clone(),
+                            DocumentVersionPrecondition {
+                                version: 1,
+                                digest: digest_raw_bytes(b"abc"),
+                            },
+                        )]),
+                    )
+                    .is_ok()
+            );
+        }
         let mismatched = planner
             .plan_workspace_edit_with_document_preconditions(
                 &json!({"documentChanges": [{
@@ -2497,6 +2562,18 @@ mod tests {
             .plan_workspace_edit(&json!({"changes": {traversal_uri: []}}))
             .unwrap_err();
         assert_eq!(traversal[0].code, "path_traversal");
+    }
+
+    #[test]
+    fn windows_file_uri_alias_only_ignores_drive_case() {
+        assert!(windows_file_uri_drive_alias(
+            "file:///C:/workspace/main.rs",
+            "file:///c:/workspace/main.rs"
+        ));
+        assert!(!windows_file_uri_drive_alias(
+            "file:///C:/Workspace/main.rs",
+            "file:///c:/workspace/main.rs"
+        ));
     }
 
     #[test]

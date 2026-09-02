@@ -81,11 +81,15 @@ def unix_descendants(pid: int) -> list[int]:
 
 
 def windows_descendants(pid: int) -> list[int]:
+    # conhost.exe hosts console-subsystem servers; it is not another language server.
     script = (
-        "$all=Get-CimInstance Win32_Process; $pending=@(" + str(pid) + "); $out=@(); "
+        "$all=@(Get-CimInstance Win32_Process);"
+        "$pending=@($all|Where-Object ProcessId -eq " + str(pid) + ");$out=@();"
         "while($pending.Count -gt 0){$p=$pending[0];$pending=@($pending|Select-Object -Skip 1);"
-        "$c=@($all|Where-Object ParentProcessId -eq $p|ForEach-Object ProcessId);"
-        "$out+=$c;$pending+=$c};$out -join ' '"
+        "$c=@($all|Where-Object {$_.ParentProcessId -eq $p.ProcessId -and "
+        "$null -ne $_.CreationDate -and $_.CreationDate -gt $p.CreationDate});"
+        "$out+=$c;$pending+=$c};"
+        "($out|Where-Object Name -ne 'conhost.exe'|ForEach-Object ProcessId) -join ' '"
     )
     output = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True, check=True)
     return [int(value) for value in output.stdout.split()]
