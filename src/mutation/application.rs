@@ -1701,12 +1701,26 @@ fn copy_resource(source: &Path, destination: &Path, copied_bytes: &mut u64) -> s
         flush_directory(destination)?;
     } else {
         fs::copy(source, destination)?;
+        let flush_file = open_copied_file_for_flush(destination, &metadata)?;
         *copied_bytes = copied_bytes.saturating_add(metadata.len());
         copy_required_metadata(source, destination, &metadata, copied_bytes)?;
         restore_source_access_time(source, &metadata)?;
-        File::open(destination)?.sync_all()?;
+        flush_file.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_copied_file_for_flush(path: &Path, metadata: &fs::Metadata) -> std::io::Result<File> {
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    OpenOptions::new().write(true).open(path)
+}
+
+#[cfg(not(windows))]
+fn open_copied_file_for_flush(path: &Path, _metadata: &fs::Metadata) -> std::io::Result<File> {
+    File::open(path)
 }
 
 fn copy_required_metadata(

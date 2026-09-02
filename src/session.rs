@@ -775,14 +775,18 @@ async fn live_endpoints() -> Result<Vec<OwnerEndpoint>, ContractFailure> {
     let mut endpoints = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        let Some(identity) = endpoint_identity_from_path(&path) else {
+            continue;
+        };
         let Some(endpoint) = read_endpoint(&path) else {
-            if let Some(identity) = endpoint_identity_from_path(&path)
-                && owner_lock_is_free(&paths.owner_lock_path(identity))
-            {
+            if owner_lock_is_free(&paths.owner_lock_path(identity)) {
                 let _ = fs::remove_file(path);
             }
             continue;
         };
+        if endpoint.session_identity != identity {
+            continue;
+        }
         if probe_endpoint(&endpoint).await.is_ok() {
             endpoints.push(endpoint);
         } else if owner_lock_is_free(&paths.owner_lock_path(&endpoint.session_identity)) {
