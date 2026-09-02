@@ -160,24 +160,24 @@ jobs:
 
   runtime-floors:
     needs: [archive-native]
-    name: floor / ${{ matrix.target }}
+    name: runtime smoke / ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: '["self-hosted","lspc-floor","macos-12","x64"]'
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             extension: tar.gz
             fake: lspc-fake-server
-          - runner: '["self-hosted","lspc-floor","macos-12","arm64"]'
+          - runner: macos-14
             target: aarch64-apple-darwin
             extension: tar.gz
             fake: lspc-fake-server
-          - runner: '["self-hosted","lspc-floor","windows-2019","x64"]'
+          - runner: windows-2022
             target: x86_64-pc-windows-msvc
             extension: zip
             fake: lspc-fake-server.exe
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -187,7 +187,7 @@ jobs:
       - name: Install stable Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal
-      - name: Build independent fixture and run archive at native floor
+      - name: Build independent fixture and smoke extracted archive
         shell: bash
         run: |
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
