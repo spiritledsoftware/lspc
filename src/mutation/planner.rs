@@ -2051,7 +2051,7 @@ fn metadata_digest(
 }
 
 #[cfg(windows)]
-fn windows_security_descriptor(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(super) fn windows_security_descriptor(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::{os::windows::ffi::OsStrExt, ptr, slice};
     use windows_sys::Win32::{
         Foundation::LocalFree,

@@ -31,6 +31,9 @@ use super::{
     },
 };
 
+#[cfg(windows)]
+use super::planner::windows_security_descriptor;
+
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
 type PostCommit<'a> = dyn FnMut(&ReceiptRecord, &[Value]) -> bool + 'a;
 const ARTIFACT_OWNER_FILE: &str = ".lspc-transaction-owner";
@@ -1751,6 +1754,7 @@ fn copy_native_owner(
         },
     };
 
+    let source_security_descriptor = windows_security_descriptor(source)?;
     let mut source_wide = source
         .as_os_str()
         .encode_wide()
@@ -1779,17 +1783,28 @@ fn copy_native_owner(
     if status != 0 {
         return Err(std::io::Error::from_raw_os_error(status as i32));
     }
-    let result =
-        if unsafe { SetFileSecurityW(destination_wide.as_mut_ptr(), information, descriptor) } == 0
-        {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        };
+    let result = if unsafe {
+        SetFileSecurityW(
+            destination_wide.as_mut_ptr(),
+            DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
     unsafe {
         LocalFree(descriptor);
     }
-    result
+    result?;
+    if windows_security_descriptor(destination)? != source_security_descriptor {
+        return Err(std::io::Error::other(
+            "copied Windows security descriptor does not match the source",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
