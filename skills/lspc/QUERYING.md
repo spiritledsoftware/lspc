@@ -19,6 +19,8 @@ Never copy a returned LSP `character` into `--column`. Convert it against the cu
 
 Read `context.synchronization` before using a result. A named Document Query that detects a post-response file change fails and places the unusable server result in structured error data. Do not treat that payload as current.
 
+If a successful navigation Query unexpectedly returns an empty result, inspect `context.serverProgress`. A non-empty array means the server reported background work when it answered. Use `lspc session status` for the same Workspace and server to watch `result.progress`; after it clears, repeat the Query. With no reported progress, treat the empty result as the server's answer.
+
 ## Page explicit results
 
 Only use `--offset` and `--limit` when the leaf schema exposes them.

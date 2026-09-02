@@ -947,6 +947,7 @@ impl LspRuntime {
                             "result": result,
                             "partialResults": query.partial_items,
                             "applyEditLedger": query.apply_edit_ledger,
+                            "serverProgress": self.progress.values().collect::<Vec<_>>(),
                             "synchronization": query.synchronization,
                             "positionEncoding": self.negotiated.position_encoding.name(),
                             "textSynchronization": match self.negotiated.text_synchronization {

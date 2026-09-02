@@ -77,6 +77,7 @@ fn schema_help_and_group_help_are_machine_readable() {
     assert!(group_help.status.success());
     let group_help: Value = serde_json::from_slice(&group_help.stdout).unwrap();
     assert_eq!(group_help["command"], json!(["help", "trust"]));
+    assert_eq!(group_help["result"]["schemas"], json!({}));
     assert_eq!(
         group_help["result"]["catalog"]["commands"]
             .as_array()
@@ -107,6 +108,10 @@ fn full_and_focused_schema_results_use_the_frozen_registry() {
     let schemas = focused["result"]["schemas"].as_object().unwrap();
     assert!(schemas.contains_key("lspc://schema/v1/cli/definition"));
     assert!(schemas.contains_key("lspc://schema/v1/command/definition"));
+    assert_eq!(
+        schemas["lspc://schema/v1/output/query-context"]["properties"]["serverProgress"]["items"]["$ref"],
+        "lspc://schema/v1/output/progress-record"
+    );
 
     let invalid = run_lspc(&["schema", "no-such-subject"]);
     assert_eq!(invalid.status.code(), Some(2));

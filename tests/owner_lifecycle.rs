@@ -788,6 +788,59 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
 }
 
 #[test]
+fn empty_query_result_includes_active_server_progress() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    fixture.command(&[
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "test/start-progress",
+    ]);
+
+    let file = fixture.workspace.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let definition = fixture.command(&[
+        "definition",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--file",
+        file.to_str().unwrap(),
+        "--line",
+        "0",
+        "--column",
+        "3",
+    ]);
+
+    assert_eq!(definition["result"], json!([]));
+    assert_eq!(
+        definition["context"]["serverProgress"],
+        json!([{
+            "token": "fixture-indexing",
+            "kind": "work_done",
+            "title": "Indexing",
+            "message": "loading workspace",
+            "percentage": 25,
+            "cancellable": false
+        }])
+    );
+
+    fixture.command(&[
+        "session",
+        "stop",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+    ]);
+}
+
+#[test]
 fn graceful_stop_closes_open_documents_before_shutdown() {
     let root = TempDir::new().unwrap();
     let event_log = root.path().join("events.log");

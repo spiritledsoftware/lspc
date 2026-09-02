@@ -3727,6 +3727,7 @@
         "ownerGeneration": "generation-id",
         "inputPositionEncoding": "enum:inputPositionEncoding?",
         "resultPositionEncoding": "enum:positionEncoding",
+        "serverProgress": "array<shape:progressRecord>?",
         "synchronization": "shape:synchronization",
         "recovery": "shape:recoveryPresence"
       }

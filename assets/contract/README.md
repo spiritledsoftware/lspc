@@ -1,9 +1,9 @@
 # Checked v1 contract assets
 
-These files come from the validated machine contract at commit `baaead1`.
+These files are based on the validated machine contract at commit `baaead1` and retain its v1 compatibility.
 
-- `catalog.json` is the frozen catalog with its prototype marker removed.
-- `schemas.json` is the output of `check.py --emit-schemas` at that revision.
+- `catalog.json` is the checked v1 catalog with its prototype marker removed.
+- `schemas.json` is compiled from the checked catalog with that revision's `check.py` generator.
 - `initialize-capabilities.json` is the exact Capability profile sent to language servers.
 
 `lspc` embeds these files. Builds do not run the prototype's Python generator.

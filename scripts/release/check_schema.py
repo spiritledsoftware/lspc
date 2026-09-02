@@ -17,7 +17,7 @@ def load(path: Path) -> object:
 
 def main() -> None:
     output = subprocess.run(
-        ["cargo", "run", "--locked", "--quiet", "--bin", "lspc", "--", "schema", "--full"],
+        ["cargo", "run", "--locked", "--quiet", "--", "schema", "--full"],
         cwd=ROOT,
         check=True,
         capture_output=True,

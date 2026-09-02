@@ -359,6 +359,44 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            Some("test/start-progress") => {
+                let callback_id = json!("fixture-progress-create");
+                if write_frame(
+                    &mut output,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": callback_id,
+                        "method": "window/workDoneProgress/create",
+                        "params": {"token": "fixture-indexing"}
+                    }),
+                    scenario,
+                )
+                .is_err()
+                    || read_callback_result(&mut input, &mut open_documents, &callback_id).is_none()
+                    || write_frame(
+                        &mut output,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "$/progress",
+                            "params": {
+                                "token": "fixture-indexing",
+                                "value": {
+                                    "kind": "begin",
+                                    "title": "Indexing",
+                                    "message": "loading workspace",
+                                    "percentage": 25,
+                                    "cancellable": false
+                                }
+                            }
+                        }),
+                        scenario,
+                    )
+                    .is_err()
+                    || result(&mut output, &message, json!({"fixture": true}), scenario).is_err()
+                {
+                    return ExitCode::from(1);
+                }
+            }
             Some("test/server-request-limit") => {
                 if write_configuration_request_burst(&mut output, "fixture-callback").is_err() {
                     return ExitCode::from(1);

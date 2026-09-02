@@ -239,6 +239,7 @@ async fn dispatch_owner_query(
         session_identity: authorized.session_identity.clone(),
         owner_generation: endpoint.owner_generation.clone(),
         result_position_encoding: position_encoding,
+        server_progress: Vec::new(),
         synchronization: json!({
             "mode": if invocation.command_path().first().is_some_and(|command| command == "workspace-diagnostics") {
                 "workspace"
@@ -436,6 +437,11 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
             .and_then(|object| object.remove("applyEditLedger"))
             .and_then(|value| value.as_array().cloned())
             .unwrap_or_default();
+        let server_progress = response
+            .as_object_mut()
+            .and_then(|object| object.remove("serverProgress"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
         let synchronization = response
             .as_object_mut()
             .and_then(|object| object.remove("synchronization"));
@@ -444,6 +450,7 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
             partial_results,
             trace,
             apply_edit_ledger,
+            server_progress,
             synchronization,
         })
     }

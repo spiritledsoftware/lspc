@@ -404,6 +404,7 @@ pub(crate) struct DispatchResponse {
     pub(crate) partial_results: Vec<Value>,
     pub(crate) trace: Option<Value>,
     pub(crate) apply_edit_ledger: Vec<Value>,
+    pub(crate) server_progress: Vec<Value>,
     pub(crate) synchronization: Option<Value>,
 }
 
@@ -515,6 +516,7 @@ pub(crate) struct QueryContext {
     pub(crate) session_identity: String,
     pub(crate) owner_generation: String,
     pub(crate) result_position_encoding: PositionEncoding,
+    pub(crate) server_progress: Vec<Value>,
     pub(crate) synchronization: Value,
     pub(crate) recovery: Value,
 }
@@ -532,6 +534,9 @@ impl QueryContext {
         });
         if has_input_position {
             context["inputPositionEncoding"] = Value::String("unicode-scalar".to_owned());
+        }
+        if !self.server_progress.is_empty() {
+            context["serverProgress"] = Value::Array(self.server_progress.clone());
         }
         context
     }
@@ -743,6 +748,7 @@ pub(crate) fn execute(
     if let Some(synchronization) = response.synchronization.clone() {
         context.synchronization = synchronization;
     }
+    context.server_progress = response.server_progress.clone();
     let context = context.json(has_source_position(composed.command));
     if composed.command == QueryCommand::Raw {
         return query_envelope(
@@ -2188,6 +2194,7 @@ mod tests {
                 "sid_0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             owner_generation: "gen_00000000000000000000000000000000".to_owned(),
             result_position_encoding: PositionEncoding::Utf16,
+            server_progress: Vec::new(),
             synchronization: json!({"mode":"document", "bestEffort":false, "before":[], "failures":[], "postResponseChanged":[]}),
             recovery: json!({"required":false}),
         }
@@ -2614,6 +2621,7 @@ mod tests {
             partial_results: Vec::new(),
             trace: None,
             apply_edit_ledger: Vec::new(),
+            server_progress: Vec::new(),
             synchronization: None,
         });
         let mut diagnostics = DiagnosticCache::new(4, 4096);
@@ -2655,6 +2663,7 @@ mod tests {
             partial_results: Vec::new(),
             trace: Some(json!({"frames":[]})),
             apply_edit_ledger: vec![json!({"ordinal":0,"applied":false,"outcome":"previewed"})],
+            server_progress: Vec::new(),
             synchronization: None,
         });
         let mut previews = RecordingPreview::default();
@@ -2705,6 +2714,7 @@ mod tests {
             partial_results: Vec::new(),
             trace: None,
             apply_edit_ledger: Vec::new(),
+            server_progress: Vec::new(),
             synchronization: None,
         });
         let output = execute(
@@ -2745,6 +2755,7 @@ mod tests {
             partial_results: Vec::new(),
             trace: Some(json!({"frames":[]})),
             apply_edit_ledger: Vec::new(),
+            server_progress: Vec::new(),
             synchronization: None,
         });
         let failure = execute(
@@ -2818,6 +2829,7 @@ mod tests {
                 partial_results: Vec::new(),
                 trace: None,
                 apply_edit_ledger: Vec::new(),
+                server_progress: Vec::new(),
                 synchronization: None,
             }),
             query,
@@ -2850,7 +2862,8 @@ mod tests {
                 partial_results: Vec::new(),
                 trace: None,
                 apply_edit_ledger: Vec::new(),
-            synchronization: None,
+                server_progress: Vec::new(),
+                synchronization: None,
             }),
             query,
             context(),
@@ -2897,6 +2910,7 @@ mod tests {
                 partial_results: Vec::new(),
                 trace: None,
                 apply_edit_ledger: Vec::new(),
+                server_progress: Vec::new(),
                 synchronization: None,
             }),
             query,

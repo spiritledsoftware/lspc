@@ -136,7 +136,9 @@ pub(crate) fn schema_success_envelope(
     } else {
         focused_catalog(&subject)
     };
-    let schemas = if full {
+    let schemas = if command_name == "help" {
+        Value::Object(Map::new())
+    } else if full {
         contract_schemas().clone()
     } else if subject.is_empty() {
         Value::Object(Map::new())
