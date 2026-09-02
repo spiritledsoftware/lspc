@@ -140,6 +140,7 @@ struct LspRuntime {
     reader_task: Option<JoinHandle<()>>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
     stderr: mpsc::Receiver<String>,
+    stderr_task: Option<JoinHandle<()>>,
     stderr_closed: bool,
     stderr_tail: Arc<Mutex<String>>,
     next_request_id: i64,
@@ -466,6 +467,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         .await
                         .ok()
                         .and_then(Result::ok);
+                        lsp.finish_server_stderr().await;
                         let failure = server_exited_failure(
                             status,
                             &lsp.server_stderr_tail(),
@@ -516,6 +518,7 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
                 if let Some(status) = lsp.process.try_wait()? {
                     lsp.log.push("lifecycle", "error", format!("Language server exited: {status}"));
+                    lsp.finish_server_stderr().await;
                     let failure = server_exited_failure(Some(status), &lsp.server_stderr_tail());
                     fail_active_queries(
                         &bootstrap.owner_generation,
@@ -569,7 +572,7 @@ impl LspRuntime {
         let (stderr_tx, stderr_rx) = mpsc::channel(64);
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let stderr_tail_writer = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut bytes = vec![0; 8192];
             loop {
                 match stderr.read(&mut bytes).await {
@@ -610,6 +613,7 @@ impl LspRuntime {
             reader_task: None,
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
             stderr: stderr_rx,
+            stderr_task: Some(stderr_task),
             stderr_closed: false,
             stderr_tail,
             next_request_id: 1,
@@ -656,6 +660,7 @@ impl LspRuntime {
             .await
         {
             runtime.process.terminate_process_tree(Duration::ZERO).await;
+            runtime.finish_server_stderr().await;
             return Err(OwnerStartupFailure {
                 contract: initialization_failure(bootstrap, &source, &runtime.server_stderr_tail()),
                 source,
@@ -711,6 +716,21 @@ impl LspRuntime {
             .lock()
             .map(|tail| tail.clone())
             .unwrap_or_default()
+    }
+
+    async fn finish_server_stderr(&mut self) {
+        if let Some(mut task) = self.stderr_task.take()
+            && tokio_time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        while let Ok(stderr) = self.stderr.try_recv() {
+            self.log.push("server_stderr", "error", stderr);
+        }
+        self.stderr_closed = true;
     }
 
     async fn initialize(
