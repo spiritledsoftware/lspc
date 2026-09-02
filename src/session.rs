@@ -933,7 +933,7 @@ async fn exchange_owner_request_with_queue_deadline(
     }
     let mut stream = TcpStream::connect(&endpoint.address)
         .await
-        .map_err(|error| owner_unavailable(&endpoint.session_identity, &error.to_string()))?;
+        .map_err(|error| owner_transport_failure(endpoint, &error))?;
     let authenticated = AuthenticatedOwnerRequest {
         owner_protocol_version: OWNER_PROTOCOL_VERSION,
         session_identity: endpoint.session_identity.clone(),
@@ -944,10 +944,10 @@ async fn exchange_owner_request_with_queue_deadline(
     };
     write_owner_message(&mut stream, &authenticated)
         .await
-        .map_err(|error| owner_unavailable(&endpoint.session_identity, &error.to_string()))?;
+        .map_err(|error| owner_transport_failure(endpoint, &error))?;
     let response: OwnerResponse = read_owner_message(&mut stream)
         .await
-        .map_err(|error| owner_unavailable(&endpoint.session_identity, &error.to_string()))?;
+        .map_err(|error| owner_transport_failure(endpoint, &error))?;
     if response.owner_protocol_version != OWNER_PROTOCOL_VERSION
         || response.owner_generation != endpoint.owner_generation
     {
@@ -1290,6 +1290,21 @@ fn owner_unavailable(identity: &str, reason: &str) -> ContractFailure {
         retry: "safe",
         data: json!({"sessionIdentity": identity, "reason": reason}),
     }
+}
+
+fn owner_transport_failure(endpoint: &OwnerEndpoint, error: &io::Error) -> ContractFailure {
+    OwnerStatePaths::new()
+        .ok()
+        .and_then(|paths| read_endpoint(&paths.endpoint_path(&endpoint.session_identity)))
+        .filter(|current| {
+            current.session_identity == endpoint.session_identity
+                && current.owner_generation == endpoint.owner_generation
+                && current.token == endpoint.token
+                && current.state == "failed"
+        })
+        .and_then(|current| current.failure)
+        .map(contract_failure_from_owner)
+        .unwrap_or_else(|| owner_unavailable(&endpoint.session_identity, &error.to_string()))
 }
 
 fn session_selection_failure(reason: &str, candidates: Vec<String>) -> ContractFailure {
