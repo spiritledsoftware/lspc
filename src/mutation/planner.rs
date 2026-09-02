@@ -1971,7 +1971,7 @@ fn metadata_digest(
     }
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::macos::fs::MetadataExt;
         value["bsdFlags"] = json!(metadata.st_flags());
     }
     #[cfg(windows)]

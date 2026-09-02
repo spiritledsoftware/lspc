@@ -98,7 +98,7 @@ mod windows {
         let token = current_process_token()?;
         let token_user = token_user(&token)?;
         let user_sid = unsafe { (*(token_user.as_ptr() as *const TOKEN_USER)).User.Sid };
-        let mut access = EXPLICIT_ACCESS_W {
+        let access = EXPLICIT_ACCESS_W {
             grfAccessPermissions: FILE_ALL_ACCESS,
             grfAccessMode: SET_ACCESS,
             grfInheritance: if inherit_to_children {
@@ -115,7 +115,7 @@ mod windows {
             },
         };
         let mut acl: *mut ACL = ptr::null_mut();
-        let status = unsafe { SetEntriesInAclW(1, &mut access, ptr::null(), &mut acl) };
+        let status = unsafe { SetEntriesInAclW(1, &access, ptr::null(), &mut acl) };
         if status != 0 {
             return Err(os_error(status));
         }

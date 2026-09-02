@@ -1807,7 +1807,7 @@ fn copy_native_flags(
     destination: &Path,
     metadata: &fs::Metadata,
 ) -> std::io::Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
+    use std::{ffi::CString, os::macos::fs::MetadataExt, os::unix::ffi::OsStrExt};
 
     let path = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;

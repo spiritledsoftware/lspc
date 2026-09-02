@@ -135,6 +135,7 @@ struct LspRuntime {
     reader_task: Option<JoinHandle<()>>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
     stderr: mpsc::Receiver<String>,
+    stderr_closed: bool,
     stderr_tail: Arc<Mutex<String>>,
     next_request_id: i64,
     negotiated: NegotiatedCapabilities,
@@ -425,9 +426,11 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                     }
                 }
             }
-            stderr = lsp.stderr.recv() => {
+            stderr = lsp.stderr.recv(), if !lsp.stderr_closed => {
                 if let Some(stderr) = stderr {
                     lsp.log.push("server_stderr", "error", stderr);
+                } else {
+                    lsp.stderr_closed = true;
                 }
             }
             frame = lsp.frames.as_mut().expect("ready Owners have an LSP reader pump").recv() => {
@@ -590,6 +593,7 @@ impl LspRuntime {
             reader_task: None,
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
             stderr: stderr_rx,
+            stderr_closed: false,
             stderr_tail,
             next_request_id: 1,
             negotiated: placeholder,
@@ -698,9 +702,11 @@ impl LspRuntime {
                 _ = tokio_time::sleep_until(deadline) => {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "LSP initialization timed out"));
                 }
-                stderr = self.stderr.recv() => {
+                stderr = self.stderr.recv(), if !self.stderr_closed => {
                     if let Some(stderr) = stderr {
                         self.log.push("server_stderr", "error", stderr);
+                    } else {
+                        self.stderr_closed = true;
                     }
                 }
                 frame = self.frames.as_mut().expect("initializing Owners have an LSP reader pump").recv() => {

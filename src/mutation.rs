@@ -759,12 +759,12 @@ fn receipt_list(invocation: &ParsedInvocation) -> Result<Value, ContractFailure>
         .list_receipts()?
         .into_iter()
         .filter(|stored| {
-            !workspace
+            workspace
                 .as_ref()
-                .is_some_and(|workspace| workspace != &stored.receipt.workspace_uri)
-                && !outcome
+                .is_none_or(|workspace| workspace == &stored.receipt.workspace_uri)
+                && outcome
                     .as_ref()
-                    .is_some_and(|outcome| outcome != &stored.receipt.outcome)
+                    .is_none_or(|outcome| outcome == &stored.receipt.outcome)
         })
         .map(|stored| receipt_list_entry(&stored.receipt))
         .collect::<Vec<_>>();
