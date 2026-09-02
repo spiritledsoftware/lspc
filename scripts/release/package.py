@@ -35,7 +35,10 @@ def main() -> None:
     build = ["cargo", "build", "--locked", "--release"]
     if target:
         build.extend(("--target", target))
-    subprocess.run(build, cwd=ROOT, check=True, env={**os.environ, "LSPC_BUILD_COMMIT": arguments.commit})
+    environment = {**os.environ, "LSPC_BUILD_COMMIT": arguments.commit}
+    if target and "windows-msvc" in target:
+        environment["RUSTFLAGS"] = f'{environment.get("RUSTFLAGS", "")} -C target-feature=+crt-static'.strip()
+    subprocess.run(build, cwd=ROOT, check=True, env=environment)
     binary = ROOT / "target" / (Path(arguments.target) / "release" if target else Path("release")) / f"lspc{suffix}"
     rust_version = command(["rustc", "-Vv"]).splitlines()[0]
     if target:

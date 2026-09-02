@@ -13,6 +13,8 @@ from pathlib import Path
 WINDOWS_DLLS = {
     "advapi32.dll",
     "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "combase.dll",
     "kernel32.dll",
     "ntdll.dll",
     "ole32.dll",

@@ -60,11 +60,13 @@ class ReleaseArchiveTests(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             audit.macos_floor("cmd LC_BUILD_VERSION\n  minos 13.0\n")
-        dependents = "    KERNEL32.dll\n    bcrypt.dll\n"
+        dependents = "    KERNEL32.dll\n    bcryptprimitives.dll\n    combase.dll\n"
         headers = "  10.00 operating system version\n  6.00 subsystem version\n"
         self.assertEqual(audit.windows_floor(dependents, headers)["encodedOsVersion"], "10.00")
         with self.assertRaises(SystemExit):
             audit.windows_floor("    future.dll\n", headers)
+        with self.assertRaises(SystemExit):
+            audit.windows_floor("    VCRUNTIME140.dll\n", headers)
 
     def test_release_smoke_environments_create_isolated_user_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
