@@ -10,6 +10,9 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  LSPC_BUILD_COMMIT: ${{ github.sha }}
+
 jobs:
   extended-acceptance:
     uses: ./.github/workflows/nightly.yml
@@ -111,6 +114,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13.7"
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: contains(matrix.target, 'windows')
       - name: Install stable Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal

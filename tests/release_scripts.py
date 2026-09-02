@@ -47,8 +47,16 @@ class ReleaseArchiveTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             audit.linux_floor("Version: GLIBC_2.34")
         self.assertEqual(
-            audit.macos_floor("cmd LC_BUILD_VERSION\n  minos 12.0\n")["minimumOs"],
+            audit.macos_floor(
+                "cmd LC_BUILD_VERSION\n  minos 12.0\n      sdk 15.5\n     tool LD\n  version 1167.5\n"
+            )["minimumOs"],
             "12.0",
+        )
+        self.assertEqual(
+            audit.macos_floor(
+                "      cmd LC_VERSION_MIN_MACOSX\n  cmdsize 16\n  version 10.15\n      sdk 11.0\n"
+            )["minimumOs"],
+            "10.15",
         )
         with self.assertRaises(SystemExit):
             audit.macos_floor("cmd LC_BUILD_VERSION\n  minos 13.0\n")

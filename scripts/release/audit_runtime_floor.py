@@ -40,7 +40,13 @@ def linux_floor(output: str) -> dict[str, object]:
 
 
 def macos_floor(output: str) -> dict[str, object]:
-    versions = re.findall(r"^\s+(?:minos|version)\s+(\d+(?:\.\d+)+)\s*$", output, re.MULTILINE)
+    versions = re.findall(r"^\s+minos\s+(\d+(?:\.\d+)+)\s*$", output, re.MULTILINE)
+    if not versions:
+        versions = re.findall(
+            r"^\s+cmd LC_VERSION_MIN_MACOSX\s*\n\s+cmdsize \d+\s*\n\s+version (\d+(?:\.\d+)+)\s*$",
+            output,
+            re.MULTILINE,
+        )
     if not versions:
         raise SystemExit("Mach-O binary has no auditable minimum macOS load command")
     minimum = max(versions, key=version)

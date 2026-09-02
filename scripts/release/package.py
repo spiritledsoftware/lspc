@@ -35,7 +35,7 @@ def main() -> None:
     build = ["cargo", "build", "--locked", "--release"]
     if target:
         build.extend(("--target", target))
-    subprocess.run(build, cwd=ROOT, check=True)
+    subprocess.run(build, cwd=ROOT, check=True, env={**os.environ, "LSPC_BUILD_COMMIT": arguments.commit})
     binary = ROOT / "target" / (Path(arguments.target) / "release" if target else Path("release")) / f"lspc{suffix}"
     rust_version = command(["rustc", "-Vv"]).splitlines()[0]
     if target:
