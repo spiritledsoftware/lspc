@@ -20,10 +20,12 @@ ARCHIVE = ROOT / "scripts/release/build_archive.py"
 SKILL_ARCHIVE = ROOT / "scripts/release/build_skill_archive.py"
 VERIFY_ARCHIVE = ROOT / "scripts/release/verify_archive.py"
 FLOOR_AUDIT = ROOT / "scripts/release/audit_runtime_floor.py"
+REFERENCE_SMOKE = ROOT / "scripts/release/reference_smoke.py"
+SOAK = ROOT / "scripts/release/soak.py"
 
 
-def load_floor_audit():
-    spec = importlib.util.spec_from_file_location("audit_runtime_floor", FLOOR_AUDIT)
+def load_script(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -32,7 +34,7 @@ def load_floor_audit():
 
 class ReleaseArchiveTests(unittest.TestCase):
     def test_runtime_floor_parsers_reject_newer_requirements(self) -> None:
-        audit = load_floor_audit()
+        audit = load_script(FLOOR_AUDIT)
         self.assertEqual(
             audit.linux_floor("Version: GLIBC_2.17 GLIBC_2.28")["requiredGlibc"],
             "2.28",
@@ -50,6 +52,19 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertEqual(audit.windows_floor(dependents, headers)["encodedOsVersion"], "10.00")
         with self.assertRaises(SystemExit):
             audit.windows_floor("    future.dll\n", headers)
+
+    def test_release_smoke_environments_create_isolated_user_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for script, function in ((REFERENCE_SMOKE, "environment"), (SOAK, "test_environment")):
+                environment = getattr(load_script(script), function)(root / script.stem)
+                for name in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"):
+                    self.assertTrue(Path(environment[name]).is_dir())
+
+            workspace = root / "workspace"
+            workspace.mkdir()
+            _, line, column, _ = load_script(REFERENCE_SMOKE).fixture("rust", workspace)
+            self.assertEqual((line, column), (0, 4))
 
     def test_archives_contain_a_verified_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -561,13 +561,8 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(0x02000000)
-        .open(path)?
-        .sync_all()
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn absolute_utf8_path(path: &Path, scope: &str) -> Result<PathBuf, ContractFailure> {

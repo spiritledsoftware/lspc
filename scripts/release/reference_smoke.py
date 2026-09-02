@@ -21,6 +21,8 @@ def native(path: Path) -> Path:
 def environment(root: Path) -> dict[str, str]:
     values = os.environ.copy()
     home = root / "home"
+    for directory in (home, root / "config", root / "state", root / "roaming", root / "local"):
+        directory.mkdir(parents=True, exist_ok=True)
     values["HOME"] = str(home)
     values["USERPROFILE"] = str(home)
     values["XDG_CONFIG_HOME"] = str(root / "config")
@@ -65,7 +67,7 @@ def fixture(kind: str, workspace: Path) -> tuple[Path, int, int, str]:
         source = workspace / "src/main.rs"
         source.parent.mkdir()
         source.write_text("fn target() -> i32 { 1 }\nfn main() { let _ = target(); }\n", encoding="utf-8")
-        return source, 1, 22, "renamed_target"
+        return source, 0, 4, "renamed_target"
     if kind == "typescript":
         (workspace / "tsconfig.json").write_text(
             '{"compilerOptions":{"strict":true,"noEmit":true},"include":["main.ts"]}\n',

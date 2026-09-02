@@ -5,6 +5,7 @@ mod planner;
 mod state;
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -29,7 +30,9 @@ use application::{
     ApplicationContext, apply_preview, lock_workspace, manifest_mismatches,
     reconcile_recovery_status, recover_accept_current, recover_rollback,
 };
-use planner::{CanonicalOperation, PlannedWorkspaceEdit, WorkspaceEditPlanner};
+use planner::{
+    CanonicalOperation, DocumentVersionPrecondition, PlannedWorkspaceEdit, WorkspaceEditPlanner,
+};
 use state::{MutationStateStore, PreviewRecord, ReceiptRecord, StoredPreview, TransactionState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -118,6 +121,7 @@ fn preview_create(invocation: &ParsedInvocation) -> Result<Value, ContractFailur
         source,
         edit,
         command,
+        &BTreeMap::new(),
     )?;
     if preview.is_null() {
         return Ok(json!({
@@ -144,6 +148,8 @@ pub(crate) fn create_query_preview(
     position_encoding: PositionEncoding,
     proposal: PreviewProposal,
 ) -> Result<Value, ContractFailure> {
+    let document_version_preconditions =
+        synchronized_document_version_preconditions(&proposal.context);
     let source = json!({
         "kind": "lsp_request",
         "command": proposal.command.name(),
@@ -160,7 +166,28 @@ pub(crate) fn create_query_preview(
         source,
         proposal.edit,
         proposal.command_payload,
+        &document_version_preconditions,
     )
+}
+
+fn synchronized_document_version_preconditions(
+    context: &Value,
+) -> BTreeMap<String, DocumentVersionPrecondition> {
+    context
+        .pointer("/synchronization/before")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|document| {
+            Some((
+                document.get("uri")?.as_str()?.to_owned(),
+                DocumentVersionPrecondition {
+                    version: document.get("version")?.as_i64()?,
+                    digest: document.get("digest")?.as_str()?.to_owned(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Plans and immediately applies one Workspace Edit preauthorized by an
@@ -418,6 +445,7 @@ fn persist_preview(
     source: Value,
     edit: Value,
     command: Option<Value>,
+    document_version_preconditions: &BTreeMap<String, DocumentVersionPrecondition>,
 ) -> Result<Value, ContractFailure> {
     let planner = WorkspaceEditPlanner::open(
         &configuration.workspace,
@@ -428,7 +456,7 @@ fn persist_preview(
     )
     .map_err(|problem| unsupported_filesystem(&configuration.workspace_uri, &[problem]))?;
     let planned = planner
-        .plan_workspace_edit(&edit)
+        .plan_workspace_edit_with_document_preconditions(&edit, document_version_preconditions)
         .map_err(|problems| invalid_workspace_edit(&edit, problems))?;
     if planned.plan.operations.is_empty() {
         return Ok(Value::Null);

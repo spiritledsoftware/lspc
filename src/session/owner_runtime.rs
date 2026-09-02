@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, OpenOptions},
     io,
     num::NonZeroUsize,
@@ -128,10 +128,16 @@ struct PendingServerRequest {
     message: Value,
 }
 
+struct ReaderQuiescenceRequest {
+    quiescent: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
 struct LspRuntime {
     process: SupervisedServerProcess,
     reader: Option<JsonRpcFrameReader<tokio::process::ChildStdout>>,
     frames: Option<mpsc::Receiver<Result<Option<JsonRpcFrame>, String>>>,
+    reader_quiescence: Option<mpsc::Sender<ReaderQuiescenceRequest>>,
     reader_task: Option<JoinHandle<()>>,
     writer: JsonRpcFrameWriter<tokio::process::ChildStdin>,
     stderr: mpsc::Receiver<String>,
@@ -143,12 +149,14 @@ struct LspRuntime {
     documents: DocumentStore,
     progress: BTreeMap<String, Value>,
     server_requests: BTreeMap<ServerRequestId, PendingServerRequest>,
+    processing_server_requests: BTreeSet<ServerRequestId>,
     server_request_order: VecDeque<ServerRequestId>,
     settings: Value,
     workspace_uri: String,
     workspace_path: PathBuf,
     server: String,
     session_identity: String,
+    owner_generation: String,
     declaration_digest: Option<String>,
     workspace_folder: Value,
     cancellation_grace: Duration,
@@ -474,7 +482,9 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                 }
             }
             _ = std::future::ready(()), if lsp.has_pending_server_requests() => {
-                let result = lsp.process_next_server_request(&mut active_queries).await;
+                let result = lsp
+                    .process_next_server_request(&mut active_queries, true)
+                    .await;
                 if let Err(error) = result {
                     lsp.log.push("protocol_violation", "error", &error);
                     fail_active_queries(
@@ -590,6 +600,7 @@ impl LspRuntime {
             process,
             reader: Some(JsonRpcFrameReader::with_body_limit(stdout, body_limit)),
             frames: None,
+            reader_quiescence: None,
             reader_task: None,
             writer: JsonRpcFrameWriter::with_body_limit(stdin, body_limit),
             stderr: stderr_rx,
@@ -608,12 +619,14 @@ impl LspRuntime {
             ),
             progress: BTreeMap::new(),
             server_requests: BTreeMap::new(),
+            processing_server_requests: BTreeSet::new(),
             server_request_order: VecDeque::new(),
             settings: settings.settings.clone(),
             workspace_uri: bootstrap.workspace_uri.clone(),
             workspace_path: bootstrap.workspace_path.clone(),
             server: bootstrap.server.clone(),
             session_identity: bootstrap.session_identity.clone(),
+            owner_generation: bootstrap.owner_generation.clone(),
             declaration_digest: settings.declaration_digest.clone(),
             workspace_folder,
             cancellation_grace: Duration::from_millis(settings.cancellation_grace_ms),
@@ -654,16 +667,34 @@ impl LspRuntime {
             .take()
             .expect("the LSP reader pump starts exactly once");
         let (sender, receiver) = mpsc::channel(OWNER_QUEUE_LIMIT);
+        let (quiescence_sender, mut quiescence_receiver) = mpsc::channel(1);
         self.frames = Some(receiver);
+        self.reader_quiescence = Some(quiescence_sender);
         self.reader_task = Some(tokio::spawn(async move {
             loop {
-                let frame = reader
-                    .read_json_rpc_frame_with_bytes()
-                    .await
-                    .map_err(|error| error.to_string());
-                let terminal = !matches!(frame, Ok(Some(_)));
-                if sender.send(frame).await.is_err() || terminal {
-                    break;
+                let read = reader.read_json_rpc_frame_with_bytes();
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        biased;
+                        frame = &mut read => {
+                            let frame = frame.map_err(|error| error.to_string());
+                            let terminal = !matches!(frame, Ok(Some(_)));
+                            if sender.send(frame).await.is_err() || terminal {
+                                return;
+                            }
+                            break;
+                        }
+                        quiescence = quiescence_receiver.recv() => {
+                            let Some(quiescence) = quiescence else {
+                                return;
+                            };
+                            let _ = quiescence.quiescent.send(());
+                            if quiescence.resume.await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }));
@@ -1023,10 +1054,13 @@ impl LspRuntime {
             );
             return self.write_server_response(&response, active).await;
         };
-        if self.server_requests.contains_key(&key) {
+        if self.server_requests.contains_key(&key) || self.processing_server_requests.contains(&key)
+        {
             return Err("The server reused an active request identifier".to_owned());
         }
-        if self.server_requests.len() >= SERVER_REQUEST_LIMIT {
+        if self.server_requests.len() + self.processing_server_requests.len()
+            >= SERVER_REQUEST_LIMIT
+        {
             let response = json_rpc_error(
                 id,
                 -32803,
@@ -1048,6 +1082,7 @@ impl LspRuntime {
     async fn process_next_server_request(
         &mut self,
         active: &mut BTreeMap<i64, ActiveQuery>,
+        drain_frames: bool,
     ) -> Result<(), String> {
         let Some(key) = self.server_request_order.pop_front() else {
             return Ok(());
@@ -1057,13 +1092,95 @@ impl LspRuntime {
             // never needs an O(n) queue scan.
             return Ok(());
         };
+        self.processing_server_requests.insert(key.clone());
         let response = if pending.message["method"] == "workspace/applyEdit" {
             self.handle_apply_edit_callback(&pending.message, active)
                 .await
         } else {
             self.route_server_request(pending.message).await
         };
-        self.write_server_response(&response, active).await
+        let reader_resume = if drain_frames {
+            Some(self.drain_reader_frames(active).await?)
+        } else {
+            None
+        };
+        if let Some(reader_resume) = reader_resume {
+            reader_resume
+                .send(())
+                .map_err(|_| "The LSP reader pump stopped before resuming".to_owned())?;
+        }
+        self.write_server_response(&response, active).await?;
+        let reader_resume = if drain_frames {
+            Some(self.drain_reader_frames(active).await?)
+        } else {
+            None
+        };
+        self.processing_server_requests.remove(&key);
+        if let Some(reader_resume) = reader_resume {
+            reader_resume
+                .send(())
+                .map_err(|_| "The LSP reader pump stopped before resuming".to_owned())?;
+        }
+        Ok(())
+    }
+
+    async fn drain_reader_frames(
+        &mut self,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<oneshot::Sender<()>, String> {
+        let quiescence_sender = self
+            .reader_quiescence
+            .as_ref()
+            .expect("ready Owners have an LSP reader pump")
+            .clone();
+        let (quiescent, mut quiescence) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        quiescence_sender
+            .send(ReaderQuiescenceRequest {
+                quiescent,
+                resume: resumed,
+            })
+            .await
+            .map_err(|_| "The LSP reader pump stopped before draining frames".to_owned())?;
+
+        let mut drained = 0_usize;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut quiescence => {
+                    result.map_err(|_| "The LSP reader pump stopped before acknowledging drained frames".to_owned())?;
+                    while let Ok(frame) = self.frames.as_mut().expect("ready Owners have an LSP reader pump").try_recv() {
+                        drained = drained.saturating_add(1);
+                        if drained > SERVER_REQUEST_LIMIT {
+                            return Err("The server emitted too many frames while a request was being processed".to_owned());
+                        }
+                        self.handle_drained_reader_frame(frame, active).await?;
+                    }
+                    return Ok(resume);
+                }
+                frame = self.frames.as_mut().expect("ready Owners have an LSP reader pump").recv() => {
+                    let frame = frame.ok_or_else(|| "The LSP reader pump stopped while draining frames".to_owned())?;
+                    drained = drained.saturating_add(1);
+                    if drained > SERVER_REQUEST_LIMIT {
+                        return Err("The server emitted too many frames while a request was being processed".to_owned());
+                    }
+                    self.handle_drained_reader_frame(frame, active).await?;
+                }
+            }
+        }
+    }
+
+    async fn handle_drained_reader_frame(
+        &mut self,
+        frame: Result<Option<JsonRpcFrame>, String>,
+        active: &mut BTreeMap<i64, ActiveQuery>,
+    ) -> Result<(), String> {
+        let frame = frame?.ok_or_else(|| {
+            "The language server exited while its frames were being drained".to_owned()
+        })?;
+        let owner_generation = self.owner_generation.clone();
+        self.handle_concurrent_frame(&owner_generation, frame, active)
+            .await
     }
 
     async fn cancel_server_request(
@@ -1894,7 +2011,11 @@ impl LspRuntime {
                         }
                     }
                     _ = std::future::ready(()), if self.has_pending_server_requests() => {
-                        if self.process_next_server_request(&mut no_active_queries).await.is_err() {
+                        if self
+                            .process_next_server_request(&mut no_active_queries, false)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }

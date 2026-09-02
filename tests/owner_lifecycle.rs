@@ -172,7 +172,9 @@ fn owner_serializes_simultaneous_agent_operations_in_fifo_order() {
     assert_eq!(raw["result"], json!({"fixture": true}));
     assert_eq!(
         raw["context"]["synchronization"]["postResponseChanged"][0]["uri"],
-        url::Url::from_file_path(&synchronized).unwrap().to_string()
+        url::Url::from_file_path(dunce::canonicalize(&synchronized).unwrap())
+            .unwrap()
+            .to_string()
     );
 
     fixture.command(&[
@@ -510,7 +512,7 @@ fn query_failure_preserves_server_error_partial_results_context_and_trace() {
     );
     assert_eq!(
         failure["context"]["workspaceUri"],
-        url::Url::from_directory_path(&fixture.workspace)
+        url::Url::from_directory_path(dunce::canonicalize(&fixture.workspace).unwrap())
             .unwrap()
             .to_string()
     );
@@ -690,7 +692,7 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
 
     let callback_target = fixture.workspace.join("callback.rs");
     fs::write(&callback_target, "old\n").unwrap();
-    let callback_uri = url::Url::from_file_path(&callback_target)
+    let callback_uri = url::Url::from_file_path(dunce::canonicalize(&callback_target).unwrap())
         .unwrap()
         .to_string();
     let callback = fixture.command(&[
@@ -732,7 +734,9 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
 
     let edited = fixture.workspace.join("edited.rs");
     fs::write(&edited, "old\n").unwrap();
-    let edited_uri = url::Url::from_file_path(&edited).unwrap().to_string();
+    let edited_uri = url::Url::from_file_path(dunce::canonicalize(&edited).unwrap())
+        .unwrap()
+        .to_string();
     let executed = fixture.command(&[
         "execute-command",
         "--workspace",

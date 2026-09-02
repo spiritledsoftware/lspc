@@ -33,6 +33,11 @@ pub(crate) struct ManifestEntry {
     pub(crate) metadata_digest: Option<String>,
 }
 
+pub(crate) struct DocumentVersionPrecondition {
+    pub(crate) version: i64,
+    pub(crate) digest: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResourceKind {
@@ -207,6 +212,14 @@ impl<'a> WorkspaceEditPlanner<'a> {
         &self,
         edit: &Value,
     ) -> Result<PlannedWorkspaceEdit, Vec<WorkspaceEditProblem>> {
+        self.plan_workspace_edit_with_document_preconditions(edit, &BTreeMap::new())
+    }
+
+    pub(crate) fn plan_workspace_edit_with_document_preconditions(
+        &self,
+        edit: &Value,
+        document_version_preconditions: &BTreeMap<String, DocumentVersionPrecondition>,
+    ) -> Result<PlannedWorkspaceEdit, Vec<WorkspaceEditProblem>> {
         let Some(object) = edit.as_object() else {
             return Err(vec![problem(
                 "unknown_operation",
@@ -282,6 +295,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                     &mut summary,
                     &mut total_new_text_bytes,
                     &mut problems,
+                    None,
                 );
             }
         } else if has_document_changes {
@@ -329,18 +343,6 @@ impl<'a> WorkspaceEditPlanner<'a> {
                         problems.push(problem);
                         continue;
                     }
-                    if let Some(version) = text_document.get("version")
-                        && !version.is_null()
-                    {
-                        problems.push(problem(
-                            "invalid_document_version",
-                            "A local Workspace Edit cannot prove a non-null originating Document version.",
-                            Some(index),
-                            None,
-                            None,
-                        ));
-                        continue;
-                    }
                     let Some(uri) = text_document.get("uri").and_then(Value::as_str) else {
                         problems.push(problem(
                             "malformed_uri",
@@ -351,6 +353,27 @@ impl<'a> WorkspaceEditPlanner<'a> {
                         ));
                         continue;
                     };
+                    let version = text_document.get("version");
+                    let document_precondition = version
+                        .filter(|version| !version.is_null())
+                        .and_then(Value::as_i64)
+                        .and_then(|version| {
+                            document_version_preconditions
+                                .get(uri)
+                                .filter(|known| known.version == version)
+                        });
+                    if version.is_some_and(|version| !version.is_null())
+                        && document_precondition.is_none()
+                    {
+                        problems.push(problem(
+                            "invalid_document_version",
+                            "A local Workspace Edit cannot prove the originating Document version.",
+                            Some(index),
+                            None,
+                            None,
+                        ));
+                        continue;
+                    }
                     self.plan_text_operation(
                         index,
                         uri,
@@ -361,6 +384,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                         &mut summary,
                         &mut total_new_text_bytes,
                         &mut problems,
+                        document_precondition.map(|known| known.digest.as_str()),
                     );
                     continue;
                 }
@@ -540,6 +564,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         summary: &mut PreviewSummary,
         total_new_text_bytes: &mut u64,
         problems: &mut Vec<WorkspaceEditProblem>,
+        expected_digest: Option<&str>,
     ) {
         let path = match self.path_from_file_uri(uri, index) {
             Ok(path) => path,
@@ -551,6 +576,25 @@ impl<'a> WorkspaceEditPlanner<'a> {
         if let Err(problem) = self.load_exact_resource(workspace, &path, index, true) {
             problems.push(problem);
             return;
+        }
+        if let Some(expected_digest) = expected_digest {
+            let actual_digest = workspace
+                .before
+                .get(&path)
+                .and_then(|entry| entry.content_digest.as_deref());
+            if actual_digest != Some(expected_digest) {
+                problems.push(problem(
+                    "invalid_document_version",
+                    "The synchronized Document content no longer matches the originating version.",
+                    Some(index),
+                    Some(&path),
+                    Some(json!({
+                        "expectedDigest": expected_digest,
+                        "actualDigest": actual_digest
+                    })),
+                ));
+                return;
+            }
         }
         let state = workspace.entries.get_mut(&path).unwrap();
         if state.manifest.resource_kind != ResourceKind::File {
@@ -1729,7 +1773,7 @@ fn problem(
 }
 
 fn hash_file(path: &Path, index: u64) -> Result<String, WorkspaceEditProblem> {
-    let mut file = File::open(path).map_err(|error| {
+    let mut file = open_file_for_inspection(path).map_err(|error| {
         problem(
             "filesystem_capability_unavailable",
             "A regular file cannot be opened.",
@@ -1782,7 +1826,7 @@ fn hash_file(path: &Path, index: u64) -> Result<String, WorkspaceEditProblem> {
 }
 
 fn read_text_file(path: &Path, limit: u64, index: u64) -> Result<Vec<u8>, WorkspaceEditProblem> {
-    let mut file = File::open(path).map_err(|error| {
+    let mut file = open_file_for_inspection(path).map_err(|error| {
         problem(
             "filesystem_capability_unavailable",
             "A text Document cannot be opened.",
@@ -2127,8 +2171,25 @@ fn windows_alternate_streams(path: &Path) -> std::io::Result<Map<String, Value>>
             }),
         );
     }
-    File::open(path)?.set_times(std::fs::FileTimes::new().set_accessed(accessed))?;
+    open_file_for_inspection(path)?.set_times(std::fs::FileTimes::new().set_accessed(accessed))?;
     Ok(result)
+}
+
+#[cfg(windows)]
+fn open_file_for_inspection(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ, Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_file_for_inspection(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 fn resource_rollback_bytes(_path: &Path, manifest: &ManifestEntry) -> u64 {
@@ -2368,11 +2429,60 @@ mod tests {
 
         let versioned = planner
             .plan_workspace_edit(&json!({"documentChanges": [{
-                "textDocument": {"uri": uri, "version": 1},
+                "textDocument": {"uri": uri.clone(), "version": 1},
                 "edits": []
             }]}))
             .unwrap_err();
         assert_eq!(versioned[0].code, "invalid_document_version");
+        assert!(
+            planner
+                .plan_workspace_edit_with_document_preconditions(
+                    &json!({"documentChanges": [{
+                        "textDocument": {"uri": uri.clone(), "version": 1},
+                        "edits": []
+                    }]}),
+                    &BTreeMap::from([(
+                        uri.clone(),
+                        DocumentVersionPrecondition {
+                            version: 1,
+                            digest: digest_raw_bytes(b"abc"),
+                        },
+                    )]),
+                )
+                .is_ok()
+        );
+        let mismatched = planner
+            .plan_workspace_edit_with_document_preconditions(
+                &json!({"documentChanges": [{
+                    "textDocument": {"uri": uri.clone(), "version": 2},
+                    "edits": []
+                }]}),
+                &BTreeMap::from([(
+                    uri.clone(),
+                    DocumentVersionPrecondition {
+                        version: 1,
+                        digest: digest_raw_bytes(b"abc"),
+                    },
+                )]),
+            )
+            .unwrap_err();
+        assert_eq!(mismatched[0].code, "invalid_document_version");
+        let stale = planner
+            .plan_workspace_edit_with_document_preconditions(
+                &json!({"documentChanges": [{
+                    "textDocument": {"uri": uri.clone(), "version": 1},
+                    "edits": []
+                }]}),
+                &BTreeMap::from([(
+                    uri.clone(),
+                    DocumentVersionPrecondition {
+                        version: 1,
+                        digest: digest_raw_bytes(b"different"),
+                    },
+                )]),
+            )
+            .unwrap_err();
+        assert_eq!(stale[0].code, "invalid_document_version");
 
         let unknown = planner
             .plan_workspace_edit(&json!({"changes": {}, "unexpected": true}))

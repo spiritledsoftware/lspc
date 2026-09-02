@@ -1837,7 +1837,22 @@ fn copy_file_times(destination: &Path, metadata: &fs::Metadata) -> std::io::Resu
     let times = std::fs::FileTimes::new()
         .set_accessed(metadata.accessed()?)
         .set_modified(metadata.modified()?);
-    File::open(destination)?.set_times(times)
+    open_file_for_timestamp_update(destination)?.set_times(times)
+}
+
+#[cfg(windows)]
+fn open_file_for_timestamp_update(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_file_for_timestamp_update(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(unix)]
@@ -2244,7 +2259,7 @@ mod tests {
         fs::write(&file, "old\n").unwrap();
         let original_accessed =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        File::open(&file)
+        open_file_for_timestamp_update(&file)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_accessed(original_accessed))
             .unwrap();
@@ -2413,7 +2428,7 @@ mod tests {
         fs::write(&file, "old\n").unwrap();
         let original_accessed =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        File::open(&file)
+        open_file_for_timestamp_update(&file)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_accessed(original_accessed))
             .unwrap();

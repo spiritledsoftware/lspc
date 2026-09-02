@@ -434,8 +434,14 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     "method": "workspace/configuration",
                     "params": {"items": []}
                 });
-                if write_frame(&mut output, &callback, scenario).is_err()
-                    || write_frame(&mut output, &callback, scenario).is_err()
+                let frame = match encode_frame(&callback) {
+                    Ok(frame) => frame,
+                    Err(()) => return ExitCode::from(1),
+                };
+                if output
+                    .write_all(&[frame.as_slice(), frame.as_slice()].concat())
+                    .and_then(|()| output.flush())
+                    .is_err()
                 {
                     return ExitCode::from(1);
                 }
@@ -673,9 +679,7 @@ fn read_frame(input: &mut impl BufRead) -> Result<Option<Value>, String> {
 }
 
 fn write_frame(output: &mut impl Write, message: &Value, scenario: Scenario) -> Result<(), ()> {
-    let body = serde_json::to_vec(message).map_err(|_| ())?;
-    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    frame.extend(body);
+    let frame = encode_frame(message)?;
     for chunk in frame.chunks(if scenario == Scenario::Fragmented {
         3
     } else {
@@ -685,4 +689,11 @@ fn write_frame(output: &mut impl Write, message: &Value, scenario: Scenario) -> 
         output.flush().map_err(|_| ())?;
     }
     Ok(())
+}
+
+fn encode_frame(message: &Value) -> Result<Vec<u8>, ()> {
+    let body = serde_json::to_vec(message).map_err(|_| ())?;
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend(body);
+    Ok(frame)
 }

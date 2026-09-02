@@ -22,6 +22,8 @@ def native(path: Path) -> Path:
 def test_environment(root: Path) -> dict[str, str]:
     env = os.environ.copy()
     home = root / "home"
+    for directory in (home, root / "config", root / "state", root / "roaming", root / "local"):
+        directory.mkdir(parents=True, exist_ok=True)
     env.update({
         "HOME": str(home),
         "USERPROFILE": str(home),
