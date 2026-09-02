@@ -15,7 +15,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::{
     AuthorizedServer, ConfigSource, EffectiveServer, LoadedConfiguration, canonical_workspace,
     effective_child_environment, load_configuration, resolve_server_cwd, resolve_server_executable,
-    session_identity,
+    resolved_user_state_directory, session_identity,
 };
 use crate::{
     canonical_value::digest_canonical_value, cli::ParsedInvocation, contract::ContractFailure,
@@ -703,12 +703,8 @@ struct TrustStatePaths {
 }
 
 fn trust_state_paths() -> Result<TrustStatePaths, ContractFailure> {
-    let project = directories::ProjectDirs::from("", "", "lspc")
+    let directory = resolved_user_state_directory()
         .ok_or_else(|| state_failure("The user state directory is unavailable."))?;
-    let directory = project
-        .state_dir()
-        .unwrap_or_else(|| project.data_local_dir())
-        .to_path_buf();
     Ok(TrustStatePaths {
         file: directory.join("trust-v1.json"),
         lock: directory.join("trust-v1.lock"),
@@ -835,11 +831,9 @@ fn stored_state_failure(path: &Path, message: &str) -> ContractFailure {
 }
 
 fn trust_state_paths_unchecked() -> String {
-    directories::ProjectDirs::from("", "", "lspc")
-        .map(|project| {
-            project
-                .state_dir()
-                .unwrap_or_else(|| project.data_local_dir())
+    resolved_user_state_directory()
+        .map(|directory| {
+            directory
                 .join("trust-v1.json")
                 .to_string_lossy()
                 .into_owned()

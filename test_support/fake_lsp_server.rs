@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -124,7 +124,21 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
             Some("exit") => return ExitCode::SUCCESS,
             Some("initialize") => {
                 if scenario == Scenario::DelayedInitialization {
-                    thread::sleep(Duration::from_millis(500));
+                    if let Some(gate) = env::args().find_map(|argument| {
+                        argument
+                            .strip_prefix("--initialization-gate=")
+                            .map(PathBuf::from)
+                    }) {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !gate.is_file() {
+                            if Instant::now() >= deadline {
+                                return ExitCode::from(1);
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    } else {
+                        thread::sleep(Duration::from_millis(500));
+                    }
                 }
                 for response in [
                     json!({"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"fixture initialized"}}),

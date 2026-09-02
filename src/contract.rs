@@ -363,6 +363,14 @@ fn user_config_path() -> Option<String> {
         }
         return Some(path.join("lspc/config.toml").to_string_lossy().into_owned());
     }
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        let path = std::path::PathBuf::from(app_data);
+        if !path.is_absolute() {
+            return None;
+        }
+        return Some(path.join("lspc/config.toml").to_string_lossy().into_owned());
+    }
     directories::ProjectDirs::from("", "", "lspc").map(|directories| {
         directories
             .config_dir()

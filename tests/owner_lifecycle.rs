@@ -50,14 +50,15 @@ impl Fixture {
 
         #[cfg(windows)]
         let (config, environment) = {
-            let roaming = root.path().join("AppData/Roaming");
-            let local = root.path().join("AppData/Local");
+            let home = root.path().join("home");
+            let roaming = home.join("AppData/Roaming");
+            let local = home.join("AppData/Local");
             (
                 roaming.join("lspc/config.toml"),
                 vec![
                     ("APPDATA".to_owned(), roaming),
                     ("LOCALAPPDATA".to_owned(), local),
-                    ("USERPROFILE".to_owned(), root.path().join("home")),
+                    ("USERPROFILE".to_owned(), home),
                 ],
             )
         };
@@ -259,7 +260,11 @@ fn queued_operation_deadline_removes_work_before_dispatch() {
 
 #[test]
 fn owner_accepts_status_and_queues_work_during_initialization() {
-    let fixture = Fixture::with_server_arguments(&["--scenario=delayed-initialization"]);
+    let initialization = TempDir::new().unwrap();
+    let gate = initialization.path().join("release");
+    let gate_argument = format!("--initialization-gate={}", gate.display());
+    let fixture =
+        Fixture::with_server_arguments(&["--scenario=delayed-initialization", &gate_argument]);
     let workspace = fixture.workspace.to_str().unwrap();
 
     std::thread::scope(|scope| {
@@ -274,7 +279,8 @@ fn owner_accepts_status_and_queues_work_during_initialization() {
                 "fixture/queued-during-initialization",
             ])
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed_initializing = false;
         loop {
             let status = fixture.output(&[
                 "session",
@@ -287,17 +293,22 @@ fn owner_accepts_status_and_queues_work_during_initialization() {
             if status.status.success() {
                 let status: Value = serde_json::from_slice(&status.stdout).unwrap();
                 if status["result"]["state"] == "initializing" {
+                    observed_initializing = true;
                     break;
                 }
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Owner never exposed its initializing state"
-            );
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
+        fs::write(&gate, "release").unwrap();
         assert_eq!(query.join().unwrap()["result"], json!({"fixture": true}));
+        assert!(
+            observed_initializing,
+            "Owner never exposed its initializing state"
+        );
     });
 
     fixture.command(&[

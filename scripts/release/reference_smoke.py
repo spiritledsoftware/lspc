@@ -21,14 +21,16 @@ def native(path: Path) -> Path:
 def environment(root: Path) -> dict[str, str]:
     values = os.environ.copy()
     home = root / "home"
-    for directory in (home, root / "config", root / "state", root / "roaming", root / "local"):
+    roaming = home / "AppData/Roaming"
+    local = home / "AppData/Local"
+    for directory in (home, root / "config", root / "state", roaming, local):
         directory.mkdir(parents=True, exist_ok=True)
     values["HOME"] = str(home)
     values["USERPROFILE"] = str(home)
     values["XDG_CONFIG_HOME"] = str(root / "config")
     values["XDG_STATE_HOME"] = str(root / "state")
-    values["APPDATA"] = str(root / "roaming")
-    values["LOCALAPPDATA"] = str(root / "local")
+    values["APPDATA"] = str(roaming)
+    values["LOCALAPPDATA"] = str(local)
     return values
 
 

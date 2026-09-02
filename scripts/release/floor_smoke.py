@@ -42,14 +42,18 @@ def extract(archive: Path, destination: Path) -> None:
 def test_environment(root: Path) -> dict[str, str]:
     env = os.environ.copy()
     home = root / "home"
+    roaming = home / "AppData/Roaming"
+    local = home / "AppData/Local"
+    for directory in (home, root / "config", root / "state", roaming, local):
+        directory.mkdir(parents=True, exist_ok=True)
     env.update(
         {
             "HOME": str(home),
             "USERPROFILE": str(home),
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_STATE_HOME": str(root / "state"),
-            "APPDATA": str(root / "roaming"),
-            "LOCALAPPDATA": str(root / "local"),
+            "APPDATA": str(roaming),
+            "LOCALAPPDATA": str(local),
         }
     )
     return env

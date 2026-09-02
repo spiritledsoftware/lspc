@@ -14,7 +14,7 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     canonical_value::digest_canonical_value,
-    configuration::{PreviewSettings, ReceiptSettings},
+    configuration::{PreviewSettings, ReceiptSettings, resolved_user_state_directory},
     contract::ContractFailure,
     state_permissions,
 };
@@ -155,7 +155,7 @@ pub(crate) struct MutationStateStore {
 impl MutationStateStore {
     /// Opens the versioned user-private Preview, Receipt, and Recovery store.
     pub(crate) fn open() -> Result<Self, ContractFailure> {
-        let project = directories::ProjectDirs::from("", "", "lspc").ok_or_else(|| {
+        let root = resolved_user_state_directory().ok_or_else(|| {
             state_failure(
                 "mutation",
                 Path::new(""),
@@ -163,11 +163,7 @@ impl MutationStateStore {
                 None,
             )
         })?;
-        let root = project
-            .state_dir()
-            .unwrap_or_else(|| project.data_local_dir())
-            .join("mutation-v1");
-        Self::open_at(root)
+        Self::open_at(root.join("mutation-v1"))
     }
 
     pub(crate) fn open_at(root: PathBuf) -> Result<Self, ContractFailure> {

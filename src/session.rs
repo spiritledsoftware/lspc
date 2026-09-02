@@ -28,7 +28,8 @@ use crate::{
     cli::ParsedInvocation,
     configuration::{
         AuthorizedServer, LoadedConfiguration, authorize_server, load_configuration,
-        select_configured_server, select_named_server, select_server,
+        resolved_user_state_directory, select_configured_server, select_named_server,
+        select_server,
     },
     contract::ContractFailure,
     query::{
@@ -1034,13 +1035,7 @@ struct OwnerStatePaths {
 
 impl OwnerStatePaths {
     fn new() -> Result<Self, ContractFailure> {
-        let root = directories::ProjectDirs::from("", "", "lspc")
-            .map(|directories| {
-                directories
-                    .state_dir()
-                    .unwrap_or_else(|| directories.data_local_dir())
-                    .to_path_buf()
-            })
+        let root = resolved_user_state_directory()
             .ok_or_else(|| {
                 owner_unavailable(
                     "sid_0000000000000000000000000000000000000000000000000000000000000000",

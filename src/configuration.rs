@@ -617,11 +617,33 @@ pub(crate) fn resolved_user_config_path() -> Result<PathBuf, ContractFailure> {
         }
         return Ok(path.join("lspc/config.toml"));
     }
+    #[cfg(windows)]
+    if let Some(app_data) = env::var_os("APPDATA") {
+        let path = PathBuf::from(app_data);
+        if !path.is_absolute() {
+            return Err(user_path_failure("APPDATA is not absolute."));
+        }
+        return Ok(path.join("lspc/config.toml"));
+    }
     directories::ProjectDirs::from("", "", "lspc")
         .map(|directories| directories.config_dir().join("config.toml"))
         .ok_or_else(|| {
             user_path_failure("The operating system user configuration directory is unavailable.")
         })
+}
+
+pub(crate) fn resolved_user_state_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let path = PathBuf::from(local_app_data);
+        return path.is_absolute().then(|| path.join("lspc"));
+    }
+    directories::ProjectDirs::from("", "", "lspc").map(|directories| {
+        directories
+            .state_dir()
+            .unwrap_or_else(|| directories.data_local_dir())
+            .to_path_buf()
+    })
 }
 
 fn merge_servers(
