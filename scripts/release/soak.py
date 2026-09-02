@@ -37,6 +37,15 @@ def test_environment(root: Path) -> dict[str, str]:
     return env
 
 
+def soak_user_config_path(env: dict[str, str]) -> Path:
+    system = platform.system()
+    if system == "Windows":
+        return Path(env["APPDATA"]) / "lspc/config.toml"
+    if system == "Darwin":
+        return Path(env["HOME"]) / "Library/Application Support/lspc/config.toml"
+    return Path(env["XDG_CONFIG_HOME"]) / "lspc/config.toml"
+
+
 def endpoint(root: Path) -> dict[str, object]:
     matches = list(root.glob("**/owners/endpoints/*.json"))
     if len(matches) != 1:
@@ -138,7 +147,8 @@ def main() -> None:
         root = Path(temporary)
         workspace = root / "workspace"
         workspace.mkdir()
-        config = root / "config/lspc/config.toml"
+        env = test_environment(root)
+        config = soak_user_config_path(env)
         config.parent.mkdir(parents=True)
         config.write_text(
             "version = 1\ndefault_server = \"fake\"\n"
@@ -154,7 +164,6 @@ def main() -> None:
             + 'published_diagnostics_wait = "1ms"\n',
             encoding="utf-8",
         )
-        env = test_environment(root)
         common = ("--workspace", str(workspace), "--server", "fake", "--method", "fixture/soak")
         cold, cold_ms = command(binary, env, "raw", *common)
         generation = cold["context"]["ownerGeneration"]

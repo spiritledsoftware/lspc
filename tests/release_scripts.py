@@ -13,6 +13,7 @@ import unittest
 import zipfile
 import importlib.util
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +65,20 @@ class ReleaseArchiveTests(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             _, line, column, _ = load_script(REFERENCE_SMOKE).fixture("rust", workspace)
-            self.assertEqual((line, column), (0, 4))
+            self.assertEqual((line, column), (1, 22))
+
+    def test_soak_uses_the_native_user_config_path(self) -> None:
+        soak = load_script(SOAK)
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = soak.test_environment(Path(temporary))
+            expected = {
+                "Linux": Path(environment["XDG_CONFIG_HOME"]) / "lspc/config.toml",
+                "Darwin": Path(environment["HOME"]) / "Library/Application Support/lspc/config.toml",
+                "Windows": Path(environment["APPDATA"]) / "lspc/config.toml",
+            }
+            for system, path in expected.items():
+                with mock.patch.object(soak.platform, "system", return_value=system):
+                    self.assertEqual(soak.soak_user_config_path(environment), path)
 
     def test_archives_contain_a_verified_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

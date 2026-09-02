@@ -69,7 +69,7 @@ def fixture(kind: str, workspace: Path) -> tuple[Path, int, int, str]:
         source = workspace / "src/main.rs"
         source.parent.mkdir()
         source.write_text("fn target() -> i32 { 1 }\nfn main() { let _ = target(); }\n", encoding="utf-8")
-        return source, 0, 4, "renamed_target"
+        return source, 1, 22, "renamed_target"
     if kind == "typescript":
         (workspace / "tsconfig.json").write_text(
             '{"compilerOptions":{"strict":true,"noEmit":true},"include":["main.ts"]}\n',
@@ -156,14 +156,19 @@ def main() -> None:
         second = smoke.run("capabilities", "--workspace", workspace_text, "--server", arguments.server)
         if first["context"]["ownerGeneration"] != second["context"]["ownerGeneration"]:
             raise SystemExit("reference server Owner was not reused")
-        definition = smoke.run(
-            "definition", "--workspace", workspace_text, "--server", arguments.server,
-            "--file", str(source), "--line", str(line), "--column", str(column),
-            "--request-timeout", "2m",
-        )
-        if definition.get("result") is None:
-            raise SystemExit("reference definition returned null")
-        time.sleep(2)
+        definition_deadline = time.monotonic() + 30
+        while True:
+            definition = smoke.run(
+                "definition", "--workspace", workspace_text, "--server", arguments.server,
+                "--file", str(source), "--line", str(line), "--column", str(column),
+                "--request-timeout", "2m",
+            )
+            if definition.get("result"):
+                break
+            smoke.outputs.pop()
+            if time.monotonic() >= definition_deadline:
+                raise SystemExit("reference definition did not resolve within 30 seconds")
+            time.sleep(1)
         smoke.run(
             "published-diagnostics", "--workspace", workspace_text, "--server", arguments.server,
             "--file", str(source),
