@@ -460,8 +460,15 @@ pub(crate) async fn run_owner(bootstrap: OwnerBootstrap) -> io::Result<()> {
                         }
                     }
                     Some(Ok(None)) | None => {
+                        let status = tokio_time::timeout(
+                            Duration::from_secs(1),
+                            lsp.process.wait(),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
                         let failure = server_exited_failure(
-                            lsp.process.try_wait().ok().flatten(),
+                            status,
                             &lsp.server_stderr_tail(),
                         );
                         fail_active_queries(&bootstrap.owner_generation, &mut active_queries, failure.clone()).await;

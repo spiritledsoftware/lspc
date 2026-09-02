@@ -982,6 +982,13 @@ fn spawn_detached_owner(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach_command(&mut command);
+    #[cfg(windows)]
+    disable_standard_stream_inheritance().map_err(|error| {
+        owner_unavailable(
+            &authorized.session_identity,
+            &format!("standard_stream_detachment_failed: {error}"),
+        )
+    })?;
     command
         .spawn()
         .map(|_| ())
@@ -1022,6 +1029,29 @@ fn detach_command(command: &mut Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+}
+
+#[cfg(windows)]
+fn disable_standard_stream_inheritance() -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        let handle = handle.cast::<std::ffi::c_void>() as HANDLE;
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
