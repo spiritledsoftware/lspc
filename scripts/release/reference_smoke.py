@@ -20,6 +20,9 @@ def native(path: Path) -> Path:
 
 def environment(root: Path) -> dict[str, str]:
     values = os.environ.copy()
+    toolchain_home = Path(values.get("USERPROFILE") or values.get("HOME") or Path.home())
+    values.setdefault("CARGO_HOME", str(toolchain_home / ".cargo"))
+    values.setdefault("RUSTUP_HOME", str(toolchain_home / ".rustup"))
     home = root / "home"
     roaming = home / "AppData/Roaming"
     local = home / "AppData/Local"

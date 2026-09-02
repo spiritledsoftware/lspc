@@ -67,6 +67,20 @@ class ReleaseArchiveTests(unittest.TestCase):
             _, line, column, _ = load_script(REFERENCE_SMOKE).fixture("rust", workspace)
             self.assertEqual((line, column), (1, 22))
 
+    def test_reference_smoke_preserves_rust_toolchain_home(self) -> None:
+        reference = load_script(REFERENCE_SMOKE)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            toolchain_home = root / "toolchain-home"
+            with mock.patch.dict(
+                reference.os.environ,
+                {"HOME": str(toolchain_home), "USERPROFILE": str(toolchain_home)},
+                clear=True,
+            ):
+                environment = reference.environment(root / "isolated")
+            self.assertEqual(Path(environment["CARGO_HOME"]), toolchain_home / ".cargo")
+            self.assertEqual(Path(environment["RUSTUP_HOME"]), toolchain_home / ".rustup")
+
     def test_soak_uses_the_native_user_config_path(self) -> None:
         soak = load_script(SOAK)
         with tempfile.TemporaryDirectory() as temporary:

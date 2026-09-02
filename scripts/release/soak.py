@@ -83,7 +83,7 @@ def unix_descendants(pid: int) -> list[int]:
 def windows_descendants(pid: int) -> list[int]:
     script = (
         "$all=Get-CimInstance Win32_Process; $pending=@(" + str(pid) + "); $out=@(); "
-        "while($pending.Count -gt 0){$p=$pending[0];$pending=$pending[1..($pending.Count-1)];"
+        "while($pending.Count -gt 0){$p=$pending[0];$pending=@($pending|Select-Object -Skip 1);"
         "$c=@($all|Where-Object ParentProcessId -eq $p|ForEach-Object ProcessId);"
         "$out+=$c;$pending+=$c};$out -join ' '"
     )
