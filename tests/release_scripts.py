@@ -21,6 +21,7 @@ ARCHIVE = ROOT / "scripts/release/build_archive.py"
 SKILL_ARCHIVE = ROOT / "scripts/release/build_skill_archive.py"
 VERIFY_ARCHIVE = ROOT / "scripts/release/verify_archive.py"
 FLOOR_AUDIT = ROOT / "scripts/release/audit_runtime_floor.py"
+PUBLISH_RELEASE = ROOT / "scripts/release/publish_release.py"
 REFERENCE_SMOKE = ROOT / "scripts/release/reference_smoke.py"
 SOAK = ROOT / "scripts/release/soak.py"
 
@@ -38,6 +39,12 @@ def load_script(path: Path):
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def test_publish_commands_do_not_require_captured_stdout(self) -> None:
+        publish = load_script(PUBLISH_RELEASE)
+        completed = subprocess.CompletedProcess(["gh"], 0)
+        with mock.patch.object(publish.subprocess, "run", return_value=completed):
+            self.assertIsNone(publish.run(["gh"]))
+
     def test_runtime_floor_parsers_reject_newer_requirements(self) -> None:
         audit = load_script(FLOOR_AUDIT)
         self.assertEqual(

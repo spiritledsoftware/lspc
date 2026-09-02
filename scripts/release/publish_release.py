@@ -25,14 +25,12 @@ TARGETS = [
 ]
 
 
-def run(arguments: list[str], *, capture: bool = False) -> str:
-    return subprocess.run(
+def run(arguments: list[str]) -> None:
+    subprocess.run(
         arguments,
         cwd=ROOT,
         check=True,
-        text=True,
-        capture_output=capture,
-    ).stdout.strip()
+    )
 
 
 def sha256(path: Path) -> str:
@@ -156,6 +154,8 @@ def main() -> None:
     notes = ROOT / "docs/releases" / f"v{version}.md"
     if not notes.is_file():
         raise SystemExit(f"release notes are missing: {notes}")
+    if not os.environ.get("CARGO_REGISTRY_TOKEN"):
+        raise SystemExit("CARGO_REGISTRY_TOKEN is required")
     assets = expected_assets(arguments.assets.resolve(), version)
     state = ensure_release(arguments.tag, notes)
     upload_missing_assets(arguments.tag, assets, state)
