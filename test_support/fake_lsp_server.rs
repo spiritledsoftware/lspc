@@ -501,11 +501,12 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                     Ok(frame) => frame,
                     Err(()) => return ExitCode::from(1),
                 };
-                if output
-                    .write_all(&[frame.as_slice(), frame.as_slice()].concat())
-                    .and_then(|()| output.flush())
-                    .is_err()
-                {
+                for _ in 0..=64 {
+                    if output.write_all(&frame).is_err() {
+                        return ExitCode::from(1);
+                    }
+                }
+                if output.flush().is_err() {
                     return ExitCode::from(1);
                 }
                 thread::sleep(Duration::from_secs(30));
