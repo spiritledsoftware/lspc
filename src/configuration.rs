@@ -509,13 +509,13 @@ pub(crate) fn resolve_server_cwd(server: &EffectiveServer) -> Result<PathBuf, Co
 /// Builds the stable environment inherited by the language-server process.
 pub(crate) fn effective_child_environment(
     server: &EffectiveServer,
-    cwd: &Path,
+    _cwd: &Path,
 ) -> Vec<(OsString, OsString)> {
     let mut environment = env::vars_os()
         .filter(|(key, _)| !is_transient_inherited_environment_key(key))
         .collect::<BTreeMap<_, _>>();
     #[cfg(unix)]
-    environment.insert(OsString::from("PWD"), cwd.as_os_str().to_os_string());
+    environment.insert(OsString::from("PWD"), _cwd.as_os_str().to_os_string());
     for (key, value) in &server.environment {
         #[cfg(windows)]
         if let Some(existing) = environment
