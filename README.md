@@ -42,6 +42,15 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/spiritle
 The script installs the latest release to `~/.local/bin` after verifying its
 SHA-256 checksum. Set `LSPCTL_INSTALL_DIR` to choose another directory.
 
+### Install script (Windows PowerShell)
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm https://raw.githubusercontent.com/spiritledsoftware/lspctl/main/install.ps1 | iex
+```
+
+The script installs the x86-64 release to `%LOCALAPPDATA%\Programs\lspctl` after
+verifying its SHA-256 checksum.
+
 ### Cargo
 
 Install from [crates.io](https://crates.io/crates/lspctl) with Rust 1.89 or newer:

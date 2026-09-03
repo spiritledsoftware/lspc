@@ -27,6 +27,7 @@ PUBLISH_RELEASE = ROOT / "scripts/release/publish_release.py"
 REFERENCE_SMOKE = ROOT / "scripts/release/reference_smoke.py"
 SOAK = ROOT / "scripts/release/soak.py"
 INSTALLER = ROOT / "install.sh"
+WINDOWS_INSTALLER = ROOT / "install.ps1"
 
 
 def load_script(path: Path):
@@ -42,6 +43,18 @@ def load_script(path: Path):
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell validation runs on Windows")
+    def test_windows_installer_parses(self) -> None:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"[scriptblock]::Create((Get-Content -Raw '{WINDOWS_INSTALLER}')) | Out-Null",
+            ],
+            check=True,
+        )
+
     @unittest.skipIf(sys.platform == "win32", "the shell installer supports Linux and macOS")
     def test_shell_installer_verifies_and_installs_release_archive(self) -> None:
         system = {"Darwin": "apple-darwin", "Linux": "unknown-linux-gnu"}[platform.system()]
