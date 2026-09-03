@@ -174,6 +174,19 @@ fn owner_reuses_session_across_transient_agent_environment_changes() {
         first["context"]["ownerGeneration"],
         changed_server_environment["context"]["ownerGeneration"]
     );
+
+    fixture.command(&[
+        "session",
+        "stop",
+        first["context"]["ownerGeneration"].as_str().unwrap(),
+    ]);
+    fixture.command(&[
+        "session",
+        "stop",
+        changed_server_environment["context"]["ownerGeneration"]
+            .as_str()
+            .unwrap(),
+    ]);
 }
 
 #[test]
