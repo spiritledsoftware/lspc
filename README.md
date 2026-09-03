@@ -19,7 +19,9 @@ keeps language servers warm between calls.
 
 ## See lspctl in action
 
-[![Side-by-side terminal demo: baseline Pi searches Tokio source while Pi with lspctl inspects and applies a five-reference semantic rename Preview](assets/demo/lspctl-agent-rename.webp)](assets/demo/lspctl-agent-rename.mp4)
+![Animated side-by-side terminal demo: baseline Pi searches Tokio source while Pi with lspctl inspects and applies a five-reference semantic rename Preview](assets/demo/lspctl-agent-rename.webp)
+
+[Download the silent MP4](assets/demo/lspctl-agent-rename.mp4?raw=1).
 
 Both Agents received the same prompt, model, Tokio commit, and prepared dependency state; the treatment added the released `lspctl` CLI and bundled skill, with rust-analyzer indexed before recording. [Read the methodology and sanitized transcripts](docs/demo.md).
 

@@ -1,6 +1,6 @@
 # README Agent rename demo
 
-This is the evidence record for the [README video](../assets/demo/lspctl-agent-rename.mp4). It compares baseline Pi with Pi using the released `lspctl` CLI and bundled skill on one semantic rename. It is a demonstration, not a benchmark or a general productivity claim.
+This is the evidence record for the README's animated preview and [downloadable MP4](../assets/demo/lspctl-agent-rename.mp4?raw=1). It compares baseline Pi with Pi using the released `lspctl` CLI and bundled skill on one semantic rename. It is a demonstration, not a benchmark or a general productivity claim.
 
 ## Comparison contract
 
