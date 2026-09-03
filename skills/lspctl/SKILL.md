@@ -5,34 +5,80 @@ description: Use the lspctl CLI for language-server Queries and Mutations. Invok
 
 # lspctl
 
-Use `lspctl` as a schema-driven LSP client. The schema defines syntax. This skill defines the workflow.
+Use `lspctl` for semantic code navigation and language-server-proposed changes.
 
-## Establish the contract
+## Run routine Queries directly
 
-Before the first LSP workflow in a session, run:
+Keep one canonical Workspace root and named server across related calls. Named
+source positions are zero-based Unicode-scalar coordinates. Point at the first
+character of the identifier, rather than indentation or punctuation.
 
 ```sh
-lspctl schema
+lspctl definition --workspace . --server rust \
+  --file src/lib.rs --line 12 --column 8
+lspctl references --workspace . --server rust \
+  --file src/lib.rs --line 12 --column 8 --include-declaration true
 ```
 
-Keep this compact catalog for the session. Require a successful envelope with `schemaVersion: 1` and `result.contractVersion: 1`.
+Use a named Query instead of textual search when the task asks about symbol
+identity. Read [QUERYING.md](QUERYING.md) for paging, diagnostics, raw methods,
+or protocol tracing.
 
-Before invoking a leaf command, find its path in that catalog and validate its flags, required values, exclusions, success schema, error schema, and exit codes. A focused `lspctl schema <command path>` lookup is enough after the catalog has established the contract.
+If syntax is uncertain, run `lspctl help <command path>`. Use `lspctl schema`
+only when implementing an integration that must validate the exact JSON
+contract.
 
-The installed binary's schema wins if it disagrees with this skill. Report the mismatch and stop instead of inventing an alias, flag, default, or fallback. `lspctl schema` is offline, so schema discovery never needs configuration, Trust, or a running language server.
+## Rename through one guarded workflow
 
-## Choose the workflow
+An explicit rename starts with `rename`; the resulting Preview is the semantic
+reference set. `prepare-rename`, `definition`, and `references` are separate
+Queries for tasks that explicitly need those results or for diagnosing a
+failed rename.
 
-- For a named Query, diagnostics, paging, an unwrapped LSP method, or protocol tracing, read [QUERYING.md](QUERYING.md).
-- For rename, formatting, code actions, `workspace/applyEdit`, Preview inspection, Application, Receipts, or Recovery, read [MUTATIONS.md](MUTATIONS.md).
-- When the human asks to add, configure, route, or verify a language server, read [CONFIGURATION.md](CONFIGURATION.md).
-- For routine server selection, Trust, capabilities, and structured errors, continue here.
+Run the proposal, inspection, and Application in order:
 
-## Select the Workspace and server
+```sh
+rename_json=$(lspctl rename --workspace . --server rust \
+  --file src/lib.rs --line 12 --column 8 --new-name replacement) || exit
+preview_id=$(printf '%s\n' "$rename_json" | jq -er \
+  'select(.ok and .outcome == "previewed") | .result.previewId') || exit
 
-Use one canonical Workspace root and one named server for a related sequence of commands. Repeat the same `--workspace` and `--server` selection when the current directory and language routing do not identify them unambiguously.
+printf '%s\n' "$rename_json" |
+  jq '{outcome, previewId: .result.previewId, summary: .result.summary}'
 
-For configuration work, follow [CONFIGURATION.md](CONFIGURATION.md). Pass explicit server launch fields only when the task already establishes them. Invocation-scoped launch fields create no persistent Trust grant.
+lspctl preview show "$preview_id" |
+  jq '{ok, result: {
+    previewId: .result.previewId,
+    summary: .result.summary,
+    conflicts: .result.conflicts,
+    staleReasons: .result.staleReasons,
+    operations: [.result.plan.operations[] |
+      {kind, path, oldPath, newPath, edits}],
+    diff: .result.diff
+  }}'
+
+lspctl apply "$preview_id" --workspace . --server rust |
+  jq '{outcome, result: {
+    receiptId: .result.receiptId,
+    filesystemState: .result.filesystemState,
+    sessionSynchronized: .result.sessionSynchronized
+  }}'
+```
+
+Inspect the Preview before Application. Apply without another question when it
+matches the requested rename and has no conflicts or stale reasons. Pause on
+unexpected resources, unexplained resource operations, conflicts, or
+insufficient evidence. A Preview-only request stops after inspection.
+
+Read [MUTATIONS.md](MUTATIONS.md) for formatting, code actions,
+`workspace/applyEdit`, stale Previews, Receipts, or Recovery.
+
+## Select and authorize the server
+
+Follow [CONFIGURATION.md](CONFIGURATION.md) when the human asks to add,
+configure, route, or verify a language server. Pass explicit server launch
+fields only when the task already establishes them. Invocation-scoped launch
+fields create no persistent Trust grant.
 
 Project launch fields require a declaration-bound Trust grant. User configuration and explicit invocation fields do not. Use `lspctl trust status` to inspect the current state before changing it. A grant authorizes the current declaration digest, `trust revoke` removes either a grant or a Denial, and a Denial keeps the declaration blocked until explicitly replaced.
 
@@ -44,7 +90,9 @@ When an error has `code: "project_trust_required"`:
 
 Do not broaden a server grant to `trust grant --all`. A durable Denial may be replaced only when the human explicitly authorizes the schema-declared replacement flag.
 
-Run `lspctl capabilities` when server support matters. Use normalized provider states of `supported`, `unsupported`, and `invalid`. The raw initialization result is diagnostic data, not a substitute for those gates.
+Run `lspctl capabilities --workspace WORKSPACE --server SERVER` when server
+support matters. Use normalized provider states of `supported`, `unsupported`,
+and `invalid`.
 
 ## Process every envelope
 
@@ -67,6 +115,12 @@ Exit codes are coarse routing hints. The envelope is authoritative.
 
 ## Completion
 
-A Query is complete when the requested semantic result is returned with its qualifying metadata, or when the structured blocked or unsafe state has been reported. A Mutation is complete only at the stopping point defined in [MUTATIONS.md](MUTATIONS.md).
+A Query is complete when the requested semantic result is returned with its
+qualifying metadata, or when the structured blocked or unsafe state has been
+reported. A requested rename is complete after a matching Preview is applied
+and its Receipt ID and filesystem state are retained.
 
-Before publishing this skill with an `lspctl` release, run its examples against that binary's `lspctl schema --full` output. Release validation must fail if a literal command path, flag, contract version, error field, or enum used here is absent.
+Before publishing this skill with an `lspctl` release, run its examples against
+that binary's `lspctl schema --full` output. Release validation must fail if a
+literal command path, flag, contract version, error field, or enum used here is
+absent.

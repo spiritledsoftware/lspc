@@ -84,7 +84,11 @@ impl Fixture {
     }
 
     fn command(&self, arguments: &[&str]) -> Value {
-        let output = self.output(arguments);
+        self.command_with_environment(arguments, &[])
+    }
+
+    fn command_with_environment(&self, arguments: &[&str], environment: &[(&str, &str)]) -> Value {
+        let output = self.output_with_environment(arguments, environment);
         assert!(
             output.status.success(),
             "command failed: {}",
@@ -106,13 +110,70 @@ impl Fixture {
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
+        self.output_with_environment(arguments, &[])
+    }
+
+    fn output_with_environment(&self, arguments: &[&str], environment: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lspctl"));
         command.args(arguments);
         for (name, value) in &self.environment {
             command.env(name, value);
         }
+        command.envs(environment.iter().copied());
         command.output().unwrap()
     }
+}
+
+#[test]
+fn owner_reuses_session_across_transient_agent_environment_changes() {
+    let fixture = Fixture::new();
+    let workspace = fixture.workspace.to_str().unwrap();
+    let query = [
+        "raw",
+        "--workspace",
+        workspace,
+        "--server",
+        "fake",
+        "--method",
+        "fixture/environment",
+    ];
+    let first = fixture.command_with_environment(
+        &query,
+        &[
+            ("PI_MODEL", "first-model"),
+            ("PI_SESSION_ID", "first-session"),
+            ("PWD", "/first/caller"),
+            ("SHLVL", "1"),
+            ("__MISE_SESSION", "first-shell-session"),
+        ],
+    );
+    let second = fixture.command_with_environment(
+        &query,
+        &[
+            ("PI_MODEL", "second-model"),
+            ("PI_SESSION_ID", "second-session"),
+            ("PWD", "/second/caller"),
+            ("SHLVL", "2"),
+            ("__MISE_SESSION", "second-shell-session"),
+        ],
+    );
+
+    assert_eq!(
+        first["context"]["ownerGeneration"],
+        second["context"]["ownerGeneration"]
+    );
+
+    let changed_server_environment = fixture.command_with_environment(
+        &query,
+        &[
+            ("PI_SESSION_ID", "third-session"),
+            ("RUSTUP_TOOLCHAIN", "different-toolchain"),
+        ],
+    );
+    assert_ne!(
+        first["context"]["ownerGeneration"],
+        changed_server_environment["context"]["ownerGeneration"]
+    );
 }
 
 #[test]
@@ -644,7 +705,13 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
     assert_eq!(definition["context"]["ownerGeneration"], generation);
 
     let renamed = fixture.workspace.join("rename.rs");
-    fs::write(&renamed, "fn old() {}\n").unwrap();
+    let original = format!(
+        "fn old() {{}}\n{}",
+        (1..=1_000)
+            .map(|line| format!("// unchanged source line {line}\n"))
+            .collect::<String>()
+    );
+    fs::write(&renamed, &original).unwrap();
     let rename = fixture.command(&[
         "rename",
         "--workspace",
@@ -661,12 +728,20 @@ fn owner_starts_reuses_dispatches_and_stops_without_leaking_output() {
         "new_name",
     ]);
     assert_eq!(rename["outcome"], "previewed");
-    assert_eq!(fs::read_to_string(&renamed).unwrap(), "fn old() {}\n");
+    assert_eq!(fs::read_to_string(&renamed).unwrap(), original);
+    let diff = rename["result"]["diff"].as_str().unwrap();
+    assert!(diff.contains("-fn old() {}"));
+    assert!(diff.contains("+fn new_name() {}"));
+    assert!(!diff.contains("unchanged source line 10"));
+    assert!(diff.len() < 1_024);
     let preview_id = rename["result"]["previewId"].as_str().unwrap();
     let applied = fixture.command(&["apply", preview_id]);
     assert_eq!(applied["outcome"], "applied");
     assert_eq!(applied["result"]["sessionSynchronized"], true);
-    assert_eq!(fs::read_to_string(&renamed).unwrap(), "fn new_name() {}\n");
+    assert_eq!(
+        fs::read_to_string(&renamed).unwrap(),
+        original.replacen("fn old()", "fn new_name()", 1)
+    );
     let receipt = fixture.command(&["receipt", "show", preview_id]);
     assert_eq!(receipt["result"]["outcome"], "applied");
     assert_eq!(receipt["result"]["sessionSynchronized"], true);

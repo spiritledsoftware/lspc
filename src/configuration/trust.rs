@@ -81,7 +81,7 @@ pub(crate) fn authorize_server(
 ) -> Result<AuthorizedServer, ContractFailure> {
     let executable = resolve_server_executable(&server)?;
     let cwd = resolve_server_cwd(&server)?;
-    let child_environment = effective_child_environment(&server);
+    let child_environment = effective_child_environment(&server, &cwd);
     let session_identity = session_identity(
         configuration,
         &server,

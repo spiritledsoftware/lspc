@@ -12,6 +12,7 @@ use std::{
 };
 
 use serde_json::{Map, Value, json};
+use similar::TextDiff;
 use url::Url;
 
 use crate::{
@@ -1065,18 +1066,7 @@ fn preview_diff(stored: &StoredPreview) -> Option<String> {
                     cursor = end;
                 }
                 new.push_str(old.get(cursor..)?);
-                output.push_str(&format!("--- {}\n+++ {}\n", path.display(), path.display()));
-                output.push_str("@@ exact-byte-plan @@\n");
-                for line in old.lines() {
-                    output.push('-');
-                    output.push_str(line);
-                    output.push('\n');
-                }
-                for line in new.lines() {
-                    output.push('+');
-                    output.push_str(line);
-                    output.push('\n');
-                }
+                output.push_str(&contextual_text_diff(path, old, &new));
             }
             CanonicalOperation::Create { path, .. } => {
                 output.push_str(&format!("create {}\n", path.display()));
@@ -1096,6 +1086,15 @@ fn preview_diff(stored: &StoredPreview) -> Option<String> {
         }
     }
     Some(output)
+}
+
+fn contextual_text_diff(path: &std::path::Path, old: &str, new: &str) -> String {
+    let path = path.to_string_lossy();
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&path, &path)
+        .to_string()
 }
 
 fn preview_list_entry(stored: &StoredPreview) -> Value {

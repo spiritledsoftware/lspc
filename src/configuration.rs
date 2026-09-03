@@ -506,8 +506,16 @@ pub(crate) fn resolve_server_cwd(server: &EffectiveServer) -> Result<PathBuf, Co
     })
 }
 
-pub(crate) fn effective_child_environment(server: &EffectiveServer) -> Vec<(OsString, OsString)> {
-    let mut environment = env::vars_os().collect::<BTreeMap<_, _>>();
+/// Builds the stable environment inherited by the language-server process.
+pub(crate) fn effective_child_environment(
+    server: &EffectiveServer,
+    cwd: &Path,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = env::vars_os()
+        .filter(|(key, _)| !is_transient_inherited_environment_key(key))
+        .collect::<BTreeMap<_, _>>();
+    #[cfg(unix)]
+    environment.insert(OsString::from("PWD"), cwd.as_os_str().to_os_string());
     for (key, value) in &server.environment {
         #[cfg(windows)]
         if let Some(existing) = environment
@@ -520,6 +528,17 @@ pub(crate) fn effective_child_environment(server: &EffectiveServer) -> Vec<(OsSt
         environment.insert(OsString::from(key), OsString::from(&value.value));
     }
     environment.into_iter().collect()
+}
+
+fn is_transient_inherited_environment_key(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    ["_", "OLDPWD", "PWD", "PS1", "PS2", "PS4", "SHLVL"]
+        .iter()
+        .any(|transient| key.eq_ignore_ascii_case(transient))
+        || key
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("PI_"))
+        || key.starts_with("__MISE_")
 }
 
 pub(crate) fn session_identity(
