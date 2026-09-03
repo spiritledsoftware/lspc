@@ -1,27 +1,50 @@
 # lspc
 
-`lspc` is a JSON-only command-line client for querying installed Language Server Protocol servers and safely previewing their proposed filesystem changes. It keeps language servers warm between invocations and works on Linux, macOS, and Windows.
+[![Crates.io](https://img.shields.io/crates/v/lspc.svg)](https://crates.io/crates/lspc)
+[![Acceptance](https://github.com/spiritledsoftware/lspc/actions/workflows/ci.yml/badge.svg)](https://github.com/spiritledsoftware/lspc/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/lspc.svg)](LICENSE-MIT)
+
+**Language-server code intelligence for coding agents and shell scripts.**
+
+`lspc` lets tools query installed Language Server Protocol servers without
+embedding an editor. It returns one versioned JSON object per invocation and
+keeps language servers warm between calls.
+
+- Query definitions, references, hover, symbols, and diagnostics.
+- Preview renames, formatting, code actions, and other filesystem changes
+  before applying them.
+- Reuse long-lived server sessions while keeping each CLI call scriptable.
+- Inspect the complete command and output contract offline.
+- Run on Linux, macOS, and Windows with any compatible language server.
 
 ## Install
 
-Install from a checkout with Rust 1.89 or newer:
+Install from [crates.io](https://crates.io/crates/lspc) with Rust 1.89 or newer:
 
 ```sh
-cargo install --path . --locked
-lspc version
+cargo install lspc --locked
+lspc version | jq
 ```
 
-`lspc` launches language servers but does not install them. Install the server you want to use separately.
+Prebuilt archives and SHA-256 checksums are available on the
+[Releases page](https://github.com/spiritledsoftware/lspc/releases).
 
-## Configure a server
+`lspc` launches language servers but does not install them. Install the server
+you want to use separately. The examples below also use
+[`jq`](https://jqlang.org/) to format and select JSON output.
+
+## Quick start
+
+### 1. Configure a language server
 
 Find the native user configuration path:
 
 ```sh
-lspc schema config user | jq -r .result.resolvedPath
+lspc schema config user | jq -r '.result.resolvedPath'
 ```
 
-Create that file with a server declaration and route. For example, if `rust-analyzer` is on `PATH`:
+Create that file with a server declaration and route. For example, if
+`rust-analyzer` is on `PATH`:
 
 ```toml
 version = 1
@@ -35,55 +58,99 @@ routes = [
 executable = "rust-analyzer"
 ```
 
-User configuration is trusted. A repository may instead commit `.lspc.toml`; project-controlled launch fields require an explicit `lspc trust grant` before the server can start.
+### 2. Query your code
 
-## Query code
-
-All output is one compact JSON object on stdout. Source lines and columns are zero-based Unicode-scalar positions.
+Run these from a Rust workspace:
 
 ```sh
-lspc capabilities --workspace . --server rust
+lspc capabilities --workspace . --server rust | jq '.result'
+
 lspc definition --workspace . --server rust \
-  --file src/lib.rs --line 12 --column 8
+  --file src/main.rs --line 12 --column 8 | jq '.result'
+
 lspc references --workspace . --server rust \
-  --file src/lib.rs --line 12 --column 8 --include-declaration true
+  --file src/main.rs --line 12 --column 8 \
+  --include-declaration true | jq '.result'
 ```
 
-A server may answer an early navigation Query before background indexing finishes. If an expected result is empty, inspect the optional `context.serverProgress`. Non-empty progress may be related, so watch it and retry after it clears:
+Source lines and columns are zero-based Unicode-scalar positions. A server may
+answer an early navigation query before background indexing finishes. Inspect
+progress and retry after it clears when an expected result is empty:
 
 ```sh
-lspc session status --workspace . --server rust | jq .result.progress
+lspc session status --workspace . --server rust | jq '.result.progress'
 ```
 
-## Preview and apply a rename
+## Preview and apply changes
 
-Mutation Queries do not edit files. They persist an immutable Preview for inspection:
+Mutation queries never edit files directly. They persist an immutable Preview
+for inspection:
 
 ```sh
 preview_id=$(
   lspc rename --workspace . --server rust \
-    --file src/lib.rs --line 12 --column 8 --new-name replacement |
-  jq -r .result.previewId
+    --file src/main.rs --line 12 --column 8 --new-name replacement |
+  jq -r '.result.previewId'
 )
-lspc preview show "$preview_id" | jq .result.diff
-lspc apply "$preview_id"
+
+lspc preview show "$preview_id" | jq -r '.result.diff'
+lspc apply "$preview_id" | jq
 ```
 
-Application rechecks the inspected Preview and records a durable Receipt. There is no force-apply path for stale edits.
+Before applying, `lspc` rechecks the inspected Preview against the Workspace,
+server configuration, authorization, and filesystem state. Every completed
+Application records a durable Receipt; stale changes have no force-apply path.
 
-## Discover commands
+## Project configuration and Trust
+
+A repository may commit a `.lspc.toml` using the same `version`, `routes`, and
+`servers` structure as the user configuration. Project-controlled server launch
+fields require an explicit, declaration-bound Trust grant before execution.
+
+When Trust is required, inspect the structured `project_trust_required` error
+and run its `error.data.requiredCommand` only after approving the reported
+Workspace, server, and declaration digest. User configuration and explicit CLI
+launch fields do not require a project Trust grant.
+
+## Discover the JSON contract
+
+The CLI is JSON-only, including help and errors:
 
 ```sh
-lspc help | jq
-lspc help definition | jq
-lspc schema definition | jq
-lspc schema --full
+lspc help | jq                         # compact command index
+lspc help definition | jq              # one command
+lspc schema definition | jq            # exact input and output schemas
+lspc schema --full > lspc-schema.json  # complete registry for tooling
 ```
 
-`help` returns a compact command catalog without JSON Schemas. Focused `schema` returns the exact contract for one command; `schema --full` is the complete registry for tooling.
+Branch on stable fields such as `ok`, `error.code`, `error.retry`, and
+`error.delivery` rather than parsing messages. The installed binary's schema is
+the source of truth for its command syntax.
 
-Use the structured `error.code`, `error.retry`, and `error.delivery` fields rather than parsing messages. See [`skills/lspc/`](skills/lspc/) for configuration, Query, Mutation, Trust, and Recovery workflows.
+## Install the companion agent skill
+
+Install the bundled workflow guidance into the current repository:
+
+```sh
+lspc skill install
+```
+
+This writes `.agent/skills/lspc`. Use `lspc skill install --global` to install
+it under your home directory instead. Existing unmanaged files are not replaced
+without `--replace`.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --features fake-server -- -D warnings
+cargo test --locked --all-targets --features fake-server
+```
+
+See the [v0.1.0 release notes](docs/releases/v0.1.0.md) for the tested platform
+floors, reference-server versions, and artifact provenance.
 
 ## License
 
-Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option.
