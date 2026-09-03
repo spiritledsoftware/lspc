@@ -27,14 +27,31 @@ Both Agents received the same prompt, model, Tokio commit, and prepared dependen
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install spiritledsoftware/tap/lspctl
+```
+
+### Install script (Linux and macOS)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/spiritledsoftware/lspctl/main/install.sh | sh
+```
+
+The script installs the latest release to `~/.local/bin` after verifying its
+SHA-256 checksum. Set `LSPCTL_INSTALL_DIR` to choose another directory.
+
+### Cargo
+
 Install from [crates.io](https://crates.io/crates/lspctl) with Rust 1.89 or newer:
 
 ```sh
 cargo install lspctl --locked
-lspctl version | jq
 ```
 
-Prebuilt archives and SHA-256 checksums are available on the
+Verify the installation with `lspctl version | jq`. Prebuilt archives and
+SHA-256 checksums are also available on the
 [Releases page](https://github.com/spiritledsoftware/lspctl/releases).
 
 `lspctl` launches language servers but does not install them. Install the server

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import subprocess
 import sys
 import tarfile
@@ -24,6 +26,7 @@ FLOOR_AUDIT = ROOT / "scripts/release/audit_runtime_floor.py"
 PUBLISH_RELEASE = ROOT / "scripts/release/publish_release.py"
 REFERENCE_SMOKE = ROOT / "scripts/release/reference_smoke.py"
 SOAK = ROOT / "scripts/release/soak.py"
+INSTALLER = ROOT / "install.sh"
 
 
 def load_script(path: Path):
@@ -39,6 +42,68 @@ def load_script(path: Path):
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "the shell installer supports Linux and macOS")
+    def test_shell_installer_verifies_and_installs_release_archive(self) -> None:
+        system = {"Darwin": "apple-darwin", "Linux": "unknown-linux-gnu"}[platform.system()]
+        architecture = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64"}[platform.machine()]
+        target = f"{architecture}-{system}"
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            binary = temporary / "lspctl"
+            binary.write_bytes(b"test lspctl binary\n")
+            skill = temporary / "skill"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("# lspctl\n", encoding="utf-8")
+            release = temporary / "release"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ARCHIVE),
+                    "--binary", str(binary),
+                    "--target", target,
+                    "--version", "1.2.3",
+                    "--commit", "0123456789abcdef",
+                    "--rust-version", "rustc 1.89.0",
+                    "--skill-dir", str(skill),
+                    "--output-dir", str(release),
+                ],
+                check=True,
+            )
+            fake_bin = temporary / "bin"
+            fake_bin.mkdir()
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  case \"$1\" in\n"
+                "    -o) output=$2; shift 2 ;;\n"
+                "    --proto) shift 2 ;;\n"
+                "    -*) shift ;;\n"
+                "    *) url=$1; shift ;;\n"
+                "  esac\n"
+                "done\n"
+                "cp \"$LSPCTL_TEST_RELEASE/${url##*/}\" \"$output\"\n",
+                encoding="utf-8",
+            )
+            curl.chmod(0o755)
+            install_dir = temporary / "installed"
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "LSPCTL_INSTALL_DIR": str(install_dir),
+                "LSPCTL_RELEASE_ROOT": "https://fixture.invalid/releases",
+                "LSPCTL_TEST_RELEASE": str(release),
+                "LSPCTL_VERSION": "1.2.3",
+            }
+            subprocess.run(["sh", str(INSTALLER)], check=True, env=environment)
+            self.assertEqual((install_dir / "lspctl").read_bytes(), binary.read_bytes())
+
+            archive = release / f"lspctl-v1.2.3-{target}.tar.gz"
+            archive.write_bytes(archive.read_bytes() + b"tampered")
+            result = subprocess.run(["sh", str(INSTALLER)], text=True, capture_output=True, env=environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("checksum mismatch", result.stderr)
+
     def test_publish_commands_do_not_require_captured_stdout(self) -> None:
         publish = load_script(PUBLISH_RELEASE)
         completed = subprocess.CompletedProcess(["gh"], 0)
