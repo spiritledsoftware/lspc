@@ -17,6 +17,12 @@ keeps language servers warm between calls.
 - Inspect the complete command and output contract offline.
 - Run on Linux, macOS, and Windows with any compatible language server.
 
+## See lspctl in action
+
+[![Side-by-side terminal demo: baseline Pi searches Tokio source while Pi with lspctl inspects and applies a five-reference semantic rename Preview](assets/demo/lspctl-agent-rename.webp)](assets/demo/lspctl-agent-rename.mp4)
+
+Both Agents received the same prompt, model, Tokio commit, and prepared dependency state; the treatment added the released `lspctl` CLI and bundled skill, with rust-analyzer indexed before recording. [Read the methodology and sanitized transcripts](docs/demo.md).
+
 ## Install
 
 Install from [crates.io](https://crates.io/crates/lspctl) with Rust 1.89 or newer:
