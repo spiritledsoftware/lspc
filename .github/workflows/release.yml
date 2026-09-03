@@ -11,7 +11,7 @@ permissions:
   attestations: write
 
 env:
-  LSPC_BUILD_COMMIT: ${{ github.sha }}
+  LSPCTL_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   extended-acceptance:
@@ -83,15 +83,15 @@ jobs:
         run: |
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           python3 scripts/release/package.py --target ${{ matrix.target }} --output-dir dist
-          python3 scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/lspc --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
-          cargo build --locked --release --target ${{ matrix.target }} --features fake-server --bin lspc-fake-server
-          python3 scripts/release/floor_smoke.py --archive "dist/lspc-v${VERSION}-${{ matrix.target }}.tar.gz" --fake-server target/${{ matrix.target }}/release/lspc-fake-server --target ${{ matrix.target }} --output dist/floor-smoke-${{ matrix.target }}.json
+          python3 scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/lspctl --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
+          cargo build --locked --release --target ${{ matrix.target }} --features fake-server --bin lspctl-fake-server
+          python3 scripts/release/floor_smoke.py --archive "dist/lspctl-v${VERSION}-${{ matrix.target }}.tar.gz" --fake-server target/${{ matrix.target }}/release/lspctl-fake-server --target ${{ matrix.target }} --output dist/floor-smoke-${{ matrix.target }}.json
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/lspc-v*.tar.gz
+          subject-path: dist/lspctl-v*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: lspc-${{ matrix.target }}
+          name: lspctl-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
@@ -124,13 +124,13 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ contains(matrix.target, 'apple-darwin') && '12.0' || '' }}
       - name: Audit runtime floor
-        run: python scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/${{ contains(matrix.target, 'windows') && 'lspc.exe' || 'lspc' }} --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
+        run: python scripts/release/audit_runtime_floor.py --binary target/${{ matrix.target }}/release/${{ contains(matrix.target, 'windows') && 'lspctl.exe' || 'lspctl' }} --target ${{ matrix.target }} --output dist/floor-${{ matrix.target }}.json
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/lspc-v*.${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
+          subject-path: dist/lspctl-v*.${{ contains(matrix.target, 'windows') && 'zip' || 'tar.gz' }}
       - uses: actions/upload-artifact@v4
         with:
-          name: lspc-${{ matrix.target }}
+          name: lspctl-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
@@ -151,11 +151,11 @@ jobs:
         run: python scripts/release/package.py --target x86_64-unknown-linux-gnu --skill-only --output-dir dist
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/lspc-agent-skill-v*.zip
+          subject-path: dist/lspctl-agent-skill-v*.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: lspc-agent-skill
-          path: dist/lspc-agent-skill-v*.zip*
+          name: lspctl-agent-skill
+          path: dist/lspctl-agent-skill-v*.zip*
           if-no-files-found: error
 
   runtime-floors:
@@ -168,21 +168,21 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             extension: tar.gz
-            fake: lspc-fake-server
+            fake: lspctl-fake-server
           - runner: macos-14
             target: aarch64-apple-darwin
             extension: tar.gz
-            fake: lspc-fake-server
+            fake: lspctl-fake-server
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
             extension: zip
-            fake: lspc-fake-server.exe
+            fake: lspctl-fake-server.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: lspc-${{ matrix.target }}
+          name: lspctl-${{ matrix.target }}
           path: dist
       - name: Install stable Rust
         shell: bash
@@ -191,8 +191,8 @@ jobs:
         shell: bash
         run: |
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
-          cargo build --locked --release --features fake-server --bin lspc-fake-server
-          python scripts/release/floor_smoke.py --archive "dist/lspc-v${VERSION}-${{ matrix.target }}.${{ matrix.extension }}" --fake-server target/release/${{ matrix.fake }} --target ${{ matrix.target }} --output floor-smoke.json
+          cargo build --locked --release --features fake-server --bin lspctl-fake-server
+          python scripts/release/floor_smoke.py --archive "dist/lspctl-v${VERSION}-${{ matrix.target }}.${{ matrix.extension }}" --fake-server target/release/${{ matrix.fake }} --target ${{ matrix.target }} --output floor-smoke.json
       - uses: actions/upload-artifact@v4
         with:
           name: floor-smoke-${{ matrix.target }}
@@ -209,7 +209,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: lspc-*
+          pattern: lspctl-*
           path: dist
           merge-multiple: true
       - name: Publish immutable crate and release assets

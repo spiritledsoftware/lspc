@@ -1954,7 +1954,7 @@ fn identity_digest(
         identity["fileIndex"] = json!(file_index);
     }
     Ok(digest_canonical_value(
-        "lspc-resource-identity-v1",
+        "lspctl-resource-identity-v1",
         &identity,
     ))
 }
@@ -2084,7 +2084,10 @@ fn metadata_digest(
                 })?);
         }
     }
-    Ok(digest_canonical_value("lspc-resource-metadata-v1", &value))
+    Ok(digest_canonical_value(
+        "lspctl-resource-metadata-v1",
+        &value,
+    ))
 }
 
 #[cfg(windows)]

@@ -1,25 +1,25 @@
 ---
-name: lspc
-description: Use the lspc CLI for language-server Queries and Mutations. Invoke for definitions, references, symbols, diagnostics, rename, formatting, code actions, raw LSP methods, server configuration, project Trust, protocol tracing, or Recovery.
+name: lspctl
+description: Use the lspctl CLI for language-server Queries and Mutations. Invoke for definitions, references, symbols, diagnostics, rename, formatting, code actions, raw LSP methods, server configuration, project Trust, protocol tracing, or Recovery.
 ---
 
-# lspc
+# lspctl
 
-Use `lspc` as a schema-driven LSP client. The schema defines syntax. This skill defines the workflow.
+Use `lspctl` as a schema-driven LSP client. The schema defines syntax. This skill defines the workflow.
 
 ## Establish the contract
 
 Before the first LSP workflow in a session, run:
 
 ```sh
-lspc schema
+lspctl schema
 ```
 
 Keep this compact catalog for the session. Require a successful envelope with `schemaVersion: 1` and `result.contractVersion: 1`.
 
-Before invoking a leaf command, find its path in that catalog and validate its flags, required values, exclusions, success schema, error schema, and exit codes. A focused `lspc schema <command path>` lookup is enough after the catalog has established the contract.
+Before invoking a leaf command, find its path in that catalog and validate its flags, required values, exclusions, success schema, error schema, and exit codes. A focused `lspctl schema <command path>` lookup is enough after the catalog has established the contract.
 
-The installed binary's schema wins if it disagrees with this skill. Report the mismatch and stop instead of inventing an alias, flag, default, or fallback. `lspc schema` is offline, so schema discovery never needs configuration, Trust, or a running language server.
+The installed binary's schema wins if it disagrees with this skill. Report the mismatch and stop instead of inventing an alias, flag, default, or fallback. `lspctl schema` is offline, so schema discovery never needs configuration, Trust, or a running language server.
 
 ## Choose the workflow
 
@@ -34,7 +34,7 @@ Use one canonical Workspace root and one named server for a related sequence of 
 
 For configuration work, follow [CONFIGURATION.md](CONFIGURATION.md). Pass explicit server launch fields only when the task already establishes them. Invocation-scoped launch fields create no persistent Trust grant.
 
-Project launch fields require a declaration-bound Trust grant. User configuration and explicit invocation fields do not. Use `lspc trust status` to inspect the current state before changing it. A grant authorizes the current declaration digest, `trust revoke` removes either a grant or a Denial, and a Denial keeps the declaration blocked until explicitly replaced.
+Project launch fields require a declaration-bound Trust grant. User configuration and explicit invocation fields do not. Use `lspctl trust status` to inspect the current state before changing it. A grant authorizes the current declaration digest, `trust revoke` removes either a grant or a Denial, and a Denial keeps the declaration blocked until explicitly replaced.
 
 When an error has `code: "project_trust_required"`:
 
@@ -44,11 +44,11 @@ When an error has `code: "project_trust_required"`:
 
 Do not broaden a server grant to `trust grant --all`. A durable Denial may be replaced only when the human explicitly authorizes the schema-declared replacement flag.
 
-Run `lspc capabilities` when server support matters. Use normalized provider states of `supported`, `unsupported`, and `invalid`. The raw initialization result is diagnostic data, not a substitute for those gates.
+Run `lspctl capabilities` when server support matters. Use normalized provider states of `supported`, `unsupported`, and `invalid`. The raw initialization result is diagnostic data, not a substitute for those gates.
 
 ## Process every envelope
 
-Parse stdout as one JSON object. Use stderr only when `lspc` could not serialize an envelope.
+Parse stdout as one JSON object. Use stderr only when `lspctl` could not serialize an envelope.
 
 On success, read `result` together with `context`, synchronization metadata, diagnostics metadata, paging, warnings, traces, and the `applyEditLedger` when present. Do not discard metadata that qualifies the result.
 
@@ -69,4 +69,4 @@ Exit codes are coarse routing hints. The envelope is authoritative.
 
 A Query is complete when the requested semantic result is returned with its qualifying metadata, or when the structured blocked or unsafe state has been reported. A Mutation is complete only at the stopping point defined in [MUTATIONS.md](MUTATIONS.md).
 
-Before publishing this skill with an `lspc` release, run its examples against that binary's `lspc schema --full` output. Release validation must fail if a literal command path, flag, contract version, error field, or enum used here is absent.
+Before publishing this skill with an `lspctl` release, run its examples against that binary's `lspctl schema --full` output. Release validation must fail if a literal command path, flag, contract version, error field, or enum used here is absent.

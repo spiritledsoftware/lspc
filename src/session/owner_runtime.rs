@@ -744,12 +744,12 @@ impl LspRuntime {
             "method": "initialize",
             "params": {
                 "processId": std::process::id(),
-                "clientInfo": {"name": "lspc", "version": env!("CARGO_PKG_VERSION")},
+                "clientInfo": {"name": "lspctl", "version": env!("CARGO_PKG_VERSION")},
                 "rootUri": self.workspace_uri,
                 "capabilities": fixed_initialize_capabilities(),
                 "initializationOptions": initialization_options,
                 "workspaceFolders": [self.workspace_folder.clone()],
-                "workDoneToken": "lspc-initialize-1"
+                "workDoneToken": "lspctl-initialize-1"
             }
         });
         self.write_lsp_message(&request, true).await?;

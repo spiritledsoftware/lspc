@@ -64,12 +64,12 @@ def main() -> None:
     arguments = parser.parse_args()
     archive = arguments.archive.resolve()
     fake = arguments.fake_server.resolve()
-    with tempfile.TemporaryDirectory(prefix="lspc-floor-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="lspctl-floor-") as temporary:
         root = Path(temporary)
         payload = root / "payload"
         payload.mkdir()
         extract(archive, payload)
-        binary_name = "lspc.exe" if os.name == "nt" else "lspc"
+        binary_name = "lspctl.exe" if os.name == "nt" else "lspctl"
         binaries = list(payload.glob(f"*/{binary_name}"))
         if len(binaries) != 1:
             raise SystemExit(f"archive has no unique production binary: {binaries!r}")
@@ -77,11 +77,11 @@ def main() -> None:
         env = test_environment(root)
         workspace = root / "workspace-λ"
         workspace.mkdir()
-        config = Path(env["XDG_CONFIG_HOME"]) / "lspc/config.toml"
+        config = Path(env["XDG_CONFIG_HOME"]) / "lspctl/config.toml"
         if os.name == "nt":
-            config = Path(env["APPDATA"]) / "lspc/config.toml"
+            config = Path(env["APPDATA"]) / "lspctl/config.toml"
         elif __import__("platform").system() == "Darwin":
-            config = Path(env["HOME"]) / "Library/Application Support/lspc/config.toml"
+            config = Path(env["HOME"]) / "Library/Application Support/lspctl/config.toml"
         config.parent.mkdir(parents=True)
         config.write_text(
             "version = 1\ndefault_server = \"fake\"\n[servers.fake]\n"

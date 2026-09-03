@@ -1,4 +1,4 @@
-# `lspc` Project Instructions
+# `lspctl` Project Instructions
 
 ## Agent skills
 

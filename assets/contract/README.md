@@ -6,4 +6,4 @@ These files are based on the validated machine contract at commit `baaead1` and 
 - `schemas.json` is compiled from the checked catalog with that revision's `check.py` generator.
 - `initialize-capabilities.json` is the exact Capability profile sent to language servers.
 
-`lspc` embeds these files. Builds do not run the prototype's Python generator.
+`lspctl` embeds these files. Builds do not run the prototype's Python generator.

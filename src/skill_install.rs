@@ -18,20 +18,23 @@ use sha2::{Digest, Sha256};
 
 use crate::{cli::ParsedInvocation, contract::ContractFailure};
 
-const MARKER_NAME: &str = ".lspc-managed.json";
-const JOURNAL_PREFIX: &str = ".lspc-journal-";
-const LOCK_NAME: &str = ".lspc-install.lock";
+const MARKER_NAME: &str = ".lspctl-managed.json";
+const JOURNAL_PREFIX: &str = ".lspctl-journal-";
+const LOCK_NAME: &str = ".lspctl-install.lock";
 const SKILL_FILES: &[(&str, &[u8])] = &[
     (
         "CONFIGURATION.md",
-        include_bytes!("../skills/lspc/CONFIGURATION.md"),
+        include_bytes!("../skills/lspctl/CONFIGURATION.md"),
     ),
     (
         "MUTATIONS.md",
-        include_bytes!("../skills/lspc/MUTATIONS.md"),
+        include_bytes!("../skills/lspctl/MUTATIONS.md"),
     ),
-    ("QUERYING.md", include_bytes!("../skills/lspc/QUERYING.md")),
-    ("SKILL.md", include_bytes!("../skills/lspc/SKILL.md")),
+    (
+        "QUERYING.md",
+        include_bytes!("../skills/lspctl/QUERYING.md"),
+    ),
+    ("SKILL.md", include_bytes!("../skills/lspctl/SKILL.md")),
 ];
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,7 +77,7 @@ pub(crate) fn install(invocation: &ParsedInvocation) -> Result<Value, ContractFa
     } else {
         std::env::current_dir().map_err(|error| install_failure(scope, Path::new("."), &error))?
     };
-    let destination = base.join(".agent/skills/lspc");
+    let destination = base.join(".agent/skills/lspctl");
     let result = install_to(&destination, scope, invocation.has_option("--replace"))?;
     Ok(json!({
         "schemaVersion": 1,
@@ -117,7 +120,7 @@ fn install_to(destination: &Path, scope: &str, replace: bool) -> Result<Value, C
     let current_version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
     let unchanged = existing.marker.as_ref().is_some_and(|marker| {
         marker.format_version == 1
-            && marker.manager == "lspc"
+            && marker.manager == "lspctl"
             && marker.skill_version == env!("CARGO_PKG_VERSION")
             && marker.digest == embedded_digest
             && existing.actual_digest.as_ref() == Some(&embedded_digest)
@@ -137,7 +140,7 @@ fn install_to(destination: &Path, scope: &str, replace: bool) -> Result<Value, C
 
     let valid_managed = existing.marker.as_ref().is_some_and(|marker| {
         marker.format_version == 1
-            && marker.manager == "lspc"
+            && marker.manager == "lspctl"
             && existing.actual_digest.as_ref() == Some(&marker.digest)
     });
     let older_managed = valid_managed
@@ -167,7 +170,7 @@ fn install_to(destination: &Path, scope: &str, replace: bool) -> Result<Value, C
         .marker
         .as_ref()
         .filter(|marker| {
-            marker.manager == "lspc"
+            marker.manager == "lspctl"
                 && marker.format_version == 1
                 && Version::parse(&marker.skill_version).is_ok()
         })
@@ -176,12 +179,12 @@ fn install_to(destination: &Path, scope: &str, replace: bool) -> Result<Value, C
         .marker
         .as_ref()
         .filter(|marker| {
-            marker.manager == "lspc"
+            marker.manager == "lspctl"
                 && marker.format_version == 1
                 && valid_sha256_digest(&marker.digest)
         })
         .map(|marker| marker.digest.clone());
-    let stage = create_random_sibling(parent, ".lspc-stage-")
+    let stage = create_random_sibling(parent, ".lspctl-stage-")
         .map_err(|error| install_failure(scope, &destination, &error))?;
     if let Err(error) = write_embedded_skill(&stage, &embedded_digest)
         .and_then(|()| verify_embedded_installation(&stage, &embedded_digest))
@@ -194,7 +197,7 @@ fn install_to(destination: &Path, scope: &str, replace: bool) -> Result<Value, C
         format_version: 1,
         destination: destination.clone(),
         stage,
-        backup: parent.join(format!(".lspc-backup-{suffix}")),
+        backup: parent.join(format!(".lspctl-backup-{suffix}")),
         digest: embedded_digest,
         outcome: outcome.to_owned(),
         previous_skill_version,
@@ -300,7 +303,7 @@ fn read_tree(root: &Path) -> io::Result<BTreeMap<String, Vec<u8>>> {
 fn bundle_digest<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> String {
     let files = files.collect::<BTreeMap<_, _>>();
     let mut hasher = Sha256::new();
-    hasher.update(b"lspc-skill-v1\0");
+    hasher.update(b"lspctl-skill-v1\0");
     hasher.update((files.len() as u64).to_be_bytes());
     for (path, bytes) in files {
         hasher.update((path.len() as u64).to_be_bytes());
@@ -317,7 +320,7 @@ fn write_embedded_skill(stage: &Path, digest: &str) -> io::Result<()> {
     }
     let marker = ManagedMarker {
         format_version: 1,
-        manager: "lspc".to_owned(),
+        manager: "lspctl".to_owned(),
         skill_version: env!("CARGO_PKG_VERSION").to_owned(),
         digest: digest.to_owned(),
     };
@@ -358,7 +361,7 @@ fn verify_embedded_installation(path: &Path, expected: &str) -> io::Result<()> {
         .marker
         .ok_or_else(|| io::Error::other("staged marker is invalid"))?;
     if marker.format_version != 1
-        || marker.manager != "lspc"
+        || marker.manager != "lspctl"
         || marker.skill_version != env!("CARGO_PKG_VERSION")
         || marker.digest != expected
         || installation.actual_digest.as_deref() != Some(expected)
@@ -494,7 +497,7 @@ fn journal_path(parent: &Path, journal: &InstallJournal) -> PathBuf {
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .trim_start_matches(".lspc-stage-")
+        .trim_start_matches(".lspctl-stage-")
         .to_owned();
     parent.join(format!("{JOURNAL_PREFIX}{suffix}.json"))
 }
@@ -630,7 +633,7 @@ mod tests {
     #[test]
     fn installs_upgrades_refuses_and_replaces() {
         let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join(".agent/skills/lspc");
+        let destination = temporary.path().join(".agent/skills/lspctl");
 
         assert_eq!(
             install_to(&destination, "local", false).unwrap()["outcome"],
@@ -659,7 +662,7 @@ mod tests {
             destination.join(MARKER_NAME),
             serde_json::to_vec(&ManagedMarker {
                 format_version: 1,
-                manager: "lspc".to_owned(),
+                manager: "lspctl".to_owned(),
                 skill_version: "0.0.9".to_owned(),
                 digest: old_digest,
             })
@@ -675,12 +678,12 @@ mod tests {
     #[test]
     fn resumes_after_destination_was_moved_to_backup() {
         let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("lspc");
+        let destination = temporary.path().join("lspctl");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("custom"), b"old").unwrap();
         let digest = bundle_digest(SKILL_FILES.iter().map(|(path, bytes)| (*path, *bytes)));
         let stage = tempfile::Builder::new()
-            .prefix(".lspc-stage-")
+            .prefix(".lspctl-stage-")
             .tempdir_in(temporary.path())
             .unwrap()
             .keep();
@@ -689,7 +692,7 @@ mod tests {
             format_version: 1,
             destination: destination.clone(),
             stage,
-            backup: temporary.path().join(".lspc-backup-test"),
+            backup: temporary.path().join(".lspctl-backup-test"),
             digest,
             outcome: "replaced".to_owned(),
             previous_skill_version: None,

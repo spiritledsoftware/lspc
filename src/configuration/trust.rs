@@ -456,12 +456,12 @@ fn current_declaration(
         .map(|(name, value)| {
             (
                 name.clone(),
-                digest_canonical_value("lspc-trust-field-v1", value),
+                digest_canonical_value("lspctl-trust-field-v1", value),
             )
         })
         .collect();
     let digest = digest_canonical_value(
-        "lspc-trust-declaration-v1",
+        "lspctl-trust-declaration-v1",
         &json!({
             "server": name,
             "resolvedExecutablePath": executable_path,
@@ -509,7 +509,7 @@ fn project_field_values(
 
 fn aggregate_digest(declarations: &BTreeMap<String, CurrentDeclaration>) -> String {
     digest_canonical_value(
-        "lspc-trust-aggregate-v1",
+        "lspctl-trust-aggregate-v1",
         &Value::Object(
             declarations
                 .iter()

@@ -978,7 +978,7 @@ fn reauthorize_preview(
 
 fn authorization_digest(session_identity: &str, declaration_digest: Option<&str>) -> String {
     digest_canonical_value(
-        "lspc-mutation-authorization-v1",
+        "lspctl-mutation-authorization-v1",
         &json!({
             "sessionIdentity": session_identity,
             "declarationDigest": declaration_digest

@@ -560,8 +560,10 @@ impl MutationStateStore {
     }
 
     pub(crate) fn application_lock_path(&self, workspace_uri: &str) -> PathBuf {
-        let digest =
-            digest_canonical_value("lspc-workspace-application-lock-v1", &json!(workspace_uri));
+        let digest = digest_canonical_value(
+            "lspctl-workspace-application-lock-v1",
+            &json!(workspace_uri),
+        );
         self.root
             .join("locks")
             .join(format!("{}.lock", digest.trim_start_matches("sha256:")))
@@ -841,7 +843,7 @@ pub(crate) fn now_rfc3339() -> String {
 
 pub(crate) fn manifest_digest(manifest: &[ManifestEntry]) -> String {
     digest_canonical_value(
-        "lspc-mutation-manifest-v1",
+        "lspctl-mutation-manifest-v1",
         &serde_json::to_value(manifest).unwrap(),
     )
 }

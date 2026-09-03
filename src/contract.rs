@@ -62,14 +62,14 @@ pub(crate) fn version_success_envelope() -> VersionSuccessEnvelope {
         ok: true,
         command: ["version"],
         result: VersionResult {
-            name: "lspc",
+            name: "lspctl",
             version: env!("CARGO_PKG_VERSION"),
             contract_version: 1,
             config_version: 1,
             capability_profile_version: 1,
             owner_protocol_version: 1,
-            target: env!("LSPC_BUILD_TARGET"),
-            commit: env!("LSPC_BUILD_COMMIT"),
+            target: env!("LSPCTL_BUILD_TARGET"),
+            commit: env!("LSPCTL_BUILD_COMMIT"),
         },
     }
 }
@@ -110,7 +110,7 @@ pub(crate) fn internal_error_envelope(command: Vec<String>, incident_id: &str) -
         "error": {
             "category": "internal",
             "code": "internal_error",
-            "message": "lspc could not complete the command.",
+            "message": "lspctl could not complete the command.",
             "stage": "dispatch",
             "delivery": "not_applicable",
             "retry": "never",
@@ -285,7 +285,7 @@ fn focused_schemas(subject: &[String]) -> Value {
     let mut selected = BTreeSet::new();
 
     if subject.first().is_some_and(|segment| segment == "config") {
-        selected.insert(format!("lspc://schema/v1/{path}"));
+        selected.insert(format!("lspctl://schema/v1/{path}"));
     } else if subject == ["output"] {
         selected.extend(
             schemas
@@ -296,7 +296,7 @@ fn focused_schemas(subject: &[String]) -> Value {
     } else if subject == ["errors"] {
         selected.extend(schemas.keys().filter(|uri| uri.contains("/error")).cloned());
     } else if subject == ["skill-install"] {
-        selected.insert("lspc://schema/v1/skill-install/marker".to_owned());
+        selected.insert("lspctl://schema/v1/skill-install/marker".to_owned());
     } else {
         for command in contract_catalog()["commands"].as_array().unwrap() {
             let command_path = command["path"]
@@ -307,10 +307,10 @@ fn focused_schemas(subject: &[String]) -> Value {
                 .collect::<Vec<_>>();
             if command_path.starts_with(&subject.iter().map(String::as_str).collect::<Vec<_>>()) {
                 let command_path = command_path.join("/");
-                selected.insert(format!("lspc://schema/v1/cli/{command_path}"));
-                selected.insert(format!("lspc://schema/v1/command/{command_path}"));
-                selected.insert(format!("lspc://schema/v1/command/{command_path}/success"));
-                selected.insert(format!("lspc://schema/v1/command/{command_path}/failure"));
+                selected.insert(format!("lspctl://schema/v1/cli/{command_path}"));
+                selected.insert(format!("lspctl://schema/v1/command/{command_path}"));
+                selected.insert(format!("lspctl://schema/v1/command/{command_path}/success"));
+                selected.insert(format!("lspctl://schema/v1/command/{command_path}/failure"));
             }
         }
     }

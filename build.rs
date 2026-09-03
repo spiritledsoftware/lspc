@@ -1,29 +1,29 @@
 use std::{env, fs, path::Path, process::Command};
 
 fn main() {
-    println!("cargo::rerun-if-env-changed=LSPC_BUILD_COMMIT");
+    println!("cargo::rerun-if-env-changed=LSPCTL_BUILD_COMMIT");
     println!("cargo::rerun-if-changed=.cargo_vcs_info.json");
 
-    let commit = env::var("LSPC_BUILD_COMMIT")
+    let commit = env::var("LSPCTL_BUILD_COMMIT")
         .ok()
         .or_else(packaged_commit)
         .or_else(|| {
             watch_git_head();
             git_output(&["rev-parse", "--verify", "HEAD"])
         })
-        .expect("set LSPC_BUILD_COMMIT when building outside a Git or Cargo package checkout");
+        .expect("set LSPCTL_BUILD_COMMIT when building outside a Git or Cargo package checkout");
 
     assert!(
         (7..=64).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "LSPC_BUILD_COMMIT must be a 7 to 64 character hexadecimal Git commit"
+        "LSPCTL_BUILD_COMMIT must be a 7 to 64 character hexadecimal Git commit"
     );
 
     println!(
-        "cargo::rustc-env=LSPC_BUILD_COMMIT={}",
+        "cargo::rustc-env=LSPCTL_BUILD_COMMIT={}",
         commit.to_ascii_lowercase()
     );
     println!(
-        "cargo::rustc-env=LSPC_BUILD_TARGET={}",
+        "cargo::rustc-env=LSPCTL_BUILD_TARGET={}",
         env::var("TARGET").unwrap()
     );
 }

@@ -70,7 +70,7 @@ fn main() -> ExitCode {
         Ok(Scenario::OversizedFrame) => raw(b"Content-Length: 67108865\r\n\r\n"),
         Ok(scenario) => serve(scenario, event_log),
         Err(error) => {
-            eprintln!("lspc fake server: {error}");
+            eprintln!("lspctl fake server: {error}");
             ExitCode::from(2)
         }
     }
@@ -543,7 +543,7 @@ fn serve(scenario: Scenario, event_log: Option<PathBuf>) -> ExitCode {
                                 "end": {"line": 0, "character": 1}
                             },
                             "severity": 2,
-                            "source": "lspc-fixture",
+                            "source": "lspctl-fixture",
                             "message": format!("diagnostic for {uri}")
                         }]
                     }

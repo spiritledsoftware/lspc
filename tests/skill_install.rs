@@ -14,11 +14,12 @@ fn local_install_is_managed_idempotent_and_replace_requires_consent() {
     assert_eq!(installed["result"]["outcome"], "installed");
     assert_eq!(installed["result"]["skillVersion"], "0.1.0");
     assert_eq!(installed["result"]["previousDigest"], Value::Null);
-    let destination = workspace.path().join(".agent/skills/lspc");
+    let destination = workspace.path().join(".agent/skills/lspctl");
     let marker: Value =
-        serde_json::from_slice(&fs::read(destination.join(".lspc-managed.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(destination.join(".lspctl-managed.json")).unwrap())
+            .unwrap();
     assert_eq!(marker["formatVersion"], 1);
-    assert_eq!(marker["manager"], "lspc");
+    assert_eq!(marker["manager"], "lspctl");
     assert_eq!(marker["digest"], installed["result"]["digest"]);
 
     let unchanged: Value = serde_json::from_slice(&run(workspace.path(), &[]).stdout).unwrap();
@@ -49,7 +50,7 @@ fn local_install_is_managed_idempotent_and_replace_requires_consent() {
 fn global_install_uses_the_home_agent_directory() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_lspc"))
+    let output = Command::new(env!("CARGO_BIN_EXE_lspctl"))
         .args(["skill", "install", "--global"])
         .current_dir(workspace.path())
         .env("HOME", home.path())
@@ -60,13 +61,13 @@ fn global_install_uses_the_home_agent_directory() {
     assert_eq!(envelope["result"]["scope"], "global");
     assert_eq!(
         envelope["result"]["resolvedPath"],
-        home.path().join(".agent/skills/lspc").to_str().unwrap()
+        home.path().join(".agent/skills/lspctl").to_str().unwrap()
     );
-    assert!(home.path().join(".agent/skills/lspc/SKILL.md").is_file());
+    assert!(home.path().join(".agent/skills/lspctl/SKILL.md").is_file());
 }
 
 fn run(workspace: &std::path::Path, extra: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lspc"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lspctl"));
     command
         .args(["skill", "install"])
         .args(extra)

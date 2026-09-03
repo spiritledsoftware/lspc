@@ -874,7 +874,7 @@ fn raw_request(invocation: &ParsedInvocation) -> Result<DispatchRequest, Contrac
             exit_code: 3,
             category: "blocked",
             code: "raw_method_forbidden",
-            message: "This raw method is controlled by lspc.".to_owned(),
+            message: "This raw method is controlled by lspctl.".to_owned(),
             stage: "dispatch",
             delivery: "not_sent",
             retry: "never",

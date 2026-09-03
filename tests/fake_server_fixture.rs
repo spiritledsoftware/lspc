@@ -9,7 +9,7 @@ use std::{
 use serde_json::{Value, json};
 
 fn fixture(scenario: &str) -> (Child, ChildStdin, BufReader<ChildStdout>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lspc-fake-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lspctl-fake-server"))
         .arg(format!("--scenario={scenario}"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

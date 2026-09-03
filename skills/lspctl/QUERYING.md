@@ -1,4 +1,4 @@
-# Querying with lspc
+# Querying with lspctl
 
 Load this reference for named Queries, diagnostics, paging, raw LSP methods, or protocol tracing.
 
@@ -9,8 +9,8 @@ Choose the named Query whose schema names the LSP method you need. Named Queries
 Examples of the shape, subject to the installed schema:
 
 ```sh
-lspc definition --workspace /work/repo --server rust --file src/lib.rs --line 12 --column 8
-lspc references --workspace /work/repo --server rust --file src/lib.rs --line 12 --column 8 --include-declaration false
+lspctl definition --workspace /work/repo --server rust --file src/lib.rs --line 12 --column 8
+lspctl references --workspace /work/repo --server rust --file src/lib.rs --line 12 --column 8 --include-declaration false
 ```
 
 Named source inputs use native file paths and zero-based `line` and `column`. The input column counts Unicode scalar values. Returned LSP positions retain the negotiated encoding named by `context.resultPositionEncoding`.
@@ -19,7 +19,7 @@ Never copy a returned LSP `character` into `--column`. Convert it against the cu
 
 Read `context.synchronization` before using a result. A named Document Query that detects a post-response file change fails and places the unusable server result in structured error data. Do not treat that payload as current.
 
-If a successful navigation Query unexpectedly returns an empty result, inspect `context.serverProgress`. A non-empty array means the server reported background work when it answered. Use `lspc session status` for the same Workspace and server to watch `result.progress`; after it clears, repeat the Query. With no reported progress, treat the empty result as the server's answer.
+If a successful navigation Query unexpectedly returns an empty result, inspect `context.serverProgress`. A non-empty array means the server reported background work when it answered. Use `lspctl session status` for the same Workspace and server to watch `result.progress`; after it clears, repeat the Query. With no reported progress, treat the empty result as the server's answer.
 
 ## Page explicit results
 
@@ -43,10 +43,10 @@ Inspect `diagnostics.source`, `fresh`, `complete`, and `workspaceComplete`. An e
 
 ## Use raw for the long tail
 
-Use `lspc raw` only when the required LSP method has no named wrapper. Supply the exact method and exact JSON params defined by LSP or the server extension.
+Use `lspctl raw` only when the required LSP method has no named wrapper. Supply the exact method and exact JSON params defined by LSP or the server extension.
 
 ```sh
-lspc raw --workspace /work/repo --server rust --method textDocument/typeDefinition --params-file params.json --sync-file src/lib.rs
+lspctl raw --workspace /work/repo --server rust --method textDocument/typeDefinition --params-file params.json --sync-file src/lib.rs
 ```
 
 Raw mode performs no coordinate conversion, URI normalization, cardinality normalization, paging, or named-operation capability gate. `--sync-file` synchronizes a native file path before dispatch but does not transform params. Omitting params differs from sending JSON `null`. Lifecycle methods remain unavailable.

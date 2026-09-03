@@ -23,13 +23,13 @@ def main() -> None:
             capture_output=True,
         ).stdout
     )
-    package = next(item for item in metadata["packages"] if item["name"] == "lspc")
+    package = next(item for item in metadata["packages"] if item["name"] == "lspctl")
     subprocess.run(["cargo", "package", "--locked", "--allow-dirty", "--no-verify"], cwd=ROOT, check=True)
-    crate = ROOT / "target/package" / f"lspc-{package['version']}.crate"
+    crate = ROOT / "target/package" / f"lspctl-{package['version']}.crate"
     if not crate.is_file():
         raise SystemExit("cargo package did not create the expected crate")
     with tempfile.TemporaryDirectory(
-        prefix="lspc-install-", ignore_cleanup_errors=True
+        prefix="lspctl-install-", ignore_cleanup_errors=True
     ) as temporary:
         root = Path(temporary)
         subprocess.run(
@@ -38,12 +38,12 @@ def main() -> None:
             check=True,
         )
         suffix = ".exe" if os.name == "nt" else ""
-        if not (root / "bin" / f"lspc{suffix}").is_file():
-            raise SystemExit("locked source installation did not install lspc")
-        if (root / "bin" / f"lspc-fake-server{suffix}").exists():
+        if not (root / "bin" / f"lspctl{suffix}").is_file():
+            raise SystemExit("locked source installation did not install lspctl")
+        if (root / "bin" / f"lspctl-fake-server{suffix}").exists():
             raise SystemExit("locked source installation included test-only fake server")
         subprocess.run(
-            [str(root / "bin" / f"lspc{suffix}"), "schema", "--full"],
+            [str(root / "bin" / f"lspctl{suffix}"), "schema", "--full"],
             check=True,
             stdout=subprocess.DEVNULL,
         )

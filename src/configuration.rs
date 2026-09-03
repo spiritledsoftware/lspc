@@ -252,7 +252,7 @@ pub(crate) fn load_configuration(
         .map_err(|()| workspace_failure("The Workspace path cannot be represented as a file URI."))?
         .to_string();
     let user_path = resolved_user_config_path()?;
-    let project_path = workspace.join(".lspc.toml");
+    let project_path = workspace.join(".lspctl.toml");
     let user = read_optional_toml::<UserConfigFile>(&user_path)?;
     let project = if ignore_project {
         None
@@ -539,7 +539,7 @@ pub(crate) fn session_identity(
         })
         .collect::<Vec<_>>();
     let digest = digest_canonical_value(
-        "lspc-session-identity-v1",
+        "lspctl-session-identity-v1",
         &json!({
             "workspaceUri": configuration.workspace_uri,
             "server": server.name,
@@ -615,7 +615,7 @@ pub(crate) fn resolved_user_config_path() -> Result<PathBuf, ContractFailure> {
         if !path.is_absolute() {
             return Err(user_path_failure("XDG_CONFIG_HOME is not absolute."));
         }
-        return Ok(path.join("lspc/config.toml"));
+        return Ok(path.join("lspctl/config.toml"));
     }
     #[cfg(windows)]
     if let Some(app_data) = env::var_os("APPDATA") {
@@ -623,9 +623,9 @@ pub(crate) fn resolved_user_config_path() -> Result<PathBuf, ContractFailure> {
         if !path.is_absolute() {
             return Err(user_path_failure("APPDATA is not absolute."));
         }
-        return Ok(path.join("lspc/config.toml"));
+        return Ok(path.join("lspctl/config.toml"));
     }
-    directories::ProjectDirs::from("", "", "lspc")
+    directories::ProjectDirs::from("", "", "lspctl")
         .map(|directories| directories.config_dir().join("config.toml"))
         .ok_or_else(|| {
             user_path_failure("The operating system user configuration directory is unavailable.")
@@ -636,9 +636,9 @@ pub(crate) fn resolved_user_state_directory() -> Option<PathBuf> {
     #[cfg(windows)]
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         let path = PathBuf::from(local_app_data);
-        return path.is_absolute().then(|| path.join("lspc"));
+        return path.is_absolute().then(|| path.join("lspctl"));
     }
-    directories::ProjectDirs::from("", "", "lspc").map(|directories| {
+    directories::ProjectDirs::from("", "", "lspctl").map(|directories| {
         directories
             .state_dir()
             .unwrap_or_else(|| directories.data_local_dir())
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn strict_project_config_merges_with_user_independently() {
         let workspace = TempDir::new().unwrap();
-        let mut project = fs::File::create(workspace.path().join(".lspc.toml")).unwrap();
+        let mut project = fs::File::create(workspace.path().join(".lspctl.toml")).unwrap();
         writeln!(
             project,
             "version = 1\n[servers.rust]\nexecutable = \"rust-analyzer\"\nargs = [\"--stdio\"]"

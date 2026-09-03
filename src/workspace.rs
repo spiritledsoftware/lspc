@@ -698,7 +698,7 @@ fn canonical_search_start(
 fn nearest_project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|ancestor| ancestor.join(".lspc.toml").is_file())
+        .find(|ancestor| ancestor.join(".lspctl.toml").is_file())
         .map(Path::to_path_buf)
 }
 
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn workspace_selection_uses_nearest_configuration_without_git() {
         let root = TempDir::new().unwrap();
-        fs::write(root.path().join(".lspc.toml"), "version = 1").unwrap();
+        fs::write(root.path().join(".lspctl.toml"), "version = 1").unwrap();
         let nested = root.path().join("src/nested");
         fs::create_dir_all(&nested).unwrap();
         let file = nested.join("main.rs");
@@ -831,7 +831,7 @@ mod tests {
     fn workspace_selection_rejects_different_implied_roots() {
         let current = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
-        fs::write(project.path().join(".lspc.toml"), "version = 1").unwrap();
+        fs::write(project.path().join(".lspctl.toml"), "version = 1").unwrap();
         let project_file = project.path().join("main.rs");
         let unrelated_file = current.path().join("other.rs");
         fs::write(&project_file, "").unwrap();

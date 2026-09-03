@@ -24,10 +24,10 @@ def native(path: Path) -> Path:
 def soak_user_config_path(env: dict[str, str]) -> Path:
     system = platform.system()
     if system == "Windows":
-        return Path(env["APPDATA"]) / "lspc/config.toml"
+        return Path(env["APPDATA"]) / "lspctl/config.toml"
     if system == "Darwin":
-        return Path(env["HOME"]) / "Library/Application Support/lspc/config.toml"
-    return Path(env["XDG_CONFIG_HOME"]) / "lspc/config.toml"
+        return Path(env["HOME"]) / "Library/Application Support/lspctl/config.toml"
+    return Path(env["XDG_CONFIG_HOME"]) / "lspctl/config.toml"
 
 
 def endpoint(root: Path) -> dict[str, object]:
@@ -42,10 +42,10 @@ def command(binary: Path, env: dict[str, str], *arguments: str) -> tuple[dict[st
     result = subprocess.run([str(binary), *arguments], env=env, capture_output=True)
     elapsed_ms = (time.perf_counter() - started) * 1000
     if result.stderr:
-        raise SystemExit(f"lspc emitted stderr: {result.stderr.decode(errors='replace')}")
+        raise SystemExit(f"lspctl emitted stderr: {result.stderr.decode(errors='replace')}")
     output = json.loads(result.stdout)
     if result.returncode != 0 or output.get("ok") is not True:
-        raise SystemExit(f"lspc command failed: {output!r}")
+        raise SystemExit(f"lspctl command failed: {output!r}")
     return output, elapsed_ms
 
 
@@ -131,7 +131,7 @@ def main() -> None:
     if arguments.queries < 2:
         raise SystemExit("soak needs at least two measured Queries")
 
-    with tempfile.TemporaryDirectory(prefix="lspc-soak-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="lspctl-soak-") as temporary:
         root = Path(temporary)
         workspace = root / "workspace"
         workspace.mkdir()

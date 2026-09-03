@@ -36,7 +36,7 @@ use super::planner::windows_security_descriptor;
 
 type ReauthorizePreview<'a> = dyn Fn(&StoredPreview) -> Result<Vec<Value>, ContractFailure> + 'a;
 type PostCommit<'a> = dyn FnMut(&ReceiptRecord, &[Value]) -> bool + 'a;
-const ARTIFACT_OWNER_FILE: &str = ".lspc-transaction-owner";
+const ARTIFACT_OWNER_FILE: &str = ".lspctl-transaction-owner";
 
 pub(crate) struct ApplicationContext<'a> {
     pub(crate) store: &'a MutationStateStore,
@@ -174,7 +174,7 @@ pub(crate) fn apply_preview(
     let transaction_id = context.store.new_transaction_id()?;
     let artifact_directory = stored
         .workspace_path
-        .join(format!(".lspc-{transaction_id}"));
+        .join(format!(".lspctl-{transaction_id}"));
     let mut transaction = TransactionRecord {
         format_version: MUTATION_STATE_VERSION,
         transaction_id: transaction_id.clone(),
@@ -1915,7 +1915,7 @@ fn cleanup_transaction_artifacts(transaction: &TransactionRecord) -> Result<(), 
     if transaction.artifact_directory.exists() {
         let expected_directory = transaction
             .workspace_path
-            .join(format!(".lspc-{}", transaction.transaction_id));
+            .join(format!(".lspctl-{}", transaction.transaction_id));
         if transaction.artifact_directory != expected_directory {
             return Err("The transaction artifact path is not canonical.".to_owned());
         }
@@ -2401,7 +2401,7 @@ mod tests {
     #[test]
     fn staging_never_cleans_an_unowned_artifact_path() {
         let workspace = TempDir::new().unwrap();
-        let artifact_directory = workspace.path().join(".lspc-collision");
+        let artifact_directory = workspace.path().join(".lspctl-collision");
         fs::create_dir(&artifact_directory).unwrap();
         let sentinel = artifact_directory.join("sentinel");
         fs::write(&sentinel, "owned by the workspace").unwrap();
@@ -2487,7 +2487,7 @@ mod tests {
             .plan_workspace_edit(&json!({"changes": {file_uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "longer"}]}}))
             .unwrap();
         let transaction_id = "txn_00000000000000000000000000000000";
-        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let artifact_directory = workspace.path().join(format!(".lspctl-{transaction_id}"));
         let transaction = TransactionRecord {
             format_version: MUTATION_STATE_VERSION,
             transaction_id: transaction_id.to_owned(),
@@ -2574,7 +2574,7 @@ mod tests {
             ]}))
             .unwrap();
         let transaction_id = "txn_00000000000000000000000000000000";
-        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let artifact_directory = workspace.path().join(format!(".lspctl-{transaction_id}"));
         let transaction = TransactionRecord {
             format_version: MUTATION_STATE_VERSION,
             transaction_id: transaction_id.to_owned(),
@@ -2643,7 +2643,7 @@ mod tests {
             .plan_workspace_edit(&json!({"changes": {file_uri: [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "longer"}]}}))
             .unwrap();
         let transaction_id = "txn_00000000000000000000000000000000";
-        let artifact_directory = workspace.path().join(format!(".lspc-{transaction_id}"));
+        let artifact_directory = workspace.path().join(format!(".lspctl-{transaction_id}"));
         let transaction = TransactionRecord {
             format_version: MUTATION_STATE_VERSION,
             transaction_id: transaction_id.to_owned(),

@@ -645,7 +645,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lspc"
+name = "lspctl"
 version = "0.1.0"
 dependencies = [
  "async-lsp",

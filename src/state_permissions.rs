@@ -41,7 +41,7 @@ pub(crate) fn restrict_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-compile_error!("lspc state privacy is implemented only for its supported Unix and Windows hosts");
+compile_error!("lspctl state privacy is implemented only for its supported Unix and Windows hosts");
 
 #[cfg(windows)]
 mod windows {

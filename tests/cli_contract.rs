@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 #[test]
 fn version_command_and_alias_emit_the_same_machine_envelope() {
-    let command_output = run_lspc(&["version"]);
-    let alias_output = run_lspc(&["--version"]);
+    let command_output = run_lspctl(&["version"]);
+    let alias_output = run_lspctl(&["--version"]);
 
     assert!(command_output.status.success());
     assert!(command_output.stderr.is_empty());
@@ -16,7 +16,7 @@ fn version_command_and_alias_emit_the_same_machine_envelope() {
     assert_eq!(envelope["schemaVersion"], 1);
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["command"], json!(["version"]));
-    assert_eq!(envelope["result"]["name"], "lspc");
+    assert_eq!(envelope["result"]["name"], "lspctl");
     assert_eq!(envelope["result"]["version"], "0.1.0");
     assert_eq!(envelope["result"]["contractVersion"], 1);
     assert_eq!(envelope["result"]["configVersion"], 1);
@@ -31,7 +31,7 @@ fn version_command_and_alias_emit_the_same_machine_envelope() {
 
 #[test]
 fn invalid_cli_emits_a_structured_failure_without_stderr() {
-    let output = run_lspc(&["-V"]);
+    let output = run_lspctl(&["-V"]);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
@@ -54,7 +54,7 @@ fn invalid_cli_emits_a_structured_failure_without_stderr() {
 
 #[test]
 fn schema_help_and_group_help_are_machine_readable() {
-    let schema = run_lspc(&["schema"]);
+    let schema = run_lspctl(&["schema"]);
     assert!(schema.status.success());
     assert!(schema.stderr.is_empty());
     let schema: Value = serde_json::from_slice(&schema.stdout).unwrap();
@@ -67,13 +67,13 @@ fn schema_help_and_group_help_are_machine_readable() {
         41
     );
 
-    let root_help = run_lspc(&["--help"]);
-    let named_help = run_lspc(&["help"]);
+    let root_help = run_lspctl(&["--help"]);
+    let named_help = run_lspctl(&["help"]);
     assert_eq!(root_help.stdout, named_help.stdout);
     let help: Value = serde_json::from_slice(&root_help.stdout).unwrap();
     assert_eq!(help["command"], json!(["help"]));
 
-    let group_help = run_lspc(&["trust", "--help"]);
+    let group_help = run_lspctl(&["trust", "--help"]);
     assert!(group_help.status.success());
     let group_help: Value = serde_json::from_slice(&group_help.stdout).unwrap();
     assert_eq!(group_help["command"], json!(["help", "trust"]));
@@ -89,7 +89,7 @@ fn schema_help_and_group_help_are_machine_readable() {
 
 #[test]
 fn full_and_focused_schema_results_use_the_frozen_registry() {
-    let full = run_lspc(&["schema", "--full"]);
+    let full = run_lspctl(&["schema", "--full"]);
     assert!(full.status.success());
     let full: Value = serde_json::from_slice(&full.stdout).unwrap();
     assert_eq!(full["result"]["schemas"].as_object().unwrap().len(), 243);
@@ -101,26 +101,27 @@ fn full_and_focused_schema_results_use_the_frozen_registry() {
         41
     );
 
-    let focused = run_lspc(&["schema", "definition"]);
+    let focused = run_lspctl(&["schema", "definition"]);
     assert!(focused.status.success());
     let focused: Value = serde_json::from_slice(&focused.stdout).unwrap();
     assert_eq!(focused["command"], json!(["schema", "definition"]));
     let schemas = focused["result"]["schemas"].as_object().unwrap();
-    assert!(schemas.contains_key("lspc://schema/v1/cli/definition"));
-    assert!(schemas.contains_key("lspc://schema/v1/command/definition"));
+    assert!(schemas.contains_key("lspctl://schema/v1/cli/definition"));
+    assert!(schemas.contains_key("lspctl://schema/v1/command/definition"));
     assert_eq!(
-        schemas["lspc://schema/v1/output/query-context"]["properties"]["serverProgress"]["items"]["$ref"],
-        "lspc://schema/v1/output/progress-record"
+        schemas["lspctl://schema/v1/output/query-context"]["properties"]["serverProgress"]["items"]
+            ["$ref"],
+        "lspctl://schema/v1/output/progress-record"
     );
 
-    let invalid = run_lspc(&["schema", "no-such-subject"]);
+    let invalid = run_lspctl(&["schema", "no-such-subject"]);
     assert_eq!(invalid.status.code(), Some(2));
     let invalid: Value = serde_json::from_slice(&invalid.stdout).unwrap();
     assert_eq!(invalid["error"]["code"], "invalid_arguments");
 }
 
-fn run_lspc(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lspc"))
+fn run_lspctl(arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lspctl"))
         .args(arguments)
         .output()
         .unwrap()

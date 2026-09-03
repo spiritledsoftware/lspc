@@ -382,13 +382,13 @@ impl SessionDispatcher for OwnerQueryDispatcher<'_> {
         if let Some(params) = request.params.as_mut() {
             if request.partial_results && params.is_object() {
                 params["partialResultToken"] = json!(format!(
-                    "lspc-partial-{}",
+                    "lspctl-partial-{}",
                     random_hex(16).map_err(DispatchFailure::from)?
                 ));
             }
             if request.work_done_progress && params.is_object() {
                 params["workDoneToken"] = json!(format!(
-                    "lspc-work-{}",
+                    "lspctl-work-{}",
                     random_hex(16).map_err(DispatchFailure::from)?
                 ));
             }

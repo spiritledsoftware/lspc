@@ -30,7 +30,7 @@ impl Fixture {
             let config = root.path().join("config");
             let state = root.path().join("state");
             (
-                config.join("lspc/config.toml"),
+                config.join("lspctl/config.toml"),
                 vec![
                     ("XDG_CONFIG_HOME".to_owned(), config),
                     ("XDG_STATE_HOME".to_owned(), state),
@@ -43,7 +43,7 @@ impl Fixture {
         let (config, environment) = {
             let home = root.path().join("home");
             (
-                home.join("Library/Application Support/lspc/config.toml"),
+                home.join("Library/Application Support/lspctl/config.toml"),
                 vec![("HOME".to_owned(), home)],
             )
         };
@@ -54,7 +54,7 @@ impl Fixture {
             let roaming = home.join("AppData/Roaming");
             let local = home.join("AppData/Local");
             (
-                roaming.join("lspc/config.toml"),
+                roaming.join("lspctl/config.toml"),
                 vec![
                     ("APPDATA".to_owned(), roaming),
                     ("LOCALAPPDATA".to_owned(), local),
@@ -72,7 +72,7 @@ impl Fixture {
             config,
             format!(
                 "version = 1\ndefault_server = \"fake\"\nroutes = [{{ server = \"fake\", language_id = \"rust\", extensions = [\".rs\"] }}]\n[servers.fake]\nexecutable = {:?}\nargs = {}\n",
-                env!("CARGO_BIN_EXE_lspc-fake-server"), arguments
+                env!("CARGO_BIN_EXE_lspctl-fake-server"), arguments
             ),
         )
         .unwrap();
@@ -106,7 +106,7 @@ impl Fixture {
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_lspc"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lspctl"));
         command.args(arguments);
         for (name, value) in &self.environment {
             command.env(name, value);

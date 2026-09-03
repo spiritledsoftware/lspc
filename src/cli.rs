@@ -200,7 +200,7 @@ fn dispatch_mutation(invocation: ParsedInvocation) -> ExitCode {
 
 fn build_cli_command() -> Command {
     let catalog = contract_catalog();
-    let mut root = base_command("lspc");
+    let mut root = base_command("lspctl");
     let mut paths = BTreeMap::<String, Vec<&Value>>::new();
     for command in catalog["commands"].as_array().unwrap() {
         let path = command["path"].as_array().unwrap();
@@ -409,7 +409,7 @@ fn one_of_prefixed_hex_parser(prefixes: &'static [&'static str]) -> ValueParser 
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             })
             .map(|_| value.to_owned())
-            .ok_or_else(|| "value is not a recognized lspc state identifier".to_owned())
+            .ok_or_else(|| "value is not a recognized lspctl state identifier".to_owned())
     })
 }
 
@@ -660,7 +660,7 @@ fn emit_envelope(envelope: &impl Serialize, success: ExitCode) -> ExitCode {
 fn serialization_failure() -> ExitCode {
     let _ = writeln!(
         io::stderr().lock(),
-        "lspc: failed to serialize the result envelope"
+        "lspctl: failed to serialize the result envelope"
     );
     ExitCode::from(INTERNAL_ERROR_EXIT_CODE)
 }
@@ -680,7 +680,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.as_str().unwrap())
                 .collect::<Vec<_>>();
-            let mut arguments = vec!["lspc"];
+            let mut arguments = vec!["lspctl"];
             arguments.extend(path);
             for flag in definition["requiredFlags"]
                 .as_array()

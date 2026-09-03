@@ -66,7 +66,7 @@ class Smoke:
 def fixture(kind: str, workspace: Path) -> tuple[Path, int, int, str]:
     if kind == "rust":
         (workspace / "Cargo.toml").write_text(
-            '[package]\nname = "lspc-reference"\nversion = "0.1.0"\nedition = "2024"\n',
+            '[package]\nname = "lspctl-reference"\nversion = "0.1.0"\nedition = "2024"\n',
             encoding="utf-8",
         )
         source = workspace / "src/main.rs"
@@ -111,7 +111,7 @@ def validate_outputs(
     for output in outputs:
         command = "/".join(output["command"])
         suffix = "success" if output["ok"] else "failure"
-        uri = f"lspc://schema/v1/command/{command}/{suffix}"
+        uri = f"lspctl://schema/v1/command/{command}/{suffix}"
         Draft202012Validator(schemas[uri], registry=registry).validate(output)
     return True
 
@@ -130,7 +130,7 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.binary = native(arguments.binary.resolve())
 
-    with tempfile.TemporaryDirectory(prefix=f"lspc-reference-{arguments.server}-") as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"lspctl-reference-{arguments.server}-") as temporary:
         root = Path(temporary)
         workspace = root / "workspace"
         workspace.mkdir()
@@ -145,7 +145,7 @@ def main() -> None:
             f"executable = {toml_string(str(arguments.executable.resolve()))}",
             "args = " + json.dumps(arguments.server_arg),
         ]
-        (workspace / ".lspc.toml").write_text("\n".join(config) + "\n", encoding="utf-8")
+        (workspace / ".lspctl.toml").write_text("\n".join(config) + "\n", encoding="utf-8")
         env = environment(root)
         smoke = Smoke(arguments.binary, workspace, env)
         workspace_text = str(workspace)

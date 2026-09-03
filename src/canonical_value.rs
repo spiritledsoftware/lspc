@@ -75,16 +75,16 @@ mod tests {
         let right = json!({"a": -1, "b": [true, null]});
 
         assert_eq!(
-            digest_canonical_value("lspc-test-v1", &left),
-            digest_canonical_value("lspc-test-v1", &right)
+            digest_canonical_value("lspctl-test-v1", &left),
+            digest_canonical_value("lspctl-test-v1", &right)
         );
         assert_ne!(
-            digest_canonical_value("lspc-test-v1", &left),
-            digest_canonical_value("lspc-other-v1", &left)
+            digest_canonical_value("lspctl-test-v1", &left),
+            digest_canonical_value("lspctl-other-v1", &left)
         );
         assert_eq!(
-            digest_canonical_value("lspc-test-v1", &json!(0.0)),
-            digest_canonical_value("lspc-test-v1", &json!(-0.0))
+            digest_canonical_value("lspctl-test-v1", &json!(0.0)),
+            digest_canonical_value("lspctl-test-v1", &json!(-0.0))
         );
     }
 }

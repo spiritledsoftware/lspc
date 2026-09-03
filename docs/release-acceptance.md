@@ -2,7 +2,7 @@
 
 The CI matrix runs current stable and Rust 1.89 on Ubuntu, macOS, and Windows.
 Each cell checks formatting, Clippy with warnings denied, tests, and that
-`lspc schema --full` exactly exposes the checked contract assets. Product
+`lspctl schema --full` exactly exposes the checked contract assets. Product
 checks have no retry step. A clean rerun is allowed only for an infrastructure
 failure and must retain both attempts.
 
@@ -16,7 +16,7 @@ unreviewed licenses for the five release targets. See
 `scripts/release/package.py` builds a target-native release binary and invokes
 `build_archive.py`. The latter emits a deterministic target-named `.tar.gz`
 or `.zip`, its SHA-256 sidecar, and a payload manifest. Archives contain the
-binary, README, both licenses, `skills/lspc/`, and a manifest with the release
+binary, README, both licenses, `skills/lspctl/`, and a manifest with the release
 version, target, source commit, Rust version, skill digest, and per-file
 checksums. The script rejects missing or symlinked skill payloads.
 

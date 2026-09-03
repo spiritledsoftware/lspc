@@ -1,11 +1,11 @@
 [package]
-name = "lspc"
+name = "lspctl"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-default-run = "lspc"
+default-run = "lspctl"
 description = "Agent-facing command-line client for Language Server Protocol servers"
-repository = "https://github.com/spiritledsoftware/lspc"
+repository = "https://github.com/spiritledsoftware/lspctl"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
@@ -53,6 +53,6 @@ windows-sys = { version = "0.61", features = [
 tempfile = "3"
 
 [[bin]]
-name = "lspc-fake-server"
+name = "lspctl-fake-server"
 path = "test_support/fake_lsp_server.rs"
 required-features = ["fake-server"]

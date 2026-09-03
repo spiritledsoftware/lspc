@@ -29,26 +29,26 @@ def main() -> None:
     if not arguments.commit:
         arguments.commit = command(["git", "rev-parse", "HEAD"])
     metadata = json.loads(command(["cargo", "metadata", "--locked", "--no-deps", "--format-version=1"]))
-    package = next(item for item in metadata["packages"] if item["name"] == "lspc")
+    package = next(item for item in metadata["packages"] if item["name"] == "lspctl")
     target = None if arguments.skill_only else arguments.target
     suffix = ".exe" if ("windows" in arguments.target if target else os.name == "nt") else ""
     build = ["cargo", "build", "--locked", "--release"]
     if target:
         build.extend(("--target", target))
-    environment = {**os.environ, "LSPC_BUILD_COMMIT": arguments.commit}
+    environment = {**os.environ, "LSPCTL_BUILD_COMMIT": arguments.commit}
     if target and "windows-msvc" in target:
         environment["RUSTFLAGS"] = f'{environment.get("RUSTFLAGS", "")} -C target-feature=+crt-static'.strip()
     subprocess.run(build, cwd=ROOT, check=True, env=environment)
-    binary = ROOT / "target" / (Path(arguments.target) / "release" if target else Path("release")) / f"lspc{suffix}"
+    binary = ROOT / "target" / (Path(arguments.target) / "release" if target else Path("release")) / f"lspctl{suffix}"
     rust_version = command(["rustc", "-Vv"]).splitlines()[0]
     if target:
         subprocess.run([sys.executable, str(ROOT / "scripts/release/build_archive.py"), "--binary", str(binary), "--target", arguments.target, "--version", package["version"], "--commit", arguments.commit, "--rust-version", rust_version, "--output-dir", str(arguments.output_dir)], cwd=ROOT, check=True)
         extension = "zip" if "windows" in arguments.target else "tar.gz"
-        archive = arguments.output_dir / f"lspc-v{package['version']}-{arguments.target}.{extension}"
+        archive = arguments.output_dir / f"lspctl-v{package['version']}-{arguments.target}.{extension}"
         subprocess.run([sys.executable, str(ROOT / "scripts/release/verify_archive.py"), str(archive), "--target", arguments.target, "--version", package["version"]], cwd=ROOT, check=True)
     if arguments.skill_only:
         schema = subprocess.run([str(binary), "schema", "--full"], check=True, capture_output=True).stdout
-        with tempfile.TemporaryDirectory(prefix="lspc-skill-schema-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="lspctl-skill-schema-") as temporary:
             schema_path = Path(temporary) / "schema.json"
             schema_path.write_bytes(schema)
             subprocess.run([sys.executable, str(ROOT / "scripts/release/build_skill_archive.py"), "--version", package["version"], "--schema-json", str(schema_path), "--output-dir", str(arguments.output_dir)], cwd=ROOT, check=True)

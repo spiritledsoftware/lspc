@@ -40,7 +40,7 @@ def main() -> None:
     archive = arguments.archive
     if not archive.is_file() or archive.is_symlink():
         fail("archive is missing or unsafe")
-    prefix = f"lspc-v{arguments.version}-{arguments.target}"
+    prefix = f"lspctl-v{arguments.version}-{arguments.target}"
     contents = entries(archive)
     manifest_path = f"{prefix}/manifest.json"
     if manifest_path not in contents:
@@ -51,7 +51,7 @@ def main() -> None:
         fail("manifest is not JSON")
     if not isinstance(manifest, dict) or manifest.get("formatVersion") != 1:
         fail("manifest format version is unsupported")
-    if manifest.get("name") != "lspc" or manifest.get("version") != arguments.version:
+    if manifest.get("name") != "lspctl" or manifest.get("version") != arguments.version:
         fail("manifest identity does not match the requested release")
     if manifest.get("target") != arguments.target:
         fail("manifest target does not match the requested target")
@@ -79,8 +79,8 @@ def main() -> None:
     actual = {name.removeprefix(f"{prefix}/") for name in contents if name != manifest_path}
     if actual != declared:
         fail("archive payload does not exactly match its manifest")
-    required = {"README.md", "LICENSE-MIT", "LICENSE-APACHE", "lspc.exe" if "windows" in arguments.target else "lspc"}
-    if not required <= declared or not any(path.startswith("skills/lspc/") for path in declared):
+    required = {"README.md", "LICENSE-MIT", "LICENSE-APACHE", "lspctl.exe" if "windows" in arguments.target else "lspctl"}
+    if not required <= declared or not any(path.startswith("skills/lspctl/") for path in declared):
         fail("archive lacks a required release payload")
     checksum = archive.with_suffix(archive.suffix + ".sha256")
     expected_checksum = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"

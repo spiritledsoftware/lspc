@@ -1,12 +1,12 @@
-# lspc
+# lspctl
 
-[![Crates.io](https://img.shields.io/crates/v/lspc.svg)](https://crates.io/crates/lspc)
-[![Acceptance](https://github.com/spiritledsoftware/lspc/actions/workflows/ci.yml/badge.svg)](https://github.com/spiritledsoftware/lspc/actions/workflows/ci.yml)
-[![License](https://img.shields.io/crates/l/lspc.svg)](LICENSE-MIT)
+[![Crates.io](https://img.shields.io/crates/v/lspctl.svg)](https://crates.io/crates/lspctl)
+[![Acceptance](https://github.com/spiritledsoftware/lspctl/actions/workflows/ci.yml/badge.svg)](https://github.com/spiritledsoftware/lspctl/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/lspctl.svg)](LICENSE-MIT)
 
 **Language-server code intelligence for coding agents and shell scripts.**
 
-`lspc` lets tools query installed Language Server Protocol servers without
+`lspctl` lets tools query installed Language Server Protocol servers without
 embedding an editor. It returns one versioned JSON object per invocation and
 keeps language servers warm between calls.
 
@@ -19,17 +19,17 @@ keeps language servers warm between calls.
 
 ## Install
 
-Install from [crates.io](https://crates.io/crates/lspc) with Rust 1.89 or newer:
+Install from [crates.io](https://crates.io/crates/lspctl) with Rust 1.89 or newer:
 
 ```sh
-cargo install lspc --locked
-lspc version | jq
+cargo install lspctl --locked
+lspctl version | jq
 ```
 
 Prebuilt archives and SHA-256 checksums are available on the
-[Releases page](https://github.com/spiritledsoftware/lspc/releases).
+[Releases page](https://github.com/spiritledsoftware/lspctl/releases).
 
-`lspc` launches language servers but does not install them. Install the server
+`lspctl` launches language servers but does not install them. Install the server
 you want to use separately. The examples below also use
 [`jq`](https://jqlang.org/) to format and select JSON output.
 
@@ -40,7 +40,7 @@ you want to use separately. The examples below also use
 Find the native user configuration path:
 
 ```sh
-lspc schema config user | jq -r '.result.resolvedPath'
+lspctl schema config user | jq -r '.result.resolvedPath'
 ```
 
 Create that file with a server declaration and route. For example, if
@@ -63,12 +63,12 @@ executable = "rust-analyzer"
 Run these from a Rust workspace:
 
 ```sh
-lspc capabilities --workspace . --server rust | jq '.result'
+lspctl capabilities --workspace . --server rust | jq '.result'
 
-lspc definition --workspace . --server rust \
+lspctl definition --workspace . --server rust \
   --file src/main.rs --line 12 --column 8 | jq '.result'
 
-lspc references --workspace . --server rust \
+lspctl references --workspace . --server rust \
   --file src/main.rs --line 12 --column 8 \
   --include-declaration true | jq '.result'
 ```
@@ -78,7 +78,7 @@ answer an early navigation query before background indexing finishes. Inspect
 progress and retry after it clears when an expected result is empty:
 
 ```sh
-lspc session status --workspace . --server rust | jq '.result.progress'
+lspctl session status --workspace . --server rust | jq '.result.progress'
 ```
 
 ## Preview and apply changes
@@ -88,22 +88,22 @@ for inspection:
 
 ```sh
 preview_id=$(
-  lspc rename --workspace . --server rust \
+  lspctl rename --workspace . --server rust \
     --file src/main.rs --line 12 --column 8 --new-name replacement |
   jq -r '.result.previewId'
 )
 
-lspc preview show "$preview_id" | jq -r '.result.diff'
-lspc apply "$preview_id" | jq
+lspctl preview show "$preview_id" | jq -r '.result.diff'
+lspctl apply "$preview_id" | jq
 ```
 
-Before applying, `lspc` rechecks the inspected Preview against the Workspace,
+Before applying, `lspctl` rechecks the inspected Preview against the Workspace,
 server configuration, authorization, and filesystem state. Every completed
 Application records a durable Receipt; stale changes have no force-apply path.
 
 ## Project configuration and Trust
 
-A repository may commit a `.lspc.toml` using the same `version`, `routes`, and
+A repository may commit a `.lspctl.toml` using the same `version`, `routes`, and
 `servers` structure as the user configuration. Project-controlled server launch
 fields require an explicit, declaration-bound Trust grant before execution.
 
@@ -117,10 +117,10 @@ launch fields do not require a project Trust grant.
 The CLI is JSON-only, including help and errors:
 
 ```sh
-lspc help | jq                         # compact command index
-lspc help definition | jq              # one command
-lspc schema definition | jq            # exact input and output schemas
-lspc schema --full > lspc-schema.json  # complete registry for tooling
+lspctl help | jq                         # compact command index
+lspctl help definition | jq              # one command
+lspctl schema definition | jq            # exact input and output schemas
+lspctl schema --full > lspctl-schema.json  # complete registry for tooling
 ```
 
 Branch on stable fields such as `ok`, `error.code`, `error.retry`, and
@@ -132,10 +132,10 @@ the source of truth for its command syntax.
 Install the bundled workflow guidance into the current repository:
 
 ```sh
-lspc skill install
+lspctl skill install
 ```
 
-This writes `.agent/skills/lspc`. Use `lspc skill install --global` to install
+This writes `.agent/skills/lspctl`. Use `lspctl skill install --global` to install
 it under your home directory instead. Existing unmanaged files are not replaced
 without `--replace`.
 

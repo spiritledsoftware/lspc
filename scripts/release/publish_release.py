@@ -39,10 +39,10 @@ def sha256(path: Path) -> str:
 
 def expected_assets(directory: Path, version: str) -> list[Path]:
     archives = [
-        directory / f"lspc-v{version}-{target}.{extension}"
+        directory / f"lspctl-v{version}-{target}.{extension}"
         for target, extension in TARGETS
     ]
-    archives.append(directory / f"lspc-agent-skill-v{version}.zip")
+    archives.append(directory / f"lspctl-agent-skill-v{version}.zip")
     assets = []
     for archive in archives:
         checksum = archive.with_suffix(archive.suffix + ".sha256")
@@ -95,7 +95,7 @@ def upload_missing_assets(tag: str, assets: list[Path], state: dict[str, object]
         if asset.name not in existing:
             run(["gh", "release", "upload", tag, str(asset)])
             continue
-        with tempfile.TemporaryDirectory(prefix="lspc-release-asset-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="lspctl-release-asset-") as temporary:
             run(
                 [
                     "gh",
@@ -117,8 +117,8 @@ def upload_missing_assets(tag: str, assets: list[Path], state: dict[str, object]
 
 def crates_io_checksum(version: str) -> str | None:
     request = urllib.request.Request(
-        f"https://crates.io/api/v1/crates/lspc/{version}",
-        headers={"User-Agent": "lspc-release-workflow/1"},
+        f"https://crates.io/api/v1/crates/lspctl/{version}",
+        headers={"User-Agent": "lspctl-release-workflow/1"},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -131,7 +131,7 @@ def crates_io_checksum(version: str) -> str | None:
 
 def publish_crate(version: str) -> None:
     run(["cargo", "package", "--locked"])
-    package = ROOT / "target/package" / f"lspc-{version}.crate"
+    package = ROOT / "target/package" / f"lspctl-{version}.crate"
     local_checksum = sha256(package)
     published_checksum = crates_io_checksum(version)
     if published_checksum is None:

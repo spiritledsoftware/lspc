@@ -36,7 +36,7 @@ def native(path: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("server", choices=["rust-analyzer", "typescript-language-server", "basedpyright"])
-    parser.add_argument("--binary", type=Path, default=ROOT / "target" / "debug" / ("lspc.exe" if os.name == "nt" else "lspc"))
+    parser.add_argument("--binary", type=Path, default=ROOT / "target" / "debug" / ("lspctl.exe" if os.name == "nt" else "lspctl"))
     parser.add_argument("--tools", type=Path, default=ROOT / ".reference-tools")
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()

@@ -1,4 +1,4 @@
-# Mutations with lspc
+# Mutations with lspctl
 
 Load this reference for any Query or server callback that can change Workspace resources.
 
@@ -15,7 +15,7 @@ Named `rename`, `format`, and a resolved code action containing an edit return e
 Run the schema-validated form of:
 
 ```sh
-lspc preview show PREVIEW_ID
+lspctl preview show PREVIEW_ID
 ```
 
 Inspect the lossless Workspace Edit, canonical plan, annotations, preconditions, conflicts, stale reasons, summary, and contextual diff. A Stale Preview may remain inspectable while its diff is unavailable.
@@ -27,7 +27,7 @@ An explicit request to rename, format, or apply a selected action authorizes onl
 Run the schema-validated form of:
 
 ```sh
-lspc apply PREVIEW_ID
+lspctl apply PREVIEW_ID
 ```
 
 Application revalidates the Preview's Workspace, server identity, authorization, and filesystem preconditions. There is no force, rebase, subset, or edit-at-apply shortcut.
@@ -46,7 +46,7 @@ Preview creation alone is a valid stopping point when the human asked only to in
 When Recovery is required, run:
 
 ```sh
-lspc recovery status --workspace WORKSPACE
+lspctl recovery status --workspace WORKSPACE
 ```
 
 Report the transaction ID, manifest digest, affected resources, current state, and available schema-declared Recovery actions. Do not run `rollback` or `accept-current` without explicit human authorization for that transaction and digest. After Recovery, retain its Receipt and confirm that the Workspace write stop cleared before another Application.
