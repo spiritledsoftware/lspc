@@ -35,7 +35,7 @@
     {
       "name": "native-floor-acceptance",
       "state": "implemented",
-      "reason": "Linux artifacts build and smoke in native manylinux 2.28 containers; self-hosted Intel/ARM macOS 12 and Windows Server 2019 floor runners smoke extracted archives, while every artifact also receives a static floor audit."
+      "reason": "Linux artifacts build and smoke in native manylinux 2.28 containers; static audits enforce the macOS 12 and Windows 10 1809 / Server 2019 floors, and hosted native runners smoke every extracted archive."
     },
     {
       "name": "stored-state-compatibility",
