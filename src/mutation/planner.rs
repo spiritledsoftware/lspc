@@ -521,46 +521,34 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 entry.insert(before);
             }
         }
-        let directory_digests = virtual_workspace
-            .entries
-            .iter()
-            .filter(|(_, state)| state.manifest.resource_kind == ResourceKind::Directory)
-            .map(|(path, _)| {
-                let children = virtual_workspace
-                    .entries
-                    .range(path.clone()..)
-                    .take_while(|(child, _)| child.starts_with(path))
-                    .filter(|(child, state)| {
-                        child.parent() == Some(path.as_path()) && state.manifest.exists
-                    })
-                    .map(|(child, state)| {
-                        (
-                            child.file_name().unwrap().to_str().unwrap().to_owned(),
-                            state.manifest.resource_kind,
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                (path.clone(), directory_membership_digest(&children))
-            })
-            .collect::<Vec<_>>();
-        for (path, digest) in directory_digests {
-            virtual_workspace
-                .entries
-                .get_mut(&path)
-                .unwrap()
-                .manifest
-                .content_digest = Some(digest);
-        }
         let before_manifest = virtual_workspace.before.into_values().collect::<Vec<_>>();
         let intended_manifest = virtual_workspace
             .affected
             .iter()
             .map(|path| {
-                virtual_workspace
+                let mut entry = virtual_workspace
                     .entries
                     .get(path)
                     .map(|state| state.manifest.clone())
-                    .unwrap_or_else(|| missing_manifest(path))
+                    .unwrap_or_else(|| missing_manifest(path));
+                if entry.resource_kind == ResourceKind::Directory {
+                    let children = virtual_workspace
+                        .entries
+                        .range(path.clone()..)
+                        .take_while(|(child, _)| child.starts_with(path))
+                        .filter(|(child, state)| {
+                            child.parent() == Some(path.as_path()) && state.manifest.exists
+                        })
+                        .map(|(child, state)| {
+                            (
+                                child.file_name().unwrap().to_str().unwrap().to_owned(),
+                                state.manifest.resource_kind,
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    entry.content_digest = Some(directory_membership_digest(&children));
+                }
+                entry
             })
             .collect::<Vec<_>>();
         let before_by_path = before_manifest
@@ -891,10 +879,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let mut next = if current.manifest.exists {
             current
         } else {
-            ResourceState {
-                manifest: missing_manifest(&path),
-                text: None,
-            }
+            missing_resource(&path)
         };
         next.manifest.exists = true;
         next.manifest.resource_kind = ResourceKind::File;
@@ -1064,23 +1049,15 @@ impl<'a> WorkspaceEditPlanner<'a> {
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         for path in destination_tree {
-            workspace.entries.insert(
-                path.clone(),
-                ResourceState {
-                    manifest: missing_manifest(&path),
-                    text: None,
-                },
-            );
+            workspace
+                .entries
+                .insert(path.clone(), missing_resource(&path));
             workspace.affected.insert(path);
         }
         for (path, state) in &moved {
-            workspace.entries.insert(
-                path.clone(),
-                ResourceState {
-                    manifest: missing_manifest(path),
-                    text: None,
-                },
-            );
+            workspace
+                .entries
+                .insert(path.clone(), missing_resource(path));
             workspace.affected.insert(path.clone());
             let relative = path.strip_prefix(&old_path).unwrap();
             let target = if relative.as_os_str().is_empty() {
@@ -1188,13 +1165,9 @@ impl<'a> WorkspaceEditPlanner<'a> {
             return;
         }
         for target in subtree {
-            workspace.entries.insert(
-                target.clone(),
-                ResourceState {
-                    manifest: missing_manifest(&target),
-                    text: None,
-                },
-            );
+            workspace
+                .entries
+                .insert(target.clone(), missing_resource(&target));
             workspace.affected.insert(target);
         }
         summary.deletes = summary.deletes.saturating_add(1);
@@ -1353,10 +1326,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
                 .get(ancestor)
                 .is_some_and(|state| !state.manifest.exists)
         }) {
-            ResourceState {
-                manifest: missing_manifest(path),
-                text: None,
-            }
+            missing_resource(path)
         } else {
             self.inspect_resource(path, index, load_text)?
         };
@@ -1514,10 +1484,7 @@ impl<'a> WorkspaceEditPlanner<'a> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ResourceState {
-                    manifest: missing_manifest(path),
-                    text: None,
-                });
+                return Ok(missing_resource(path));
             }
             Err(error) => {
                 return Err(problem(
@@ -1966,6 +1933,13 @@ fn uri_contains_path_traversal(raw: &str) -> bool {
 
 fn directory_membership_digest(children: &BTreeMap<String, ResourceKind>) -> String {
     digest_canonical_value("lspctl-directory-membership-v1", &json!(children))
+}
+
+fn missing_resource(path: &Path) -> ResourceState {
+    ResourceState {
+        manifest: missing_manifest(path),
+        text: None,
+    }
 }
 
 fn missing_manifest(path: &Path) -> ManifestEntry {
