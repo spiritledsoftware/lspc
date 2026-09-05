@@ -432,8 +432,8 @@ fn read_journal(
     let mut journal: InstallJournal = serde_json::from_slice(&bytes).map_err(|error| {
         install_failure(scope, destination, &io::Error::other(error.to_string()))
     })?;
-    if selected_destination.as_os_str() != destination.as_os_str()
-        && journal.destination.as_os_str() == selected_destination.as_os_str()
+    if !same_installation_path(selected_destination, destination)
+        && same_installation_path(&journal.destination, selected_destination)
     {
         // Older v1 journals used the selected base's spelling. Accept only that known
         // alias, already resolved above, never canonicalize journal-controlled paths.
@@ -452,6 +452,23 @@ fn read_journal(
     Ok(Some((path.clone(), journal)))
 }
 
+fn same_installation_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // Ordinary Win32 paths accept both separators. Verbatim paths do not.
+        if ![left, right].iter().any(|path| {
+            matches!(path.components().next(), Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+        }) {
+            let separator = |unit| if unit == u16::from(b'/') { u16::from(b'\\') } else { unit };
+            return left.as_os_str().encode_wide().map(separator)
+                .eq(right.as_os_str().encode_wide().map(separator));
+        }
+    }
+    left.as_os_str() == right.as_os_str()
+}
+
 fn validate_journal(path: &Path, destination: &Path, journal: &InstallJournal) -> io::Result<()> {
     let incompatible = || io::Error::other("installation journal is incompatible");
     let parent = destination.parent().ok_or_else(incompatible)?;
@@ -467,7 +484,7 @@ fn validate_journal(path: &Path, destination: &Path, journal: &InstallJournal) -
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
         .ok_or_else(incompatible)?;
-    // Compare raw paths: Path equality normalizes some traversal aliases such as `./`.
+    // Permit Windows separators only: Path equality also normalizes aliases such as `./`.
     if journal.format_version != 1
         || !destination.is_absolute()
         || destination.components().any(|part| {
@@ -476,16 +493,13 @@ fn validate_journal(path: &Path, destination: &Path, journal: &InstallJournal) -
                 std::path::Component::ParentDir | std::path::Component::CurDir
             )
         })
-        || journal.destination.as_os_str() != destination.as_os_str()
-        || journal.stage.as_os_str() != parent.join(format!(".lspctl-stage-{id}")).as_os_str()
-        || journal.backup.as_os_str()
-            != parent
-                .join(format!(".lspctl-backup-.lspctl-stage-{id}"))
-                .as_os_str()
-        || path.as_os_str()
-            != parent
-                .join(format!("{JOURNAL_PREFIX}{id}.json"))
-                .as_os_str()
+        || !same_installation_path(&journal.destination, destination)
+        || !same_installation_path(&journal.stage, &parent.join(format!(".lspctl-stage-{id}")))
+        || !same_installation_path(
+            &journal.backup,
+            &parent.join(format!(".lspctl-backup-.lspctl-stage-{id}")),
+        )
+        || !same_installation_path(path, &parent.join(format!("{JOURNAL_PREFIX}{id}.json")))
         || !valid_sha256_digest(&journal.digest)
         || !matches!(
             journal.outcome.as_str(),
@@ -1022,6 +1036,43 @@ mod tests {
                     "unchanged"
                 );
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skill_recovery_accepts_windows_separators() {
+        for spelling in ["forward", "native", "mixed"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let parent = dunce::canonicalize(temporary.path())
+                .unwrap()
+                .join(".agent")
+                .join("skills");
+            fs::create_dir_all(&parent).unwrap();
+            let mut journal = recovery_journal(&parent);
+            fs::create_dir(&journal.stage).unwrap();
+            write_embedded_skill(&journal.stage, &journal.digest).unwrap();
+            let path = journal_path(&parent, &journal);
+            for field in [
+                &mut journal.destination,
+                &mut journal.stage,
+                &mut journal.backup,
+            ] {
+                let text = field.to_str().unwrap();
+                *field = PathBuf::from(match spelling {
+                    "forward" => text.replace('\\', "/"),
+                    "native" => text.to_owned(),
+                    "mixed" => text.replace("\\skills\\", "/skills\\"),
+                    _ => unreachable!(),
+                });
+            }
+            // v1 journals can contain mixed separators from Path::join(".agent/skills/lspctl").
+            fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            let result = install_to(temporary.path(), "local", false).unwrap();
+            assert_eq!(result["outcome"], "installed", "{spelling}");
+            verify_embedded_installation(&journal.destination, &journal.digest).unwrap();
+            assert!(!journal.stage.exists());
+            assert!(!path.exists());
         }
     }
 
