@@ -99,8 +99,7 @@ fn install_to(base: &Path, scope: &str, replace: bool) -> Result<Value, Contract
         ));
     }
     let parent = destination.parent().unwrap();
-    create_safe_parent(&base, parent)
-        .map_err(|error| install_failure(scope, &destination, &error))?;
+    create_safe_parent(&base).map_err(|error| install_failure(scope, &destination, &error))?;
     let lock_path = parent.join(LOCK_NAME);
     reject_unsafe_path(&lock_path).map_err(|error| install_failure(scope, &destination, &error))?;
     let lock = OpenOptions::new()
@@ -605,25 +604,16 @@ fn journal_path(parent: &Path, journal: &InstallJournal) -> PathBuf {
     parent.join(format!("{JOURNAL_PREFIX}{suffix}.json"))
 }
 
-fn create_safe_parent(base: &Path, path: &Path) -> io::Result<()> {
-    if path == base {
-        return Ok(());
+fn create_safe_parent(base: &Path) -> io::Result<()> {
+    for path in [base.join(".agent"), base.join(".agent/skills")] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !unsafe_metadata(&metadata) && metadata.is_dir() => {}
+            Ok(_) => return Err(io::Error::other("installation parent is unsafe")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path)?,
+            Err(error) => return Err(error),
+        }
     }
-    if !path.starts_with(base) {
-        return Err(io::Error::other(
-            "installation parent is outside the selected base",
-        ));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("installation parent is unavailable"))?;
-    create_safe_parent(base, parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if !unsafe_metadata(&metadata) && metadata.is_dir() => Ok(()),
-        Ok(_) => Err(io::Error::other("installation parent is unsafe")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path),
-        Err(error) => Err(error),
-    }
+    Ok(())
 }
 
 fn reject_unsafe_path(path: &Path) -> io::Result<()> {
@@ -1182,27 +1172,14 @@ mod tests {
     #[test]
     fn resumes_after_destination_was_moved_to_backup() {
         let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("lspctl");
-        fs::create_dir(&destination).unwrap();
-        fs::write(destination.join("custom"), b"old").unwrap();
-        let digest = bundle_digest(SKILL_FILES.iter().map(|(path, bytes)| (*path, *bytes)));
-        let stage = create_random_sibling(temporary.path(), ".lspctl-stage-").unwrap();
-        write_embedded_skill(&stage, &digest).unwrap();
-        let journal = InstallJournal {
-            format_version: 1,
-            destination: destination.clone(),
-            backup: temporary.path().join(format!(
-                ".lspctl-backup-{}",
-                stage.file_name().unwrap().to_str().unwrap()
-            )),
-            stage,
-            digest,
-            outcome: "replaced".to_owned(),
-            previous_skill_version: None,
-            previous_digest: None,
-        };
+        let mut journal = recovery_journal(temporary.path());
+        journal.outcome = "replaced".to_owned();
+        fs::create_dir(&journal.destination).unwrap();
+        fs::write(journal.destination.join("custom"), b"old").unwrap();
+        fs::create_dir(&journal.stage).unwrap();
+        write_embedded_skill(&journal.stage, &journal.digest).unwrap();
         write_journal(temporary.path(), &journal).unwrap();
-        fs::rename(&destination, &journal.backup).unwrap();
+        fs::rename(&journal.destination, &journal.backup).unwrap();
         fs::remove_dir_all(&journal.stage).unwrap();
 
         finish_journal(
@@ -1212,7 +1189,7 @@ mod tests {
             true,
         )
         .unwrap();
-        verify_embedded_installation(&destination, &journal.digest).unwrap();
+        verify_embedded_installation(&journal.destination, &journal.digest).unwrap();
         assert!(!journal.backup.exists());
         assert!(!journal_path(temporary.path(), &journal).exists());
     }
